@@ -11,15 +11,17 @@ starts with that data instead of the code that built it.
 
 No Julia runtime is linked. WasmGC provides allocation and garbage collection, and
 generated code handles object layout and type tags. What libjulia's C code does
-otherwise (IO, 128-bit arithmetic, `memmove`, random seeds) is a small runtime written in
-Julia and compiled into the module on demand, over a few host imports.
+otherwise (IO, 128-bit arithmetic, `memmove`, Unicode tables, `strtod`, hashes, random
+seeds) is a small runtime written in Julia and compiled into the module on demand, over a
+few host imports.
 
 **Status: experimental.** The supported subset is what `juliac --trim=safe` accepts: no
 dynamic dispatch. Julia 1.13 is the main target, and 1.12 also works. Programs that run
 today include OrdinaryDiffEq's `Tsit5` on an `ODEProblem` built at compile time, a
-ModelingToolkit model, Random (bit-identical streams), printing to `stdout`, and the
-programs of JuliaC.jl's tests (dispatch over concrete types, reductions, sorting,
-concatenation). Exceptions trap: `try`/`catch` is not compiled yet.
+ModelingToolkit model, JuliaSyntax (Julia's parser), Random (bit-identical streams),
+dictionaries, printing to `stdout`, and the programs of JuliaC.jl's tests (dispatch over
+concrete types, reductions, sorting, concatenation). Exceptions trap: `try`/`catch` is
+not compiled yet.
 
 ## Example
 
@@ -51,8 +53,13 @@ process.stdout.write(new TextDecoder().decode(new Uint8Array(out)));
 ```
 
 `compile` throws `UnsupportedConstructs` with the statements it cannot compile and the
-method instances they are in, as juliac's verifier reports what it cannot trim.
-`examples/lorenz` builds a page solving the Lorenz system with adjustable parameters.
+method instances they are in, as juliac's verifier reports what it cannot trim. The module
+it returns is optimized by `wasm-opt -O3` (Binaryen_jll); `Config(optimize=nothing)` gives
+the raw module, for debugging the code generator only.
+
+Each example builds a page: `examples/lorenz` solves the Lorenz system with adjustable
+parameters, `examples/mtk` simulates a ModelingToolkit model with sliders, and
+`examples/juliasyntax` parses Julia source in the browser.
 
 ## How it works
 
@@ -72,6 +79,9 @@ method instances they are in, as juliac's verifier reports what it cannot trim.
   Pointers are an address plus the object they point into, so Base's pointer code works.
   Modules are built and validated with
   [WasmBuilder.jl](https://github.com/gbaraldi/WasmBuilder.jl).
+- **Optimizing.** The code generator emits simple code (a local per value, a helper per
+  type for memory access and boxing) and leaves locals, the operand stack and inlining to
+  `wasm-opt`.
 - **The image.** Constants and global variables, and everything reachable from them,
   become immutable globals in the module, with identity preserved and cycles completed by
   the start function.

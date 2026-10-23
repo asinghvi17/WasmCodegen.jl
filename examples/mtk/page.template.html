@@ -1,0 +1,510 @@
+<title>Driven Oscillator in WasmGC</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,500;0,8..60,600;1,8..60,500&display=swap">
+<style>
+  /* Layout: an instrument panel, as on the Lorenz page. The model and its controls in a
+     narrow column; the trajectory large beside it, phase portrait and energy below. */
+  :root {
+    --bg: #eef0f3;
+    --surface: #ffffff;
+    --ink: #18202b;
+    --muted: #5a6473;
+    --line: #d5dae1;
+    --accent: #1f5ca6;
+    --trace-a: #2c6ad8;
+    --trace-b: #d9692a;
+    --trace-c: #1d8a6e;
+    --grid: #e6e9ee;
+    --code-bg: #f5f6f8;
+    --ok: #1d7a55;
+    --warn: #a65d00;
+    --font-display: "Source Serif 4", Georgia, "Times New Roman", serif;
+    --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-data: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f131a; --surface: #161b24; --ink: #e4e8ee; --muted: #949eac; --line: #2a313d;
+      --accent: #74a9f5; --trace-a: #5b97f2; --trace-b: #f39a54; --trace-c: #4cc6a0; --grid: #1f2530;
+      --code-bg: #11161e; --ok: #5ccf9c; --warn: #f0b05a;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f131a; --surface: #161b24; --ink: #e4e8ee; --muted: #949eac; --line: #2a313d;
+    --accent: #74a9f5; --trace-a: #5b97f2; --trace-b: #f39a54; --trace-c: #4cc6a0; --grid: #1f2530;
+    --code-bg: #11161e; --ok: #5ccf9c; --warn: #f0b05a;
+    color-scheme: dark;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 15px;
+    line-height: 1.5;
+  }
+  .page {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding-block: 28px 48px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    display: grid;
+    gap: 28px;
+  }
+  header { display: grid; gap: 6px; }
+  .eyebrow {
+    font-family: var(--font-data);
+    font-size: 12px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  h1 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: clamp(28px, 4vw, 40px);
+    line-height: 1.1;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .lede { margin: 0; max-width: 70ch; color: var(--muted); }
+  .lede em { font-family: var(--font-display); font-style: italic; color: var(--ink); }
+
+  .instrument {
+    display: grid;
+    grid-template-columns: minmax(270px, 320px) minmax(0, 1fr);
+    gap: 20px;
+    align-items: start;
+  }
+  @media (max-width: 800px) { .instrument { grid-template-columns: minmax(0, 1fr); } }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 18px;
+    display: grid;
+    gap: 16px;
+    min-width: 0;
+  }
+  .model { display: grid; gap: 8px; border-bottom: 1px solid var(--line); padding-bottom: 14px; min-width: 0; }
+  .model pre {
+    margin: 0;
+    background: var(--code-bg);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 10px 12px;
+    font: 12.5px/1.6 var(--font-data);
+    overflow-x: auto;
+  }
+  .model .kw { color: var(--accent); }
+  .model .tilde { color: var(--trace-b); }
+  .model p { margin: 0; font-size: 12.5px; color: var(--muted); }
+  .model p b { font-weight: 500; color: var(--ink); font-family: var(--font-data); }
+
+  .control { display: grid; gap: 4px; }
+  .control-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .control label { font-family: var(--font-display); font-style: italic; font-size: 17px; }
+  .control label small { font-family: var(--font-body); font-style: normal; font-size: 12px; color: var(--muted); margin-left: 6px; }
+  .control output { font-family: var(--font-data); font-size: 13.5px; font-variant-numeric: tabular-nums; }
+  .control output .u { color: var(--muted); }
+  input[type="range"] { width: 100%; accent-color: var(--accent); margin: 0; }
+  input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+  .row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .btn {
+    font: 500 13px var(--font-body);
+    color: var(--ink);
+    background: transparent;
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 6px 10px;
+    cursor: pointer;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .readouts {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    overflow: hidden;
+  }
+  .readout { background: var(--surface); padding: 7px 10px; display: grid; gap: 1px; min-width: 0; }
+  .readout span { font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+  .readout b { font: 500 15px var(--font-data); font-variant-numeric: tabular-nums; }
+  .regime {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+    border: 1px solid currentColor;
+    border-radius: 999px;
+    padding: 1px 9px;
+    width: fit-content;
+  }
+  .regime::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .regime[data-kind="under"] { color: var(--accent); }
+  .regime[data-kind="critical"] { color: var(--ok); }
+  .regime[data-kind="over"] { color: var(--warn); }
+  .status { font-size: 13px; color: var(--muted); }
+  .status.error { color: var(--warn); }
+
+  .plots { display: grid; gap: 16px; min-width: 0; }
+  .pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+  @media (max-width: 560px) { .pair { grid-template-columns: minmax(0, 1fr); } }
+  .plot {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 12px;
+    min-width: 0;
+    display: grid;
+    gap: 6px;
+  }
+  .plot h2 { font: 600 13px var(--font-body); margin: 0; display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; }
+  .plot h2 .key { font-weight: 400; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 16px; height: 3px; border-radius: 2px; display: inline-block; }
+  .plot canvas { width: 100%; max-width: 100%; display: block; }
+  .wide canvas { aspect-ratio: 16 / 7; }
+  .pair canvas { aspect-ratio: 4 / 3; }
+  .ramp { width: 70px; height: 5px; border-radius: 3px; background: linear-gradient(90deg, var(--trace-a), var(--trace-b)); display: inline-block; }
+
+  .notes {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 20px;
+    border-top: 1px solid var(--line);
+    padding-top: 22px;
+  }
+  .notes h2 { font-family: var(--font-display); font-weight: 600; font-size: 18px; margin: 0 0 6px; }
+  .notes p { margin: 0; color: var(--muted); max-width: 60ch; }
+  .notes code { font-family: var(--font-data); font-size: 13px; color: var(--ink); }
+</style>
+
+<div class="page">
+  <header>
+    <div class="eyebrow">ModelingToolkit → WebAssembly GC · no Julia runtime</div>
+    <h1>A ModelingToolkit model, solved in your browser</h1>
+    <p class="lede">A mass on a spring with damping and a periodic driving force. ModelingToolkit
+      simplified the model and generated its code ahead of time; every change here re-solves it with
+      OrdinaryDiffEq's <em>Tsit5</em> over <em>t</em> ∈ [0, 30] s in WebAssembly, and reads the
+      energy back through the model's own observed function.</p>
+  </header>
+
+  <section class="instrument" aria-label="Driven, damped oscillator">
+    <div class="panel">
+      <div class="model">
+        <pre aria-label="The model, as written for ModelingToolkit"><span class="kw">@variables</span> x(t) v(t) Fs(t) a(t) E(t)
+D(x) <span class="tilde">~</span> v
+Fs   <span class="tilde">~</span> -k*x - c*v + F*sin(ω*t)
+a    <span class="tilde">~</span> Fs / m
+D(v) <span class="tilde">~</span> a
+E    <span class="tilde">~</span> m*v^2/2 + k*x^2/2</pre>
+        <p><b>mtkcompile</b> keeps two states, x and v; Fs, a and E become observed variables.</p>
+      </div>
+      <div class="control">
+        <div class="control-head"><label for="m">m<small>mass</small></label><output id="m-out" for="m"></output></div>
+        <input id="m" type="range" min="0.2" max="5" step="0.05" value="1">
+      </div>
+      <div class="control">
+        <div class="control-head"><label for="k">k<small>spring stiffness</small></label><output id="k-out" for="k"></output></div>
+        <input id="k" type="range" min="0.5" max="40" step="0.1" value="10">
+      </div>
+      <div class="control">
+        <div class="control-head"><label for="c">c<small>damping</small></label><output id="c-out" for="c"></output></div>
+        <input id="c" type="range" min="0" max="8" step="0.01" value="0.5">
+      </div>
+      <div class="control">
+        <div class="control-head"><label for="F">F<small>driving amplitude</small></label><output id="F-out" for="F"></output></div>
+        <input id="F" type="range" min="0" max="10" step="0.05" value="1">
+      </div>
+      <div class="control">
+        <div class="control-head"><label for="w">ω<small>driving frequency</small></label><output id="w-out" for="w"></output></div>
+        <input id="w" type="range" min="0.1" max="8" step="0.01" value="2">
+      </div>
+      <div class="control">
+        <div class="control-head"><label for="x0">x₀<small>initial displacement (v₀ = 0)</small></label><output id="x0-out" for="x0"></output></div>
+        <input id="x0" type="range" min="-2" max="2" step="0.01" value="1">
+      </div>
+      <div class="row">
+        <button id="resonate" class="btn" type="button">Drive at ω₀</button>
+        <button id="free" class="btn" type="button">Free decay (F = 0)</button>
+        <button id="reset" class="btn" type="button">Defaults</button>
+      </div>
+      <div class="readouts" aria-label="The system's natural frequency and damping">
+        <div class="readout"><span>ω₀ = √(k/m)</span><b id="r-w0">–</b></div>
+        <div class="readout"><span>ζ = c/2√(km)</span><b id="r-zeta">–</b></div>
+        <div class="readout"><span>ω / ω₀</span><b id="r-ratio">–</b></div>
+      </div>
+      <span id="regime" class="regime" data-kind="under">Underdamped</span>
+      <div class="readouts" aria-live="polite" aria-label="The last solve">
+        <div class="readout"><span>Solve</span><b id="r-time">–</b></div>
+        <div class="readout"><span>Steps</span><b id="r-steps">–</b></div>
+        <div class="readout"><span>Points</span><b id="r-points">–</b></div>
+      </div>
+      <div id="status" class="status">Loading the module…</div>
+    </div>
+
+    <div class="plots">
+      <div class="plot wide">
+        <h2>Trajectory
+          <span class="key"><span class="swatch" style="background: var(--trace-a)"></span>x(t), m</span>
+          <span class="key"><span class="swatch" style="background: var(--trace-b)"></span>v(t), m/s</span></h2>
+        <canvas id="c-traj" aria-label="Displacement and velocity against time"></canvas>
+      </div>
+      <div class="pair">
+        <div class="plot">
+          <h2>Phase portrait <span class="key">t = 0 <span class="ramp" aria-hidden="true"></span> 30 s</span></h2>
+          <canvas id="c-phase" aria-label="Velocity against displacement"></canvas>
+        </div>
+        <div class="plot">
+          <h2>Energy <span class="key"><span class="swatch" style="background: var(--trace-c)"></span>E(t), J (observed)</span></h2>
+          <canvas id="c-energy" aria-label="Kinetic plus spring energy against time"></canvas>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="notes" aria-label="How it runs">
+    <div>
+      <h2>Symbolic at build time</h2>
+      <p>ModelingToolkit runs when the module is built: <code>mtkcompile</code> eliminates the
+        algebraic equations, and with <code>eval_expression = true</code> it generates the
+        right-hand side and the observed functions as ordinary Julia code, which WasmCodegen compiles
+        with <code>trim = :safe</code>.</p>
+    </div>
+    <div>
+      <h2>Objects in the module</h2>
+      <p>The integrator is built with <code>init</code> when the module is compiled and serialized into
+        it: __OBJECTS__ Julia objects, its <code>MTKParameters</code> included. The page calls MTK's
+        parameter setter (<code>setp</code>), then <code>reinit!</code> and <code>solve!</code>.</p>
+    </div>
+    <div>
+      <h2>This module</h2>
+      <p>__SIZE__ KB of WebAssembly, __FUNCS__ functions, no imports. Native Julia on the build machine
+        solves the default case in about __NATIVE__ ms; the timing on this page is your browser's.</p>
+    </div>
+  </section>
+</div>
+
+<script>
+(() => {
+  const WASM_BASE64 = "__WASM_BASE64__";
+  const $ = (id) => document.getElementById(id);
+  const DEFAULTS = { m: 1, k: 10, c: 0.5, F: 1, w: 2, x0: 1 };
+  const UNITS = { m: "kg", k: "N/m", c: "N·s/m", F: "N", w: "rad/s", x0: "m" };
+  const DIGITS = { m: 2, k: 1, c: 2, F: 2, w: 2, x0: 2 };
+  const inputs = {};
+  for (const key of Object.keys(DEFAULTS)) inputs[key] = $(key);
+  const canvases = { traj: $("c-traj"), phase: $("c-phase"), energy: $("c-energy") };
+  let exports = null;
+  let n = 0;
+  let T = new Float64Array(0), X = T, V = T, E = T;
+  let pending = false;
+
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const fmt = (v, d) => Number(v).toFixed(d);
+  function hexToRgb(h) {
+    const s = h.replace("#", "");
+    const v = parseInt(s.length === 3 ? s.split("").map((c) => c + c).join("") : s, 16);
+    return [(v >> 16) & 255, (v >> 8) & 255, v & 255];
+  }
+  const mix = (a, b, t) => `rgb(${a.map((v, i) => Math.round(v + (b[i] - v) * t)).join(",")})`;
+  // "nice" tick values covering [lo, hi], about n of them
+  function ticks(lo, hi, count) {
+    const span = hi - lo, raw = span / count, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const step = [1, 2, 5, 10].map((s) => s * mag).find((s) => span / s <= count) || 10 * mag;
+    const out = [];
+    for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(Math.round(v / step) * step);
+    return out;
+  }
+  const label = (v) => String(+v.toFixed(6));
+  function range(arrays) {
+    let lo = Infinity, hi = -Infinity;
+    for (const a of arrays) for (let i = 0; i < n; i++) { const v = a[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+    if (!isFinite(lo)) return [-1, 1];
+    if (hi - lo < 1e-9) { lo -= 1; hi += 1; }
+    const pad = 0.04 * (hi - lo);
+    return [lo - pad, hi + pad];
+  }
+
+  // a canvas sized to its box at the device's pixel ratio, drawn in CSS pixels
+  function surface(canvas) {
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+      canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+    }
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    return { ctx, w, h };
+  }
+
+  // axes with ticks from the same scale as the data; returns the coordinate maps
+  function axes(ctx, w, h, [x0, x1], [y0, y1], xname, yname) {
+    const padL = 46, padR = 10, padT = 8, padB = 30;
+    const sx = (w - padL - padR) / (x1 - x0), sy = (h - padT - padB) / (y1 - y0);
+    const Xp = (x) => padL + (x - x0) * sx, Yp = (y) => h - padB - (y - y0) * sy;
+    ctx.font = `11px ${css("--font-data")}`;
+    ctx.lineWidth = 1;
+    ctx.fillStyle = css("--muted");
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    for (const v of ticks(x0, x1, Math.max(3, Math.floor(w / 90)))) {
+      ctx.strokeStyle = css("--grid"); ctx.beginPath(); ctx.moveTo(Xp(v), padT); ctx.lineTo(Xp(v), h - padB); ctx.stroke();
+      ctx.fillText(label(v), Xp(v), h - padB + 6);
+    }
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    for (const v of ticks(y0, y1, Math.max(3, Math.floor(h / 50)))) {
+      ctx.strokeStyle = css("--grid"); ctx.beginPath(); ctx.moveTo(padL, Yp(v)); ctx.lineTo(w - padR, Yp(v)); ctx.stroke();
+      ctx.fillText(label(v), padL - 6, Yp(v));
+    }
+    // the zero lines, a little stronger
+    ctx.strokeStyle = css("--line");
+    if (y0 < 0 && y1 > 0) { ctx.beginPath(); ctx.moveTo(padL, Yp(0)); ctx.lineTo(w - padR, Yp(0)); ctx.stroke(); }
+    if (x0 < 0 && x1 > 0) { ctx.beginPath(); ctx.moveTo(Xp(0), padT); ctx.lineTo(Xp(0), h - padB); ctx.stroke(); }
+    ctx.strokeRect(padL, padT, w - padL - padR, h - padT - padB);
+    ctx.textAlign = "right"; ctx.textBaseline = "bottom";
+    ctx.fillText(xname, w - padR, h - padB - 3);
+    ctx.textAlign = "left"; ctx.textBaseline = "top";
+    ctx.fillText(yname, padL + 5, padT + 3);
+    return { Xp, Yp, padL, padR, padT, padB };
+  }
+
+  function line(ctx, Xs, Ys, Xp, Yp, color, width) {
+    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.lineJoin = "round";
+    ctx.beginPath();
+    ctx.moveTo(Xp(Xs[0]), Yp(Ys[0]));
+    for (let i = 1; i < n; i++) ctx.lineTo(Xp(Xs[i]), Yp(Ys[i]));
+    ctx.stroke();
+  }
+
+  function drawTrajectory() {
+    const { ctx, w, h } = surface(canvases.traj);
+    if (n < 2) return;
+    const { Xp, Yp } = axes(ctx, w, h, [0, T[n - 1]], range([X, V]), "t, s", "x, v");
+    line(ctx, T, V, Xp, Yp, css("--trace-b"), 1.4);
+    line(ctx, T, X, Xp, Yp, css("--trace-a"), 1.9);
+  }
+
+  function drawPhase() {
+    const { ctx, w, h } = surface(canvases.phase);
+    if (n < 2) return;
+    const { Xp, Yp } = axes(ctx, w, h, range([X]), range([V]), "x", "v");
+    const ca = hexToRgb(css("--trace-a")), cb = hexToRgb(css("--trace-b"));
+    const chunks = 60, per = Math.ceil(n / chunks);
+    ctx.lineWidth = 1.4; ctx.lineJoin = "round";
+    for (let c = 0; c < chunks; c++) {
+      const s = c * per, e = Math.min(n - 1, (c + 1) * per);
+      if (s >= e) break;
+      ctx.strokeStyle = mix(ca, cb, c / (chunks - 1));
+      ctx.beginPath(); ctx.moveTo(Xp(X[s]), Yp(V[s]));
+      for (let i = s + 1; i <= e; i++) ctx.lineTo(Xp(X[i]), Yp(V[i]));
+      ctx.stroke();
+    }
+    ctx.fillStyle = css("--trace-b");
+    ctx.beginPath(); ctx.arc(Xp(X[n - 1]), Yp(V[n - 1]), 4, 0, 2 * Math.PI); ctx.fill();
+  }
+
+  function drawEnergy() {
+    const { ctx, w, h } = surface(canvases.energy);
+    if (n < 2) return;
+    let [lo, hi] = range([E]);
+    lo = Math.min(0, lo);
+    const { Xp, Yp } = axes(ctx, w, h, [0, T[n - 1]], [lo, hi], "t, s", "E");
+    const color = css("--trace-c");
+    ctx.beginPath(); ctx.moveTo(Xp(T[0]), Yp(0));
+    for (let i = 0; i < n; i++) ctx.lineTo(Xp(T[i]), Yp(E[i]));
+    ctx.lineTo(Xp(T[n - 1]), Yp(0)); ctx.closePath();
+    ctx.globalAlpha = 0.14; ctx.fillStyle = color; ctx.fill(); ctx.globalAlpha = 1;
+    line(ctx, T, E, Xp, Yp, color, 1.6);
+  }
+
+  function drawAll() { drawTrajectory(); drawPhase(); drawEnergy(); }
+
+  function values() {
+    const v = {};
+    for (const key of Object.keys(inputs)) v[key] = +inputs[key].value;
+    return v;
+  }
+
+  function updateReadouts() {
+    const p = values();
+    for (const key of Object.keys(inputs)) {
+      $(`${key}-out`).innerHTML = `${fmt(p[key], DIGITS[key])} <span class="u">${UNITS[key]}</span>`;
+    }
+    const w0 = Math.sqrt(p.k / p.m), zeta = p.c / (2 * Math.sqrt(p.k * p.m));
+    $("r-w0").textContent = fmt(w0, 3);
+    $("r-zeta").textContent = fmt(zeta, 3);
+    $("r-ratio").textContent = fmt(p.w / w0, 3);
+    const regime = $("regime");
+    const kind = Math.abs(zeta - 1) < 0.02 ? "critical" : zeta < 1 ? "under" : "over";
+    regime.dataset.kind = kind;
+    regime.textContent = kind === "critical" ? "Critically damped" : kind === "under" ? "Underdamped" : "Overdamped";
+  }
+
+  function solve() {
+    pending = false;
+    if (!exports) return;
+    const p = values();
+    const t0 = performance.now();
+    n = exports.osc_solve(p.m, p.k, p.c, p.F, p.w, p.x0, 0);
+    const t1 = performance.now();
+    if (T.length < n) { T = new Float64Array(n); X = new Float64Array(n); V = new Float64Array(n); E = new Float64Array(n); }
+    for (let i = 1; i <= n; i++) {
+      T[i - 1] = exports.osc_time(i);
+      X[i - 1] = exports.osc_state(i, 1);
+      V[i - 1] = exports.osc_state(i, 2);
+      E[i - 1] = exports.osc_observed(i, 1);
+    }
+    $("r-time").textContent = `${fmt(t1 - t0, 2)} ms`;
+    $("r-steps").textContent = exports.osc_steps();
+    $("r-points").textContent = n;
+    drawAll();
+  }
+
+  function schedule() {
+    updateReadouts();
+    if (!pending) { pending = true; requestAnimationFrame(solve); }
+  }
+  function set(p) {
+    for (const [key, v] of Object.entries(p)) {
+      const el = inputs[key];
+      el.value = Math.min(+el.max, Math.max(+el.min, v));
+    }
+    schedule();
+  }
+
+  for (const el of Object.values(inputs)) el.addEventListener("input", schedule);
+  $("resonate").addEventListener("click", () => { const p = values(); set({ w: Math.sqrt(p.k / p.m) }); });
+  $("free").addEventListener("click", () => set({ F: 0 }));
+  $("reset").addEventListener("click", () => set(DEFAULTS));
+  new ResizeObserver(drawAll).observe(canvases.traj);
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", drawAll);
+  new MutationObserver(drawAll).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+  updateReadouts();
+  (async () => {
+    try {
+      const bytes = Uint8Array.from(atob(WASM_BASE64), (c) => c.charCodeAt(0));
+      const { instance } = await WebAssembly.instantiate(bytes, {});
+      exports = instance.exports;
+      $("status").textContent = "Drag a slider: the model is re-solved on every change.";
+      schedule();
+    } catch (err) {
+      const st = $("status");
+      st.classList.add("error");
+      st.textContent = "This browser could not load the module, which needs WebAssembly GC " +
+        "(Chrome 119, Firefox 120, Safari 18.2 or later). " + err.message;
+    }
+  })();
+})();
+</script>

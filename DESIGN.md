@@ -30,11 +30,16 @@ per function: CodeInfo → IRCode → prepare → StructuredIRCode (IRStructuriz
   │  prepare: strip exception handling, trap throws, drop unused type computations
   ▼
 emit: walk the structured IR → WasmBuilder (validating builder)
+  │  simple code: a local per value; per-type helpers for memory access and boxing
   │  runtime functions (Julia) and host imports added on demand
   ▼
 image: serialize the referenced objects; start function completes them
   ▼
-module bytes (wasm-tools validated; wasm-opt optional)
+raw module (WasmBuilder's validation, and wasm-tools' when installed)
+  ▼
+wasm-opt -O3 (Binaryen_jll): locals, stack code, inlining, the rest
+  ▼
+module bytes
 ```
 
 ## 1. The program's world: no overlays, patches
@@ -43,6 +48,12 @@ Inference is Julia's own: the same `InferenceParams`/`OptimizationParams` as jul
 (`force_enable_inference`), concrete and semi-concrete evaluation included, over Julia's
 own method table, with its own cache owner. The only target-specific fact is
 `have_fma = false` (Wasm has no fused multiply-add), folded in `abstract_call_known`.
+Inlining is Julia's own too. One optimizer parameter differs: `compilesig_invokes = false`,
+so a call targets the method instance of its argument types rather than the signature
+native code would be compiled for, which widens arguments of type `Function`, `Type` and
+`Vararg` that a method only passes on. A closed world has no dynamic dispatch to fall back
+on: JuliaSyntax's parser passes its subparsers as `down::Function`, which juliac's own
+verifier rejects, and compiles once they are specialized.
 
 There is no overlay method table, not even an empty one. Stacking one makes the
 interpreter overlayed, and inference then taints every call it cannot resolve statically
@@ -101,19 +112,34 @@ them to traps where they are, as `juliac --trim=unsafe`.
 
 ## 3. Structured IR
 
-IRStructurizer recovers `IfOp`/`ForOp`/`WhileOp`/`LoopOp` regions with block arguments;
-Wasm control flow is structured, so the lift is direct:
+IRStructurizer recovers `IfOp`/`WhileOp`/`LoopOp` regions with block arguments; Wasm
+control flow is structured, so the lift is direct:
 
 | Structured op | Wasm |
 |---|---|
 | `IfOp` with `YieldOp`s | `if` with result locals assigned in each arm |
 | `LoopOp` (`ContinueOp`/`BreakOp`) | `block $exit (loop $cont ...)` |
-| `ForOp` (iv, `slt` bound, step) | `block (loop (br_if exit (iv ≥ upper)) body iv+=step br)` |
 | `WhileOp` (before/`ConditionOp`/after) | `block (loop before (if !cond results br exit) after br loop)` |
 | `ReturnNode` | `return` |
 
-Carried values are assigned in parallel (all values pushed, then all locals set). Results
-of control-flow ops are lists of values read by `getfield(op, i)`. IRStructurizer's
+Loops are not promoted to counting `ForOp`s (`promote = false`): a `ForOp` has neither the
+signedness of the comparison it came from (`ult_int`) nor room for an inclusive bound at
+`typemax`, and gains nothing on Wasm. Carried values are assigned in parallel (all values
+pushed, then all locals set). Results of control-flow ops are lists of values read by
+`getfield(op, i)`.
+
+The structured form threads values through every `if` on the path between a definition
+and a merge (a phi of Julia's IR becomes results of each enclosing `if`): JuliaSyntax's
+`parse_call_chain` has 1,511 `if`s with 57,977 results. Three rules keep that from turning
+into copies, all exact:
+
+- **Aliasing.** A result that each arm yields as the same value, or as undefined, is that
+  value: no locals, no copies (Wasm locals live in the whole function, and an undefined
+  result is not read). An undefined value is never stored.
+- **Destination passing.** A result of a control-flow op that only goes to the yield ending
+  its block, to the enclosing `if`'s result, is assigned there directly: a chain of nested
+  merges shares one set of locals. (Never to a loop's carries, which the loop reads.)
+- **Dead carries.** A loop carry nothing reads has no locals. IRStructurizer's
 terminator type check is stricter than Julia's IR (a phi's edge value may be wider than
 the phi when a branch narrowed it), so that one validation is skipped.
 
@@ -229,6 +255,8 @@ built it.
 - Global variables are mutable globals (one per leaf of the declared type), initialized
   with their value at compile time.
 - A `Ptr` constant is its address without owner (an address of the build process).
+- A symbol carries its hash, as Julia's runtime computed it, so that dictionaries with
+  symbol keys built at compile time are found at run time.
 - Not serializable (an error naming the object): tasks, modules, methods.
 
 ## 7. Functions, calls, intrinsics
@@ -242,6 +270,13 @@ immutables), `isa` (type ids, a generated predicate per abstract type), `tuple`,
 inline, with Julia's semantics where Wasm's differ: over-shifts, saturating float→int,
 checked arithmetic, `fpiseq`, IEEE `min`/`max`, division traps.
 
+Operations whose code grows with the value they move are **outlined**: a helper function
+per operation and type, called where they are used (`outline.jl`): `memoryrefget`,
+`memoryrefset!`, `memoryrefnew`, `memoryref_isassigned`, `memorynew`, boxing and unboxing.
+A helper's body is the operation's inline emission, run in the helper's own context, so
+there is one implementation; Binaryen inlines the helpers where it pays, and keeps others
+shared (10% smaller modules for the parser).
+
 ## 8. The runtime
 
 - **Runtime functions** (`src/runtime/`, module `WasmCodegen.Runtime`): Julia code the
@@ -249,24 +284,51 @@ checked arithmetic, `fpiseq`, IEEE `min`/`max`, division traps.
   (`runtime_function!` extends the closed world): 128-bit integer arithmetic on `UInt64`
   pairs (multiplication by 32-bit halves, shift-subtract division); `fma` is Base's
   `fma_emulated`.
+- **C library calls implemented in Julia** (`RUNTIME_CCALLS`), checked against the native
+  libraries: Unicode properties (`utf8proc_category`, `jl_id_char`, `jl_id_start_char`:
+  tables of runs computed from the native libraries when WasmCodegen is compiled, exact
+  on every code point; `utf8proc_grapheme_break_stateful`: utf8proc's rules over its
+  classes); `strtod`/`strtof` (the extent of the number as C finds it, the value from
+  Parsers.jl, which is correctly rounded without C or big floats) and `errno`;
+  `memmove`/`memset`/`memcmp`/`memchr` through pointers without origins.
+- **Hashes as the C runtime computes them**, so that dictionaries built at compile time are
+  found at run time: `objectid` of symbols (their hash: MurmurHash3 of the name, mixed;
+  symbols in the image carry it, computed natively) and of isbits values of 1, 2, 4 or 8
+  bytes (`immut_id_`: the bits' hash and the type's). Strings and symbols are `===` by
+  their bytes, so symbols made at run time need no interning.
 - **Primitives**: runtime functions whose calls the code generator compiles to host
-  imports (module `julia`): `write_byte(fd, byte)`.
+  imports (module `julia`): `write_byte(fd, byte)`, `entropy()` (the seed of the task's
+  random number generator).
 - **The pseudo-runtime's patches** (section 1): Base/Core methods over the primitives
   (IO for `Core.stdout`/`Core.stderr`).
 - **The host**: a loader instantiating the module with the `julia` imports (the test
   runner's is in `test/runner.mjs`): it buffers bytes per descriptor and decodes them as
   UTF-8.
 
-Next: the task-local RNG (`rand`), exceptions with `try_table`, float parsing, time; a
-WASI-style host interface.
+Next: `IdDict` (the C runtime's identity hash table, also behind task-local storage and so
+`Random.seed!` of the global generator), exceptions with `try_table`, time; a WASI-style
+host interface.
 
 ## 9. Output, performance
 
 Exports are the entry points under their names, with their leaves as parameters and
-results (`i64` is a JavaScript BigInt). `wasm-opt` (Binaryen, without `-all`: it enables
-proposals V8 does not ship) shrinks modules by about a quarter; V8's optimizing tier makes
-its speed effect small. OrdinaryDiffEq's Tsit5 on the Lorenz system runs within about 1.5×
-of native Julia in Node.js.
+results (`i64` is a JavaScript BigInt).
+
+The code generator emits simple code and `compile` optimizes it with `wasm-opt -O3`
+(`Config(optimize=...)`; the features are listed explicitly: `-all` enables proposals V8
+does not ship). Allocating locals, putting values on the operand stack and inlining small
+helpers are Binaryen's job, which it does far better than a code generator's own passes
+would (JuliaSyntax's parser: 147,000 locals to 3,500). A raw module is not meant to run:
+its large functions have frames of thousands of locals, which overflow the stack of a
+recursive parser. What the code generator does avoid is code `wasm-opt` would have to
+remove at a cost: without the rules of section 3, `wasm-opt` takes 13 times longer on the
+parser (683 s against 53 s) for a worse module, and destination passing halved it again
+(23 s). Most of its time is `simplify-locals` on the largest functions.
+
+For the parser, a compile takes about 23 s in `wasm-opt`, 8 s in IRStructurizer, 3 s in
+juliac's verifier and 2 s in the code generator (after Julia's inference, cached across
+compilations). OrdinaryDiffEq's Tsit5 on the Lorenz system runs within about 1.5× of native
+Julia in Node.js; a ModelingToolkit model and the parser run at about native speed.
 
 Floating-point results are bit-identical to native Julia built for a CPU without FMA
 (`-C generic`); natively on FMA hardware, `muladd` fuses, so results differ in the last
@@ -277,8 +339,10 @@ bits (and chaotic systems diverge from there). Relaxed SIMD's `relaxed_madd` cou
 
 Differential (`@wtest f(args...)`): native and compiled results compared (values and
 types), in a persistent Node.js from `NodeJS_24_jll`, inside one session of patches.
-Coverage: numbers and control flow, 128-bit integers, structs/vectors/closures/broadcast/
-sort, the image (tables, symbols, cycles, identity), and JuliaC.jl's own test programs
+Coverage: numbers and control flow, 128-bit integers, pointers, identity, globals,
+structs/vectors/closures/broadcast/sort, dictionaries and sets, Random (the native
+streams), the image (tables, symbols, cycles, identity), and JuliaC.jl's own test programs
 (reshape, dispatch, reductions, concatenations, printing; the untrimmable one must be
-rejected). The examples (`examples/lorenz`) solve ODEs with SimpleDiffEq and
-OrdinaryDiffEq.
+rejected). The tests run the optimized modules. The examples: `examples/lorenz`
+(OrdinaryDiffEq), `examples/mtk` (a ModelingToolkit model), `examples/juliasyntax` (Julia's
+parser, compared with native JuliaSyntax node for node on Base's sources), each with a page.

@@ -1,0 +1,415 @@
+<title>JuliaSyntax in WasmGC</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,600&display=swap">
+<style>
+  /* Layout: a parser workbench. Source on the left (editor, then the parser's view of it),
+     the green tree on the right; stacks on phones. Same family as the Lorenz and
+     oscillator pages. */
+  :root {
+    --bg: #eef0f3;
+    --surface: #ffffff;
+    --ink: #18202b;
+    --muted: #5a6473;
+    --line: #d5dae1;
+    --accent: #1f5ca6;
+    --code-bg: #f7f8fa;
+    --hover: #fff1c2;
+    --t-keyword: #8a3ab9;
+    --t-operator: #a14d0f;
+    --t-literal: #0f7a5c;
+    --t-ident: #18202b;
+    --t-comment: #7a8494;
+    --t-error: #c42b1c;
+    --font-display: "Source Serif 4", Georgia, "Times New Roman", serif;
+    --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-code: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f131a; --surface: #161b24; --ink: #e4e8ee; --muted: #949eac; --line: #2a313d;
+      --accent: #74a9f5; --code-bg: #11161e; --hover: #4a3d12;
+      --t-keyword: #d19bf0; --t-operator: #f0a46b; --t-literal: #5fd0a8; --t-ident: #e4e8ee;
+      --t-comment: #7f8a99; --t-error: #ff7a6b;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f131a; --surface: #161b24; --ink: #e4e8ee; --muted: #949eac; --line: #2a313d;
+    --accent: #74a9f5; --code-bg: #11161e; --hover: #4a3d12;
+    --t-keyword: #d19bf0; --t-operator: #f0a46b; --t-literal: #5fd0a8; --t-ident: #e4e8ee;
+    --t-comment: #7f8a99; --t-error: #ff7a6b;
+    color-scheme: dark;
+  }
+
+  body { background: var(--bg); color: var(--ink); font-family: var(--font-body); font-size: 15px; line-height: 1.5; }
+  .page {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding-block: 28px 48px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    display: grid;
+    gap: 24px;
+  }
+  header { display: grid; gap: 6px; }
+  .eyebrow { font-family: var(--font-code); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+  h1 { font-family: var(--font-display); font-weight: 600; font-size: clamp(28px, 4vw, 40px); line-height: 1.1; margin: 0; text-wrap: balance; }
+  .lede { margin: 0; max-width: 74ch; color: var(--muted); }
+  .lede code { font-family: var(--font-code); font-size: 13.5px; color: var(--ink); }
+
+  .bench { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+  @media (max-width: 860px) { .bench { grid-template-columns: minmax(0, 1fr); } }
+  .pane { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 14px; display: grid; gap: 10px; min-width: 0; }
+  .pane h2 { font: 600 13px var(--font-body); margin: 0; letter-spacing: 0.02em; display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; align-items: baseline; }
+  .pane h2 span { font-weight: 400; color: var(--muted); }
+
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  select, .btn {
+    font: 500 13px var(--font-body);
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 5px 8px;
+  }
+  select:focus-visible, .btn:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  label.inline { font-size: 13px; color: var(--muted); display: inline-flex; gap: 6px; align-items: center; }
+
+  textarea {
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 220px;
+    resize: vertical;
+    font: 13px/1.6 var(--font-code);
+    color: var(--ink);
+    background: var(--code-bg);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 10px 12px;
+    tab-size: 4;
+  }
+  .view {
+    margin: 0;
+    font: 13px/1.6 var(--font-code);
+    background: var(--code-bg);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 10px 12px;
+    white-space: pre;
+    overflow: auto;
+    max-height: 420px;
+    tab-size: 4;
+  }
+  .view span.k { color: var(--t-keyword); font-weight: 500; }
+  .view span.o { color: var(--t-operator); }
+  .view span.l { color: var(--t-literal); }
+  .view span.c { color: var(--t-comment); font-style: italic; }
+  .view span.e { color: var(--t-error); text-decoration: underline wavy var(--t-error); text-underline-offset: 3px; }
+  .view span.hl { background: var(--hover); border-radius: 2px; }
+  .view span.diag { text-decoration: underline wavy var(--t-error); text-underline-offset: 3px; }
+
+  .readouts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+  .readout { background: var(--surface); padding: 6px 10px; display: grid; gap: 1px; min-width: 0; }
+  .readout span { font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+  .readout b { font: 500 15px var(--font-code); font-variant-numeric: tabular-nums; }
+  @media (max-width: 480px) { .readouts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+  .diags { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; font-size: 13px; }
+  .diags li { display: flex; gap: 8px; align-items: baseline; }
+  .diags .lvl { font: 500 11px var(--font-code); text-transform: uppercase; letter-spacing: 0.05em; color: var(--t-error); border: 1px solid currentColor; border-radius: 999px; padding: 0 7px; }
+  .diags .lvl.warning { color: var(--t-operator); }
+  .diags .at { font-family: var(--font-code); color: var(--muted); }
+  .empty { color: var(--muted); font-size: 13px; }
+
+  .tree { margin: 0; padding: 0; list-style: none; font: 12.5px/1.55 var(--font-code); overflow: auto; max-height: 760px; }
+  .tree ul { margin: 0; padding-left: 16px; list-style: none; border-left: 1px solid var(--line); }
+  .tree li > .node { display: flex; gap: 8px; align-items: baseline; padding: 0 4px; border-radius: 3px; cursor: default; white-space: nowrap; }
+  .tree li > .node:hover, .tree li > .node.hl { background: var(--hover); }
+  .tree .kind { font-weight: 500; }
+  .tree .nt > .node > .kind { color: var(--accent); }
+  .tree .trivia > .node { color: var(--t-comment); }
+  .tree .err > .node > .kind { color: var(--t-error); }
+  .tree .range { color: var(--muted); font-size: 11.5px; }
+  .tree .text { color: var(--muted); overflow: hidden; text-overflow: ellipsis; max-width: 32ch; }
+  .tree .flags { color: var(--muted); font-size: 11px; }
+
+  .status { font-size: 13px; color: var(--muted); }
+  .status.error { color: var(--t-error); }
+  .notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; border-top: 1px solid var(--line); padding-top: 22px; }
+  .notes h2 { font-family: var(--font-display); font-weight: 600; font-size: 18px; margin: 0 0 6px; }
+  .notes p { margin: 0; color: var(--muted); max-width: 60ch; }
+  .notes code { font-family: var(--font-code); font-size: 13px; color: var(--ink); }
+</style>
+
+<div class="page">
+  <header>
+    <div class="eyebrow">Julia → WebAssembly GC · no Julia runtime</div>
+    <h1>Julia's parser, running in your browser</h1>
+    <p class="lede">The JuliaSyntax parser that ships with Julia 1.13 (<code>Base.JuliaSyntax</code>),
+      compiled from Julia to WasmGC with WasmCodegen. Every edit is lexed and parsed in WebAssembly,
+      error recovery included; the page reads back the parser's raw output, tokens and tree ranges,
+      and builds the green tree from it as <code>build_tree</code> does.</p>
+  </header>
+
+  <section class="bench" aria-label="Parser">
+    <div class="pane">
+      <h2>Source <span id="example-note"></span></h2>
+      <div class="controls">
+        <label class="inline" for="example">Example
+          <select id="example"></select></label>
+        <label class="inline" for="rule">Parse as
+          <select id="rule">
+            <option value="1">a file</option>
+            <option value="2">a statement</option>
+            <option value="3">an atom</option>
+          </select></label>
+      </div>
+      <textarea id="src" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Julia source"></textarea>
+      <div class="readouts" aria-live="polite">
+        <div class="readout"><span>Parse</span><b id="r-time">–</b></div>
+        <div class="readout"><span>Bytes</span><b id="r-bytes">–</b></div>
+        <div class="readout"><span>Nodes</span><b id="r-nodes">–</b></div>
+        <div class="readout"><span>Tokens</span><b id="r-tokens">–</b></div>
+      </div>
+      <h2>As the parser sees it <span>hover the tree to find a node</span></h2>
+      <pre id="view" class="view" aria-label="The source, colored by token"></pre>
+      <h2>Diagnostics</h2>
+      <ul id="diags" class="diags"></ul>
+      <div id="status" class="status">Loading the parser…</div>
+    </div>
+
+    <div class="pane">
+      <h2>Green tree <span>kind, byte range; trivia dimmed</span></h2>
+      <ul id="tree" class="tree" aria-label="The green tree"></ul>
+    </div>
+  </section>
+
+  <section class="notes" aria-label="How it runs">
+    <div>
+      <h2>The whole parser</h2>
+      <p>JuliaSyntax's lexer and recursive-descent parser, unchanged: __FUNCS__ Julia functions in
+        __SIZE__ KB of WebAssembly. Its tables (kind names, operator sets) were built when Julia loaded
+        and are serialized into the module: __OBJECTS__ objects.</p>
+    </div>
+    <div>
+      <h2>What WebAssembly lacks</h2>
+      <p>The lexer asks libutf8proc about Unicode characters, and numbers go through C's
+        <code>strtod</code>. Here the Unicode tables come from the native libraries at build time and
+        floats are parsed by Parsers.jl, compiled into the module with the parser.</p>
+    </div>
+    <div>
+      <h2>Checked against Julia</h2>
+      <p>On 308 KB of Julia source, Base files included, the module's output matches native
+        JuliaSyntax node for node: kinds, spans, flags and diagnostics.</p>
+    </div>
+  </section>
+</div>
+
+<script>
+(() => {
+  const WASM_BASE64 = "__WASM_BASE64__";
+  const $ = (id) => document.getElementById(id);
+  const EXAMPLES = [
+    ["A function", "function fib(n::Integer)\n    n <= 1 && return n\n    return fib(n - 1) + fib(n - 2)\nend\n\n# broadcasting, a comprehension, string interpolation\nxs = [fib(k) for k in 1:10]\nprintln(\"sum = $(sum(xs .^ 2))\")\n"],
+    ["A struct and methods", "struct Point{T<:Real}\n    x::T\n    y::T\nend\n\nBase.:+(a::Point, b::Point) = Point(a.x + b.x, a.y + b.y)\nnorm2(p::Point) = sqrt(p.x^2 + p.y^2)\n\np = Point(3.0, 4.0) + Point(1.0, -1.0)\n@show norm2(p)\n"],
+    ["Macros, do blocks, Unicode", "using Statistics\n\n@time begin\n    α = 0.5; β = 2.0f0\n    data = map(1:100) do i\n        sin(α * i) * β\n    end\n    μ, σ² = mean(data), var(data)\nend\n\nx ∈ [1, 2, 3] && x ≠ 0 ? :yes : :no\n"],
+    ["Syntax errors", "function broken(x\n    y = = x + \n    [1, 2,, 3]\n    1.0.0\nend\n"],
+    ["Float literals", "a = 1e400        # overflow\nb = 1e-400       # underflows to zero\nc = 0x1.8p3\nd = 1_000.5e-3\ne = 2.5f0\n"],
+  ];
+
+  let ex = null;
+  let bytes = new Uint8Array(0);
+  let nodes = [];
+  let root = null;
+  let kindNames = new Map();
+  const enc = new TextEncoder(), dec = new TextDecoder();
+
+  const sel = $("example");
+  EXAMPLES.forEach(([name], i) => { const o = document.createElement("option"); o.value = i; o.textContent = name; sel.appendChild(o); });
+  $("src").value = EXAMPLES[0][1];
+
+  function kindName(k) {
+    let s = kindNames.get(k);
+    if (s === undefined) {
+      const n = ex.kind_name_len(k);
+      const b = new Uint8Array(n);
+      for (let j = 0; j < n; j++) b[j] = ex.kind_name_byte(k, j + 1);
+      s = dec.decode(b);
+      kindNames.set(k, s);
+    }
+    return s;
+  }
+
+  // the green tree from the postorder output: a token is a leaf; an interior node's
+  // `nodespan` counts the nodes below it, which are the last ones on the stack
+  function buildTree(out) {
+    const stack = [];
+    for (let i = 0; i < out.length; i++) {
+      const o = out[i];
+      const node = { ...o, index: i, children: [] };
+      if (o.cls & 1) {
+        const first = i - o.nodespan;
+        while (stack.length && stack[stack.length - 1].index >= first) node.children.unshift(stack.pop());
+      }
+      stack.push(node);
+    }
+    // the output starts with a sentinel of no width, outside the tree
+    while (stack.length > 1 && !(stack[0].cls & 1) && stack[0].span === 0) stack.shift();
+    const top = stack.length === 1 ? stack[0] : { kind: -1, span: 0, cls: 1, children: stack };
+    let pos = 0;
+    (function place(n) {
+      n.start = pos;
+      if (n.cls & 1) { for (const c of n.children) place(c); n.end = pos; if (!n.children.length) { n.end = n.start + n.span; pos = n.end; } }
+      else { pos += n.span; n.end = pos; }
+    })(top);
+    return top;
+  }
+
+  function parse() {
+    if (!ex) return;
+    bytes = enc.encode($("src").value);
+    ex.src_resize(bytes.length);
+    for (let i = 0; i < bytes.length; i++) ex.src_set(i + 1, bytes[i]);
+    const t0 = performance.now();
+    const n = ex.parse_src(+$("rule").value);
+    const t1 = performance.now();
+    nodes = [];
+    let ntok = 0;
+    for (let i = 1; i <= n; i++) {
+      const o = { kind: ex.out_kind(i), span: ex.out_span(i), nodespan: ex.out_nodespan(i), cls: ex.out_class(i) };
+      if (!(o.cls & 1)) ntok++;
+      nodes.push(o);
+    }
+    root = buildTree(nodes);
+    const diags = [];
+    for (let k = 1; k <= ex.ndiag(); k++) {
+      const len = ex.diag_msg_len(k), m = new Uint8Array(len);
+      for (let j = 0; j < len; j++) m[j] = ex.diag_msg_byte(k, j + 1);
+      diags.push({ first: ex.diag_first(k), last: ex.diag_last(k), level: ex.diag_level(k), msg: dec.decode(m) });
+    }
+    $("r-time").textContent = `${(t1 - t0).toFixed(2)} ms`;
+    $("r-bytes").textContent = bytes.length;
+    $("r-nodes").textContent = n;
+    $("r-tokens").textContent = ntok;
+    renderView(diags);
+    renderDiags(diags);
+    renderTree();
+  }
+
+  const text = (a, b) => dec.decode(bytes.subarray(a, b));
+  function tokenClass(cls) {
+    if (cls & 4) return "e";
+    if (cls & 128) return "c";
+    if (cls & 8) return "k";
+    if (cls & 32) return "l";
+    if (cls & 16) return "o";
+    return "";
+  }
+
+  function renderView(diags) {
+    const view = $("view");
+    view.textContent = "";
+    const inDiag = (a) => diags.some((d) => a >= d.first - 1 && a <= d.last - 1);
+    (function walk(n) {
+      if (n.cls & 1) { for (const c of n.children) walk(c); return; }
+      if (n.end <= n.start) return;
+      const s = document.createElement("span");
+      const c = tokenClass(n.cls);
+      if (c) s.classList.add(c);
+      if (inDiag(n.start)) s.classList.add("diag");
+      s.textContent = text(n.start, n.end);
+      n.el = s;
+      view.appendChild(s);
+    })(root);
+  }
+
+  function renderDiags(diags) {
+    const ul = $("diags");
+    ul.textContent = "";
+    if (!diags.length) { const li = document.createElement("li"); li.className = "empty"; li.textContent = "None: the source parses cleanly."; ul.appendChild(li); return; }
+    for (const d of diags) {
+      const li = document.createElement("li");
+      const lvl = document.createElement("span");
+      lvl.className = "lvl" + (d.level === 2 ? " warning" : "");
+      lvl.textContent = d.level === 1 ? "error" : d.level === 2 ? "warning" : "note";
+      const at = document.createElement("span");
+      at.className = "at";
+      at.textContent = `bytes ${d.first}:${d.last}`;
+      const msg = document.createElement("span");
+      msg.textContent = d.msg;
+      li.append(lvl, at, msg);
+      ul.appendChild(li);
+    }
+  }
+
+  function highlight(n, on) {
+    (function walk(m) {
+      if (m.cls & 1) { for (const c of m.children) walk(c); return; }
+      if (m.el) m.el.classList.toggle("hl", on);
+    })(n);
+  }
+
+  function renderTree() {
+    const ul = $("tree");
+    ul.textContent = "";
+    const MAX = 4000;
+    let count = 0;
+    (function add(n, parent) {
+      if (count++ > MAX) return;
+      const li = document.createElement("li");
+      if (n.cls & 1) li.classList.add("nt");
+      if (n.cls & 2) li.classList.add("trivia");
+      if (n.cls & 4) li.classList.add("err");
+      const row = document.createElement("div");
+      row.className = "node";
+      const k = document.createElement("span");
+      k.className = "kind";
+      k.textContent = n.kind < 0 ? "(output)" : kindName(n.kind);
+      const r = document.createElement("span");
+      r.className = "range";
+      r.textContent = `${n.start + 1}:${n.end}`;
+      row.append(k, r);
+      if (n.cls & 2) { const f = document.createElement("span"); f.className = "flags"; f.textContent = "trivia"; row.appendChild(f); }
+      if (!(n.cls & 1) && !(n.cls & 128)) {
+        const t = document.createElement("span");
+        t.className = "text";
+        t.textContent = JSON.stringify(text(n.start, n.end));
+        row.appendChild(t);
+      }
+      row.addEventListener("mouseenter", () => { row.classList.add("hl"); highlight(n, true); });
+      row.addEventListener("mouseleave", () => { row.classList.remove("hl"); highlight(n, false); });
+      li.appendChild(row);
+      if ((n.cls & 1) && n.children.length) {
+        const sub = document.createElement("ul");
+        for (const c of n.children) add(c, sub);
+        li.appendChild(sub);
+      }
+      parent.appendChild(li);
+    })(root, ul);
+    if (count > MAX) { const li = document.createElement("li"); li.className = "empty"; li.textContent = `… the first ${MAX} nodes are shown.`; ul.appendChild(li); }
+  }
+
+  let pending = false;
+  function schedule() { if (!pending) { pending = true; requestAnimationFrame(() => { pending = false; parse(); }); } }
+  $("src").addEventListener("input", schedule);
+  $("rule").addEventListener("change", schedule);
+  sel.addEventListener("change", () => { $("src").value = EXAMPLES[+sel.value][1]; schedule(); });
+
+  (async () => {
+    try {
+      const wasm = Uint8Array.from(atob(WASM_BASE64), (c) => c.charCodeAt(0));
+      const { instance } = await WebAssembly.instantiate(wasm, {});
+      ex = instance.exports;
+      $("status").textContent = "Edit the source: it is parsed again on every change.";
+      parse();
+    } catch (err) {
+      const st = $("status");
+      st.classList.add("error");
+      st.textContent = "This browser could not load the parser, which needs WebAssembly GC " +
+        "(Chrome 119, Firefox 120, Safari 18.2 or later). " + err.message;
+    }
+  })();
+})();
+</script>

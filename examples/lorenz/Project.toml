@@ -1,6 +1,5 @@
 [deps]
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
-Binaryen_jll = "a54ac8ab-712d-5a0e-8e11-9296c0d3c20e"
 IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
 OrdinaryDiffEqTsit5 = "b1df2697-797e-41e3-8120-5422d3b24e4a"
 SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"

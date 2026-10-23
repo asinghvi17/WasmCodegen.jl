@@ -1,14 +1,9 @@
 # Build the demo page: julia --project=<env> page.jl (after build.jl)
-using Base64, Binaryen_jll
+using Base64
 include("model.jl")
 
 dir = @__DIR__
-features = `--enable-gc --enable-reference-types --enable-multivalue --enable-bulk-memory
-            --enable-nontrapping-float-to-int --enable-sign-ext --enable-exception-handling
-            --enable-tail-call --enable-mutable-globals`
-run(`$(Binaryen_jll.wasmopt()) -O3 $features --closed-world --type-ssa --gufa
-     $(joinpath(dir, "lorenz.wasm")) -o $(joinpath(dir, "lorenz.opt.wasm"))`)
-bytes = read(joinpath(dir, "lorenz.opt.wasm"))
+bytes = read(joinpath(dir, "lorenz.wasm"))   # optimized by `compile` (wasm-opt -O3)
 
 # the native time of the classic case, for reference
 lorenz_solve(10.0, 28.0, 8 / 3, 1.0)

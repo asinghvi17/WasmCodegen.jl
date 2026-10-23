@@ -5,8 +5,17 @@ A forced, damped oscillator written with ModelingToolkit, compiled to WebAssembl
 
 ```
 julia +1.13 --project=. -e 'using Pkg; Pkg.instantiate()'
-julia +1.13 --project=. oscillator.jl
+julia +1.13 --project=. oscillator.jl      # compile and compare with native Julia
+julia +1.13 --project=. build.jl           # oscillator.wasm (entry points in model.jl)
+node --experimental-wasm-exnref check.mjs  # solve in Node.js, compare with build.jl's native run
+julia +1.13 --project=. page.jl            # oscillator.html: sliders, with the module embedded
 ```
+
+The page re-solves the model on every slider change (mass, stiffness, damping, driving
+amplitude and frequency, initial displacement). It plots x(t) and v(t), the phase portrait,
+and the energy, which it reads through MTK's observed function compiled into the module.
+After `wasm-opt`, the module is about 105 KB and solves the default case (1501 saved points)
+in about the time native Julia takes.
 
 `mtkcompile` reduces the model to two states (`x`, `v`); the spring force, acceleration
 and energy become observed variables. The entry point `mtk_run(T, k)` sets the spring
