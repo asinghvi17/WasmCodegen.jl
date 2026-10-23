@@ -57,6 +57,19 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return ghost(Nothing, nothing)
     elseif name === :memset
         return emit_memset!(fc, args[1], args[2], args[3])
+    elseif name === :jl_genericmemory_owner
+        # a Memory owns itself here (none shares a String's storage as its owner)
+        return convert_repr(fc, args[1]::CGVal, typ)
+    elseif name === :jl_string_ptr
+        # the address of the bytes of a string: virtual, pointing into them
+        s = args[1]::CGVal
+        push_memory_base!(fc, convert_repr(fc, s, String))
+        v = pop_val!(fc, typ)
+        push_val!(fc, s)
+        emit!(fc.b, :struct_get, layout(fc, String).wtype, DATA_FIELD)
+        arr = new_local!(fc, RefType(array_type!(fc.cgm.types, I8), true))
+        emit!(fc.b, :local_set, arr)
+        return with_origin(v, PtrOrigin(nothing, arr, Inst(:i32_const, 0), UInt8))
     elseif name === :jl_value_ptr
         # the address of an object: a virtual one (see `push_memory_base!`), pointing into it
         x = args[1]::CGVal

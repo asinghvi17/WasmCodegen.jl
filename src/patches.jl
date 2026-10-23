@@ -9,7 +9,9 @@
 # replaced another restores it).
 
 const TRIM_PATCHES = [joinpath(@__DIR__, "trim", "juliac-trim-base.jl"),
-                      joinpath(@__DIR__, "trim", "juliac-trim-stdlib.jl")]
+                      joinpath(@__DIR__, "trim", "juliac-trim-stdlib.jl"),
+                      # the pseudo-runtime: what Wasm has no C runtime for
+                      joinpath(@__DIR__, "trim", "wasm-io.jl")]
 
 # the constants the patches rebind (methods are restored by deleting their replacements)
 const PATCHED_CONSTS = [(Base, :invokelatest)]
@@ -49,6 +51,7 @@ function with_trim_patches(f; patches=TRIM_PATCHES)
     added = Method[]
     try
         Core.eval(sandbox, :(Core.Compiler._verify_trim_world_age[] = $w0))
+        Core.eval(sandbox, :(const WasmCodegen = $(@__MODULE__)))
         for file in patches
             Base.include(sandbox, file)
         end

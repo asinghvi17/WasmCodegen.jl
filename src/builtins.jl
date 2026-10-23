@@ -238,6 +238,19 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
     elseif f === Core.sizeof
         x = args[1]::CGVal
         isconstant(x) && return const_value(fc, Core.sizeof(constant_value(x)))
+        if x.typ === String || x.typ === Symbol
+            push_val!(fc, x)
+            emit!(fc.b, :struct_get, layout(fc, x.typ).wtype, DATA_FIELD)
+            emit!(fc.b, :array_len)
+            emit!(fc.b, :i64_extend_i32_u)
+            return pop_val!(fc, Int)
+        elseif is_memory_type(x.typ)
+            n = get_field(fc, x, 1)
+            push_val!(fc, n)
+            emit!(fc.b, :i64_const, Base.aligned_sizeof(memory_eltype(x.typ)))
+            emit!(fc.b, :i64_mul)
+            return pop_val!(fc, Int)
+        end
         isconcretetype(x.typ) && !is_memory_type(x.typ) && x.typ !== String &&
             return const_value(fc, Core.sizeof(x.typ))
         unsupported("sizeof of a value of type ", x.typ)

@@ -64,4 +64,15 @@ function cats()
     return a[1] + b[1] + c[end] + d[end] + e[1] + f[end] + g[end] + h[end] + size(h, 2)
 end
 
+
+# AppProject / MathApp: printing to Core.stdout
+function app_main()::Cint
+    println(Core.stdout, "Fast compilation test!")
+    return 0
+end
+function math_main(x::Float64)::Cint
+    println(Core.stdout, "sin(", x, ") = ", sin(x))
+    return 0
+end
+
 end

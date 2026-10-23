@@ -29,7 +29,27 @@ end
 """
     emit_intrinsic_call!(fc, mi, ex, typ) -> Union{Nothing,CGVal}
 
-The code of an `:invoke` the code generator compiles itself, or `nothing` for other
-calls. (None for now: kept as the hook for intrinsics of the runtime.)
+The code of an `:invoke` of a primitive of the runtime, which the code generator compiles
+itself (a host call), or `nothing` for other calls.
 """
-emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nospecialize(typ)) = nothing
+function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nospecialize(typ))
+    m = mi.def
+    m isa Method || return nothing
+    if m.module === Runtime.IO && m.name === :write_byte
+        fd, b = CGVal[operand(fc, a) for a in ex.args[3:end]]
+        push_val!(fc, convert_repr(fc, fd, Int32))
+        push_val!(fc, convert_repr(fc, b, UInt8))
+        call!(fc.b, host_import!(fc.cgm, "write_byte", ValType[I32, I32], ValType[]))
+        return ghost(Nothing, nothing)
+    end
+    return nothing
+end
+
+"""
+    host_import!(cgm, name, params, results) -> Func
+
+The function `name` the host provides (import module `julia`), the runtime's interface to
+the world outside: see the loader for what each one does.
+"""
+host_import!(cgm::CGModule, name::AbstractString, params::Vector{ValType}, results::Vector{ValType}) =
+    add_import!(cgm.mod, "julia", name, params, results)

@@ -4,15 +4,23 @@ import { createInterface } from 'node:readline';
 const modules = new Map();
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 let output = '';
+let bytes = [];
+const decoder = new TextDecoder();
+// the host side of the runtime (import module "julia")
 function makeImports(mod) {
-  const imports = {};
+  const julia = {
+    write_byte: (fd, b) => { bytes.push(b); },
+  };
+  const imports = { julia };
   for (const imp of WebAssembly.Module.imports(mod)) {
-    imports[imp.module] ??= {};
-    if (imp.kind === 'function') {
-      imports[imp.module][imp.name] = (...a) => { output += a.map(String).join('') ; return 0; };
-    }
+    if (imp.module === 'julia' && !(imp.name in julia)) throw new Error('unknown host function ' + imp.name);
   }
   return imports;
+}
+function takeOutput() {
+  output += decoder.decode(new Uint8Array(bytes));
+  bytes = [];
+  const o = output; output = ''; return o;
 }
 function decode(a) {
   const big = BigInt('0x' + a.bits);
@@ -44,19 +52,19 @@ rl.on('line', async (line) => {
       inst = await WebAssembly.instantiate(mod, makeImports(mod));
       modules.set(req.wasmId, inst);
     }
-    output = '';
+    takeOutput();
     const f = inst.exports[req.fn];
     if (!f) throw new Error('no export ' + req.fn);
     let r;
     try {
       r = f(...req.args.map(decode));
     } catch (e) {
-      process.stdout.write(JSON.stringify({ id: req.id, trap: String(e && e.message || e), output }) + '\n');
+      process.stdout.write(JSON.stringify({ id: req.id, trap: String(e && e.message || e), output: takeOutput() }) + '\n');
       return;
     }
     const rs = req.results.length === 1 ? [r] : (req.results.length === 0 ? [] : r);
     const results = req.results.map((t, i) => encode(t, rs[i]));
-    process.stdout.write(JSON.stringify({ id: req.id, results, output }) + '\n');
+    process.stdout.write(JSON.stringify({ id: req.id, results, output: takeOutput() }) + '\n');
   } catch (e) {
     process.stdout.write(JSON.stringify({ id: req.id, error: String(e && e.stack || e) }) + '\n');
   }

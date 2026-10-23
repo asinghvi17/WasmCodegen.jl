@@ -389,6 +389,11 @@ end
 # the primitive leaves of an isbits value, as Julia values
 function const_leaves_bits(@nospecialize(x))
     T = typeof(x)
+    if isprimitivetype(T) && sizeof(T) == 16
+        # two 64-bit leaves: low, high
+        u = Core.bitcast(UInt128, x)
+        return Any[UInt64(u & typemax(UInt64)), UInt64(u >> 64)]
+    end
     isprimitivetype(T) && return Any[x]
     out = Any[]
     for i in 1:fieldcount(T)
