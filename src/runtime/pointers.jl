@@ -40,3 +40,14 @@ function ptr_memcmp(a::Ptr{UInt8}, b::Ptr{UInt8}, n::UInt)
     end
     return Int32(0)
 end
+
+"`memchr(p, c, n)`: the first of the `n` bytes at `p` equal to `c`, or a null pointer."
+function ptr_memchr(p::Ptr{UInt8}, c::Int32, n::UInt)
+    b = c % UInt8
+    i = UInt(1)
+    while i <= n
+        unsafe_load(p, i) == b && return p + (i - 1)
+        i += 1
+    end
+    return Ptr{UInt8}(0)
+end

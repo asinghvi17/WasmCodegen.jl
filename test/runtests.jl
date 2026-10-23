@@ -6,5 +6,7 @@ WasmCodegen.with_trim_patches() do _, _
     include("basics.jl")
     include("data.jl")
     include("random.jl")
+    include("dicts.jl")
+    include("globals.jl")
     include("juliac/runtests.jl")
 end

@@ -233,7 +233,7 @@ function ptr_load!(fc::FnCtx, p::CGVal, i::CGVal, @nospecialize(T))
     end
     if o !== nothing && !is_object_origin(o) && T === o.eltype && !byte_addressable(fc, T)
         # a whole element of a memory whose elements are not stored as bytes
-        return emit_memoryrefget!(fc, element_ref!(fc, o, i, T), const_value(fc, false), T)
+        return outlined_memoryrefget!(fc, element_ref!(fc, o, i, T), const_value(fc, false), T)
     end
     isbitstype(T) || unsupported("a load of a ", T, " through a pointer")
     byte = byte_offset!(fc, p, i, T)
@@ -274,7 +274,7 @@ function ptr_store!(fc::FnCtx, p::CGVal, v::CGVal, i::CGVal)
         return p
     end
     if o !== nothing && !is_object_origin(o) && T === o.eltype && !byte_addressable(fc, T)
-        emit_memoryrefset!(fc, element_ref!(fc, o, i, T), v, const_value(fc, false))
+        outlined_memoryrefset!(fc, element_ref!(fc, o, i, T), v, const_value(fc, false))
         return p
     end
     isbitstype(T) || unsupported("a store of a ", T, " through a pointer")

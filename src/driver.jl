@@ -62,10 +62,31 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
     finish_module!(cgm)
     bytes = to_bytes(cgm.mod)
     validate && WasmBuilder.validate(bytes)
+    config.optimize === nothing || (bytes = wasm_opt(bytes, config.optimize))
     return Compilation(bytes, w, cgm)
 end
 
 compile(f, argtypes::Tuple; kw...) = compile([Entry(f, argtypes)]; kw...)
+
+# the WebAssembly features the code generator uses, for Binaryen
+const WASM_FEATURES = `--enable-gc --enable-reference-types --enable-multivalue --enable-bulk-memory
+                       --enable-nontrapping-float-to-int --enable-sign-ext
+                       --enable-exception-handling --enable-tail-call --enable-mutable-globals`
+
+"""
+    wasm_opt(bytes, options) -> Vector{UInt8}
+
+The module optimized by Binaryen's `wasm-opt` (from Binaryen_jll), as a whole program
+(`--closed-world`: no type escapes it but through its exports).
+"""
+function wasm_opt(bytes::Vector{UInt8}, options::Cmd)
+    mktempdir() do dir
+        src, dst = joinpath(dir, "in.wasm"), joinpath(dir, "out.wasm")
+        write(src, bytes)
+        run(`$(Binaryen_jll.wasmopt()) $options $WASM_FEATURES --closed-world --type-ssa --gufa $src -o $dst`)
+        return read(dst)
+    end
+end
 
 function finish_module!(cgm::CGModule)
     finish_pointers!(cgm)

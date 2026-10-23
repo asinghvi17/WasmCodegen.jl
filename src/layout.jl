@@ -408,14 +408,15 @@ end
     bytes_object_type!(ts, T) -> TypeRef
 
 The Wasm struct type of `String`s or `Symbol`s: the header and the bytes (the array type
-of `Memory{UInt8}`, which the conversions between strings and memory share).
+of `Memory{UInt8}`, which the conversions between strings and memory share). A symbol also
+has its hash, as Julia's runtime computes it (`objectid`, `SYMBOL_HASH_FIELD`).
 """
 function bytes_object_type!(ts::Types, @nospecialize(T))
     get!(ts.boxes, T) do
         bytes = array_type!(ts, I8)
-        add_type!(ts.mod, StructType([FieldType(I32, false), FieldType(I32, true),
-                                       FieldType(RefType(bytes, true), false)]);
-                  final=true, super=ts.jlvalue)
+        fields = [FieldType(I32, false), FieldType(I32, true), FieldType(RefType(bytes, true), false)]
+        T === Symbol && push!(fields, FieldType(I64, false))
+        add_type!(ts.mod, StructType(fields); final=true, super=ts.jlvalue)
     end
 end
 
@@ -436,6 +437,8 @@ end
 
 "The field of the array of the objects of `Memory`, `String` and `Symbol`."
 const DATA_FIELD = HEADER_FIELDS
+"The index of the hash of a `Symbol` object (after its bytes)."
+const SYMBOL_HASH_FIELD = DATA_FIELD + 1
 
 "Whether the objects of the boxed type `T` are `\$JlValue`s (they all are)."
 is_jlvalue_type(ts::Types, @nospecialize(T)) = true

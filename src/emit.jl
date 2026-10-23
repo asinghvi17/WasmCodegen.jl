@@ -85,7 +85,9 @@ function emit_function!(cgm::CGModule, info::FuncInfo)
     end
     b = Builder(cgm.mod, info.func)
     fc = FnCtx(cgm, info, sci, b, CGVal[], Dict{Int,Any}(), Dict{Int,CGVal}(),
-               LoopTarget[], 0, Vector{CGVal}[])
+               LoopTarget[], 0, Vector{CGVal}[], Dict{Int,Any}(), Set{Int}(), Uses(), Bool[], 0)
+    collect_ssatypes!(fc.ssatypes, sci.entry)
+    analyze_uses!(fc, sci.entry)
     bind_arguments!(fc)
     emit_block!(fc, sci.entry)
     is_unreachable(b) || unreachable!(b)
@@ -175,6 +177,7 @@ function emit_block!(fc::FnCtx, block)
         stmt = inst[:stmt]
         typ = CC.widenconst(inst[:type])
         if stmt isa IRStructurizer.ControlFlowOp
+            fc.opidx = idx
             fc.ssavals[idx] = emit_cfop!(fc, stmt, typ)
         else
             res = emit_stmt_or_trap!(fc, stmt, typ)
@@ -238,14 +241,20 @@ end
 
 # assign values to locals, evaluating all values before assigning (a value may read a
 # local that is assigned)
+# assign the values `vals` to the destinations `dsts` (as one parallel assignment); an
+# undefined value leaves its destination as it is (it is not read), and a bottom
+# destination is an aliased result, not assigned
 function assign_all!(fc::FnCtx, dsts::Vector{CGVal}, vals)
-    srcs = CGVal[convert_repr(fc, operand(fc, v), d.typ) for (v, d) in zip(vals, dsts)]
-    for (d, s) in zip(dsts, srcs)
+    pairs = [(d, v) for (d, v) in zip(dsts, vals)
+             if d.kind !== Bottom && !(v isa IRStructurizer.Undef) && !same_locals(fc, d, v)]
+    srcs = CGVal[convert_repr(fc, operand(fc, v), d.typ) for (d, v) in pairs]
+    for s in srcs
         s.kind === Bottom && continue
         push_val!(fc, s)
     end
-    for d in Iterators.reverse(dsts)
-        pop_to!(fc, d)
+    for i in reverse(eachindex(pairs))
+        srcs[i].kind === Bottom && continue
+        pop_to!(fc, pairs[i][1])
     end
 end
 
@@ -286,26 +295,204 @@ function new_vals!(fc::FnCtx, types)
 end
 
 function emit_cfop!(fc::FnCtx, op::IRStructurizer.IfOp, @nospecialize(typ))
-    results = new_vals!(fc, result_types(typ))
+    rtypes = result_types(typ)
+    # a result that both arms yield as the same value (or one of them as undefined) is
+    # that value: no locals, no copies (Wasm locals live in the whole function, and on the
+    # undefined arm the result is not read)
+    aliases = Any[if_alias(fc, op, i, rtypes[i]) for i in eachindex(rtypes)]
+    results = CGVal[aliases[i] === nothing ? result_val!(fc, fc.opidx, i, rtypes[i]) : bottom()
+                    for i in eachindex(rtypes)]
     c = convert_repr(fc, operand(fc, op.condition), Bool)
     if isconstant(c)
         # a branch on a constant: only one arm
-        push!(fc.yields, results)
+        push!(fc.yields, results); push!(fc.yields_if, true)
         emit_region!(fc, constant_value(c) ? op.then_region : op.else_region)
-        pop!(fc.yields)
-        return MultiVal(results)
+        pop!(fc.yields); pop!(fc.yields_if)
+    else
+        push_val!(fc, c)
+        if!(fc.b)
+        open_label!(fc)
+        push!(fc.yields, results); push!(fc.yields_if, true)
+        emit_region!(fc, op.then_region)
+        else!(fc.b)
+        emit_region!(fc, op.else_region)
+        pop!(fc.yields); pop!(fc.yields_if)
+        end!(fc.b)
+        close_label!(fc)
     end
-    push_val!(fc, c)
-    if!(fc.b)
-    open_label!(fc)
-    push!(fc.yields, results)
-    emit_region!(fc, op.then_region)
-    else!(fc.b)
-    emit_region!(fc, op.else_region)
-    pop!(fc.yields)
-    end!(fc.b)
-    close_label!(fc)
+    for (i, a) in enumerate(aliases)
+        a === nothing && continue
+        # (defined in an arm that does not complete: no value, the result is not read)
+        v = a isa Core.SSAValue && !haskey(fc.ssavals, a.id) ? undef_val(fc, rtypes[i]) : operand(fc, a)
+        results[i] = v isa CGVal && v.kind !== Bottom ? convert_repr(fc, v, rtypes[i]) : undef_val(fc, rtypes[i])
+    end
     return MultiVal(results)
+end
+
+# the value the result `i` of an if is, when every arm that yields it yields that one
+# value or undefined, and the value has the representation of the result's type
+function if_alias(fc::FnCtx, op::IRStructurizer.IfOp, i::Int, @nospecialize(T))
+    v = nothing
+    for r in (op.then_region, op.else_region)
+        t = r.terminator
+        t isa IRStructurizer.YieldOp || continue
+        x = t.values[i]
+        x isa IRStructurizer.Undef && continue
+        if v === nothing
+            v = x
+        elseif !(v === x)
+            return nothing
+        end
+    end
+    v === nothing && return nothing
+    S = static_type(fc, v)
+    S === nothing && return nothing
+    return same_repr(fc, S, T) ? v : nothing
+end
+
+# the type of an operand, before it is emitted (or nothing if not known)
+function static_type(fc::FnCtx, @nospecialize(x))
+    if x isa Core.SSAValue
+        return get(fc.ssatypes, x.id, nothing)
+    elseif x isa IRStructurizer.BlockArgument
+        return CC.widenconst(x.type)
+    elseif x isa Core.Argument
+        return x.n <= length(fc.info.argtypes) ? fc.info.argtypes[x.n] : nothing
+    elseif x isa QuoteNode
+        return Core.Typeof(x.value)
+    elseif x isa GlobalRef || x isa Expr || x isa IRStructurizer.Undef
+        return nothing
+    end
+    return Core.Typeof(x)
+end
+
+# whether the value `v` (an operand) is in the locals of `d` already
+function same_locals(fc::FnCtx, d::CGVal, @nospecialize(v))
+    v isa Core.SSAValue && haskey(fc.ssavals, v.id) || return false
+    x = fc.ssavals[v.id]
+    return x isa CGVal && x.typ === d.typ && x.leaves == d.leaves
+end
+
+# whether a value of type S is a value of type T without a conversion that emits code
+function same_repr(fc::FnCtx, @nospecialize(S), @nospecialize(T))
+    S === T && return true
+    S <: T || return false
+    ls, lt = layout(fc, S), layout(fc, T)
+    if ls.kind === Inline && lt.kind === Inline
+        return length(ls.leaves) == length(lt.leaves) &&
+               all(i -> ls.leaves[i].type == lt.leaves[i].type, eachindex(lt.leaves))
+    elseif ls.kind === Boxed && lt.kind === Boxed
+        return ls.wtype == lt.wtype ||
+               (lt.wtype == fc.cgm.types.jlvalue && is_jlvalue_type(fc.cgm.types, S))
+    end
+    return false
+end
+
+"""
+    Uses
+
+What the code generator needs to know about the uses of SSA values: how many times each
+is used, which is used by the terminator of the block defining it (and at which position
+of its values), and the projections `getfield(op, i)` of the results of control flow
+operations.
+"""
+struct Uses
+    count::Dict{Int,Int}
+    interm::Dict{Int,Tuple{Any,Int}}
+    defblock::Dict{Int,Any}
+    projections::Dict{Tuple{Int,Int},Vector{Int}}
+end
+Uses() = Uses(Dict{Int,Int}(), Dict{Int,Tuple{Any,Int}}(), Dict{Int,Any}(), Dict{Tuple{Int,Int},Vector{Int}}())
+
+"""
+    analyze_uses!(fc, block)
+
+Find the block arguments that are read (`fc.usedargs`: a loop carry nothing reads is not
+kept) and the uses of SSA values (`fc.uses`).
+"""
+function analyze_uses!(fc::FnCtx, block)
+    u = fc.uses
+    function use!(@nospecialize(v))
+        v isa IRStructurizer.BlockArgument && push!(fc.usedargs, v.id)
+        v isa Core.SSAValue && (u.count[v.id] = get(u.count, v.id, 0) + 1)
+    end
+    for inst in IRStructurizer.instructions(block)
+        st = inst[:stmt]
+        u.defblock[inst.ssa_idx] = block
+        if st isa IRStructurizer.ControlFlowOp
+            foreach(use!, IRStructurizer.operands(st))
+            foreach(b -> analyze_uses!(fc, b), IRStructurizer.blocks(st))
+        else
+            foreach(use!, IRStructurizer.operands(block, st))
+            # a projection of a result of a control flow operation
+            if st isa Expr && st.head === :call && length(st.args) == 3 &&
+               st.args[2] isa Core.SSAValue && st.args[3] isa Int
+                push!(get!(Vector{Int}, u.projections, (st.args[2].id, st.args[3])), inst.ssa_idx)
+            end
+        end
+    end
+    t = block.terminator
+    t === nothing && return
+    for name in fieldnames(typeof(t))
+        isdefined(t, name) || continue
+        x = getfield(t, name)
+        if x isa AbstractVector
+            for (j, v) in enumerate(x)
+                use!(v)
+                v isa Core.SSAValue && (u.interm[v.id] = (block, j))
+            end
+        else
+            use!(x)
+        end
+    end
+end
+
+# the locals of the result `i` of the control flow operation `opidx`: those of the
+# enclosing `if`'s result it is forwarded to, or new ones
+function result_val!(fc::FnCtx, opidx::Int, i::Int, @nospecialize(T))
+    d = forwarded_result(fc, opidx, i, T)
+    return d === nothing ? new_val!(fc, T) : d
+end
+
+"""
+    forwarded_result(fc, opidx, i, T) -> Union{Nothing,CGVal}
+
+Where the result `i` of the control flow operation `opidx` only goes to the yield that ends
+its block, to the results of the enclosing `if`: that destination, which the operation
+can assign directly (destination passing: a chain of nested merges shares its locals
+instead of copying at each level). An `if`'s results cannot be read inside the `if`, so
+nothing reads them before the yield; a loop's carries could be, and are never forwarded
+to.
+"""
+function forwarded_result(fc::FnCtx, opidx::Int, i::Int, @nospecialize(T))
+    u = fc.uses
+    (isempty(fc.yields) || !fc.yields_if[end]) && return nothing
+    ps = get(u.projections, (opidx, i), nothing)
+    (ps !== nothing && length(ps) == 1) || return nothing
+    p = only(ps)
+    get(u.count, p, 0) == 1 || return nothing
+    t = get(u.interm, p, nothing)
+    t === nothing && return nothing
+    block, j = t
+    block === get(u.defblock, opidx, nothing) || return nothing
+    block.terminator isa IRStructurizer.YieldOp || return nothing
+    dsts = fc.yields[end]
+    j <= length(dsts) || return nothing
+    d = dsts[j]
+    (d.kind !== Bottom && d.typ === T) || return nothing
+    return d
+end
+
+function collect_ssatypes!(d::Dict{Int,Any}, block)
+    for inst in IRStructurizer.instructions(block)
+        d[inst.ssa_idx] = CC.widenconst(inst[:type])
+        st = inst[:stmt]
+        if st isa IRStructurizer.ControlFlowOp
+            for b in IRStructurizer.blocks(st)
+                collect_ssatypes!(d, b)
+            end
+        end
+    end
 end
 
 # emit a region in its own scope of block arguments
@@ -319,11 +506,17 @@ function bind_block_args!(fc::FnCtx, args, vals::Vector{CGVal})
     end
 end
 
+# the locals of the carries of a loop; a carry nothing reads has none (bottom: its
+# assignments are dropped)
+function carry_vals!(fc::FnCtx, args)
+    return CGVal[a.id in fc.usedargs ? new_val!(fc, CC.widenconst(a.type)) : bottom() for a in args]
+end
+
 function emit_cfop!(fc::FnCtx, op::IRStructurizer.LoopOp, @nospecialize(typ))
-    carries = new_vals!(fc, [CC.widenconst(a.type) for a in op.body.args])
+    carries = carry_vals!(fc, op.body.args)
     assign_all!(fc, carries, op.init_values)
     bind_block_args!(fc, op.body.args, carries)
-    results = new_vals!(fc, result_types(typ))
+    results = CGVal[result_val!(fc, fc.opidx, i, R) for (i, R) in enumerate(result_types(typ))]
     block!(fc.b); exit = open_label!(fc)
     loop!(fc.b); cont = open_label!(fc)
     push!(fc.loops, LoopTarget(exit, cont, carries, results, nothing, nothing))
@@ -341,7 +534,7 @@ function emit_cfop!(fc::FnCtx, op::IRStructurizer.ForOp, @nospecialize(typ))
     iv = new_val!(fc, ivT)
     assign!(fc, iv, convert_repr(fc, operand(fc, op.lower), ivT))
     fc.blockargs[op.iv_arg.id] = iv
-    carries = new_vals!(fc, [CC.widenconst(a.type) for a in op.body.args])
+    carries = carry_vals!(fc, op.body.args)
     assign_all!(fc, carries, op.init_values)
     bind_block_args!(fc, op.body.args, carries)
     upper = convert_repr(fc, operand(fc, op.upper), ivT)
@@ -363,10 +556,10 @@ function emit_cfop!(fc::FnCtx, op::IRStructurizer.ForOp, @nospecialize(typ))
 end
 
 function emit_cfop!(fc::FnCtx, op::IRStructurizer.WhileOp, @nospecialize(typ))
-    carries = new_vals!(fc, [CC.widenconst(a.type) for a in op.before.args])
+    carries = carry_vals!(fc, op.before.args)
     assign_all!(fc, carries, op.init_values)
     bind_block_args!(fc, op.before.args, carries)
-    results = new_vals!(fc, result_types(typ))
+    results = CGVal[result_val!(fc, fc.opidx, i, R) for (i, R) in enumerate(result_types(typ))]
     block!(fc.b); exit = open_label!(fc)
     loop!(fc.b); cont = open_label!(fc)
     push!(fc.loops, LoopTarget(exit, cont, carries, results, nothing, nothing))
@@ -376,6 +569,7 @@ function emit_cfop!(fc::FnCtx, op::IRStructurizer.WhileOp, @nospecialize(typ))
         stmt = inst[:stmt]
         typ_i = CC.widenconst(inst[:type])
         if stmt isa IRStructurizer.ControlFlowOp
+            fc.opidx = inst.ssa_idx
             fc.ssavals[inst.ssa_idx] = emit_cfop!(fc, stmt, typ_i)
         else
             res = emit_stmt_or_trap!(fc, stmt, typ_i)
@@ -401,9 +595,9 @@ function emit_cfop!(fc::FnCtx, op::IRStructurizer.WhileOp, @nospecialize(typ))
             assign_all!(fc, afterargs, term.args)
             bind_block_args!(fc, op.after.args, afterargs)
             # the after region yields the next carried values
-            push!(fc.yields, carries)
+            push!(fc.yields, carries); push!(fc.yields_if, false)
             emit_block!(fc, op.after)
-            pop!(fc.yields)
+            pop!(fc.yields); pop!(fc.yields_if)
             is_unreachable(fc.b) || br!(fc.b, br_depth(fc, cont))
         else
             emit_terminator!(fc, term)
@@ -626,14 +820,21 @@ function box!(fc::FnCtx, v::CGVal, @nospecialize(T))
         return CGVal(T, Boxed, LeafVal[Inst(:global_get, g)], v.constant)
     end
     lv.kind === Ghost && unsupported("boxing the ghost ", S, " without its value")
+    # by a helper per type (outline.jl)
+    r = call_outlined!(fc, (:box, S), "box_" * typename_str(S), CGVal[v], Any, box_inline!)
+    return CGVal(T, Boxed, r.leaves)
+end
+
+function box_inline!(fc::FnCtx, args::Vector{CGVal})
+    ts = fc.cgm.types
+    v = only(args)
+    S = v.typ
     box = box_type!(ts, S)
     emit!(fc.b, :i32_const, typeid!(ts, S))
     emit!(fc.b, :i32_const, 0)
     push_val!(fc, v)
     emit!(fc.b, :struct_new, box)
-    r = new_local!(fc, jlvalue_ref(ts))
-    emit!(fc.b, :local_set, r)
-    return CGVal(T, Boxed, LeafVal[r])
+    return pop_val!(fc, Any)
 end
 
 """
@@ -649,7 +850,13 @@ function unbox!(fc::FnCtx, v::CGVal, @nospecialize(T))
         emit!(fc.b, :ref_cast_null, lt.wtype)
         return pop_val!(fc, T)
     end
-    # an inline value, a Memory or a String: in a box
+    # an inline value, a Memory or a String: in a box, unpacked by a helper per type
+    return call_outlined!(fc, (:unbox, T), "unbox_" * typename_str(T),
+                          CGVal[CGVal(Any, Boxed, v.leaves)], T, (h, a) -> unbox_inline!(h, a[1], T))
+end
+
+function unbox_inline!(fc::FnCtx, v::CGVal, @nospecialize(T))
+    ts = fc.cgm.types
     box = box_type!(ts, T)
     push_val!(fc, v)
     emit!(fc.b, :ref_cast_null, box)

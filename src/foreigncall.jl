@@ -22,7 +22,7 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     if name === :jl_alloc_genericmemory
         M = args[1]::CGVal
         isconstant(M) || unsupported("allocating a Memory of a type not known at compile time")
-        return emit_memorynew!(fc, constant_value(M), args[2])
+        return outlined_memorynew!(fc, constant_value(M), args[2])
     elseif name === :jl_alloc_string
         n = convert_repr(fc, args[1], Int)
         push_val!(fc, n)
@@ -54,6 +54,11 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return bytes_from_ptr!(fc, args[1], args[2], Symbol)
     elseif name === :jl_pchar_to_string
         return bytes_from_ptr!(fc, args[1], args[2], String)
+    elseif name === :jl_object_id
+        return emit_objectid!(fc, args[1]::CGVal)
+    elseif name === :memchr
+        return call_runtime!(fc, Runtime.ptr_memchr, CGVal[byte_ptr(args[1]), convert_repr(fc, args[2], Int32),
+                                                            convert_repr(fc, args[3], UInt)])
     elseif name === :memcmp
         return call_runtime!(fc, Runtime.ptr_memcmp, CGVal[byte_ptr(args[1]), byte_ptr(args[2]),
                                                             convert_repr(fc, args[3], UInt)])
@@ -88,6 +93,41 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     unsupported("the foreign call ", something(name, ex.args[1]))
 end
 
+"""
+    emit_objectid!(fc, x) -> CGVal
+
+`objectid(x)` as Julia's C runtime computes it, where it does not depend on addresses: of a
+symbol, its hash; of an isbits value without padding of 1, 2, 4 or 8 bytes, the hash of its
+bits mixed with its type's hash (`immut_id_`); of a singleton, from its type's hash. Hashes
+of `Dict`s built at compile time depend on these values.
+"""
+function emit_objectid!(fc::FnCtx, x::CGVal)
+    T = x.typ
+    if isconstant(x)
+        v = constant_value(x)
+        (v isa Symbol || isbits(v)) && return const_value(fc, objectid(v))
+    end
+    if T === Symbol
+        push_val!(fc, x)
+        emit!(fc.b, :struct_get, layout(fc, Symbol).wtype, SYMBOL_HASH_FIELD)
+        return pop_val!(fc, UInt64)
+    end
+    (T isa DataType && isbitstype(T)) || unsupported("objectid of a value of type ", T)
+    h = UInt64(reinterpret(UInt32, getfield(T, :hash)))
+    sz = sizeof(T)
+    sz == 0 && return const_value(fc, ~h)
+    I = sz == 1 ? Int8 : sz == 2 ? Int16 : sz == 4 ? Int32 : sz == 8 ? UInt64 : nothing
+    (I !== nothing && !Base.datatype_haspadding(T) &&
+     (isprimitivetype(T) || (Base.datatype_isbitsegal(T) && Base.datatype_pointerfree(T)))) ||
+        unsupported("objectid of a value of type ", T)
+    bits = emit_reinterpret_bits!(fc, I, x, T)
+    r = call_runtime!(fc, Runtime.bits_hash, CGVal[bits])
+    push_val!(fc, r)
+    emit!(fc.b, :i64_const, reinterpret(Int64, h))
+    emit!(fc.b, :i64_xor)
+    return pop_val!(fc, UInt64)
+end
+
 "A `String` or `Symbol` (`T`) of a copy of the `n` bytes at the pointer `p`."
 function bytes_from_ptr!(fc::FnCtx, p::CGVal, n::CGVal, @nospecialize(T))
     n = convert_repr(fc, n, Int)
@@ -97,18 +137,25 @@ function bytes_from_ptr!(fc::FnCtx, p::CGVal, n::CGVal, @nospecialize(T))
     s = new_bytes_object!(fc, String)
     emit_memmove!(fc, string_ptr!(fc, s, Ptr{UInt8}), p, n, true)
     T === String && return s
+    h = call_runtime!(fc, Runtime.symbol_hash, CGVal[s])
     push_val!(fc, s); emit!(fc.b, :struct_get, layout(fc, String).wtype, DATA_FIELD)
-    return new_bytes_object!(fc, T)
+    return new_bytes_object!(fc, T, h)
 end
 
-"The `String` (or `Symbol`) object of type `T` of the bytes on the stack."
-function new_bytes_object!(fc::FnCtx, @nospecialize(T))
+"""
+    new_bytes_object!(fc, T[, hash]) -> CGVal
+
+The `String` (or `Symbol`, with its `hash`, a UInt64) object of type `T` of the bytes on
+the stack.
+"""
+function new_bytes_object!(fc::FnCtx, @nospecialize(T), hash::Union{Nothing,CGVal}=nothing)
     ts = fc.cgm.types
     arr = new_local!(fc, RefType(array_type!(ts, I8), true))
     emit!(fc.b, :local_set, arr)
     emit!(fc.b, :i32_const, typeid!(ts, T))
     emit!(fc.b, :i32_const, 0)
     emit!(fc.b, :local_get, arr)
+    T === Symbol && push_val!(fc, hash::CGVal)
     emit!(fc.b, :struct_new, bytes_object_type!(ts, T))
     return pop_val!(fc, T)
 end
@@ -261,7 +308,19 @@ struct RuntimeCcall
     args::Vector{Symbol}
 end
 
-const RUNTIME_CCALLS = Dict{Symbol,RuntimeCcall}()
+const RUNTIME_CCALLS = Dict{Symbol,RuntimeCcall}(
+    # Unicode properties (libutf8proc, libjulia): tables of the native libraries
+    :utf8proc_category => RuntimeCcall(Runtime.UnicodeData.category, [:val]),
+    :jl_id_char => RuntimeCcall(Runtime.UnicodeData.id_char, [:val]),
+    :jl_id_start_char => RuntimeCcall(Runtime.UnicodeData.id_start_char, [:val]),
+    :utf8proc_grapheme_break_stateful =>
+        RuntimeCcall(Runtime.UnicodeData.grapheme_break_stateful, [:val, :val, :val]),
+    # the C library's float parsing and errno
+    :jl_strtod_c => RuntimeCcall(Runtime.Floats.strtod, [:val, :val]),
+    :jl_strtof_c => RuntimeCcall(Runtime.Floats.strtof, [:val, :val]),
+    :jl_set_errno => RuntimeCcall(Runtime.Floats.set_errno, [:val]),
+    :jl_errno => RuntimeCcall(Runtime.Floats.get_errno, Symbol[]),
+)
 
 runtime_ccall(name) = name === nothing ? nothing : get(RUNTIME_CCALLS, name, nothing)
 

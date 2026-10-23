@@ -21,6 +21,10 @@ Base.@kwdef struct Config
     verify::Symbol = :warn
     trim_patches::Bool = true
     trim::Symbol = :safe
+    "Binaryen's `wasm-opt` options the module is optimized with (`nothing`: not optimized).
+    The code generator emits simple code (a local per value) and leaves allocating locals,
+    putting values on the operand stack and the rest to it."
+    optimize::Union{Nothing,Cmd} = `-O3`
 end
 
 """
@@ -104,8 +108,18 @@ mutable struct FnCtx
     loops::Vector{LoopTarget}
     "The number of labels (blocks, loops, ifs) enclosing the current position."
     depth::Int
-    "The results of the enclosing ifs, which `YieldOp`s assign."
+    "The results of the enclosing ifs, which `YieldOp`s assign (bottom: not assigned)."
     yields::Vector{Vector{CGVal}}
+    "The types of the SSA values of the structured IR."
+    ssatypes::Dict{Int,Any}
+    "The block arguments (loop carries) that are read somewhere."
+    usedargs::Set{Int}
+    "The uses of the SSA values (see `analyze_uses!`)."
+    uses::Any
+    "Whether the destinations of each entry of `yields` are the results of an `if`."
+    yields_if::Vector{Bool}
+    "The SSA index of the control flow operation being emitted."
+    opidx::Int
 end
 
 layout(fc::FnCtx, @nospecialize(T)) = layout(fc.cgm.types, T)

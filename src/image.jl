@@ -131,6 +131,11 @@ function const_leaves(img::Image, @nospecialize(x), @nospecialize(FT))
     # a reference
     if lf.wtype == ts.jlvalue
         return Inst[Inst(:global_get, boxed_object_global!(img, x))]
+    elseif lf.elements !== nothing && layout(ts, typeof(x)).elements === nothing
+        # a tuple stored where the declared type is a tuple of unknown length (`VersionNumber`'s
+        # `prerelease`): an array object of the declared element type
+        g = get!(() -> tuple_array_global!(img, x, lf; register=false), img.boxes, (x, lf.wtype))
+        return Inst[Inst(:global_get, g)]
     end
     return Inst[Inst(:global_get, object_global!(img, x))]
 end
@@ -221,10 +226,12 @@ function object_global!(img::Image, @nospecialize(x))
 end
 
 # a large tuple: its elements in an array (as a Memory's), in an object
-function tuple_array_global!(img::Image, @nospecialize(x), l::Layout)
+# the tuple `x` as an array object of the layout `l` (of its own type, or of the declared
+# type of where it is stored)
+function tuple_array_global!(img::Image, @nospecialize(x), l::Layout; register::Bool=true)
     ts = types(img)
     T = typeof(x)
-    mem = Memory{fieldtype(T, 1)}(undef, fieldcount(T))
+    mem = Memory{(l.elements::MemoryLayout).elem.T}(undef, fieldcount(T))
     for i in 1:fieldcount(T)
         mem[i] = x[i]
     end
@@ -233,7 +240,7 @@ function tuple_array_global!(img::Image, @nospecialize(x), l::Layout)
     init = Inst[Inst(:i32_const, typeid!(ts, T)), Inst(:i32_const, 0), Inst(:global_get, arr),
                 Inst(:struct_new, l.wtype)]
     g = add_global!(img.cgm.mod, global_name(img, x), RefType(l.wtype, false), false, init)
-    img.globals[x] = g
+    register && (img.globals[x] = g)
     return g
 end
 
@@ -256,8 +263,10 @@ function bytes_object_global!(img::Image, @nospecialize(x))
     bytes = Vector{UInt8}(codeunits(x isa Symbol ? String(x) : x))
     arr = array_global!(img, bytes, bytes, UInt8)
     img.arrays[x] = arr
-    init = Inst[Inst(:i32_const, typeid!(ts, T)), Inst(:i32_const, 0), Inst(:global_get, arr),
-                Inst(:struct_new, bytes_object_type!(ts, T))]
+    init = Inst[Inst(:i32_const, typeid!(ts, T)), Inst(:i32_const, 0), Inst(:global_get, arr)]
+    # a symbol's hash, computed natively
+    x isa Symbol && push!(init, Inst(:i64_const, reinterpret(Int64, objectid(x))))
+    push!(init, Inst(:struct_new, bytes_object_type!(ts, T)))
     name = x isa Symbol ? "jl_sym_" * replace(String(x), r"[^A-Za-z0-9_]" => "_") : global_name(img, x)
     g = add_global!(img.cgm.mod, name, RefType(bytes_object_type!(ts, T), false), false, init)
     img.globals[x] = g

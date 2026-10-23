@@ -58,7 +58,11 @@ end
 function WasmInterpreter(; world::UInt=Base.get_world_counter())
     mt = CC.CachedMethodTable(CC.InternalMethodTable(world))
     inf_params = CC.InferenceParams(; force_enable_inference=true)
-    opt_params = CC.OptimizationParams()
+    # calls target the method instance of their argument types, not the signature native
+    # code would be compiled for, which widens arguments of type Function, Type and Vararg
+    # that a method only passes on (JuliaSyntax's parser passes its subparsers as
+    # `down::Function`): a closed world has no dynamic dispatch to fall back on
+    opt_params = CC.OptimizationParams(; compilesig_invokes=false)
     return WasmInterpreter(world, mt, CC.InferenceResult[], inf_params, opt_params,
                            CodegenSources())
 end

@@ -264,13 +264,13 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
         (isconstant(m) && isconstant(s)) || unsupported("setglobal! of a binding not known at compile time")
         return set_global_var!(fc, GlobalRef(constant_value(m), constant_value(s)), args[3])
     elseif f === Core.memoryrefnew
-        return emit_memoryrefnew!(fc, args)
+        return outlined_memoryrefnew!(fc, args)
     elseif f === Core.memoryrefget
-        return emit_memoryrefget!(fc, args[1], args[3], typ)
+        return outlined_memoryrefget!(fc, args[1], args[3], typ)
     elseif f === Core.memoryrefset!
-        return emit_memoryrefset!(fc, args[1], args[2], args[4])
+        return outlined_memoryrefset!(fc, args[1], args[2], args[4])
     elseif f === Core.memoryref_isassigned
-        return emit_memoryref_isassigned!(fc, args[1], args[3])
+        return outlined_isassigned!(fc, args[1], args[3])
     elseif f === Core.memoryrefoffset
         r = args[1]::CGVal
         push_leaf!(fc, r.leaves[3])
@@ -279,7 +279,7 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
         emit!(fc.b, :i64_extend_i32_u)
         return pop_val!(fc, Int)
     elseif isdefined(Core, :memorynew) && f === getfield(Core, :memorynew)
-        return emit_memorynew!(fc, constant_value(args[1]), args[2])
+        return outlined_memorynew!(fc, constant_value(args[1]), args[2])
     elseif f === Core._apply_iterate
         return emit_apply_iterate!(fc, args, typ)
     elseif f === Core.apply_type

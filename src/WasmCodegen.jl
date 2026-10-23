@@ -13,6 +13,7 @@ using WasmBuilder: Inst, Func, Global, WModule, TypeRef, RefType, ValType, Stora
                    PackedType, FieldType, StructType, ArrayType, SubType, Builder, emit!,
                    typedef, is_unreachable
 import IRStructurizer
+import Binaryen_jll
 using IRStructurizer: StructuredIRCode
 
 const CC = Base.Compiler
@@ -25,6 +26,9 @@ include("runtime/int128.jl")
 include("runtime/io.jl")
 include("runtime/pointers.jl")
 include("runtime/reinterpret.jl")
+include("runtime/hash.jl")
+include("runtime/unicode.jl")
+include("runtime/floats.jl")
 end
 include("interpreter.jl")
 include("collect.jl")
@@ -35,6 +39,7 @@ include("context.jl")
 include("emit.jl")
 include("builtins.jl")
 include("memory.jl")
+include("outline.jl")
 include("intrinsics.jl")
 include("intrinsics128.jl")
 include("foreigncall.jl")
