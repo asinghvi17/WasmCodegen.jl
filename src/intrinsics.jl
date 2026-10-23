@@ -127,9 +127,10 @@ function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}
         push_val!(fc, a)
         emit!(fc.b, wop(t, FLOAT_UNOPS[f]))
         return pop_val!(fc, a.typ)
-    elseif f === II.muladd_float || f === II.fma_float
-        # (fma_float is overlaid by an exact software fma; it should not reach here)
-        f === II.fma_float && unsupported("fma_float (no fused multiply-add on Wasm)")
+    elseif f === II.fma_float
+        # no fused multiply-add on Wasm: Base's exact emulation
+        return call_runtime!(fc, Base.fma_emulated, args)
+    elseif f === II.muladd_float
         a, b, c = args
         t = prim_wtype(fc, a.typ)
         push_val!(fc, a); push_val!(fc, b)

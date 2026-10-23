@@ -124,6 +124,62 @@ function is_throw_call(stmt::Expr)
 end
 
 """
+    drop_unused!(ir) -> IRCode
+
+Remove statements whose results are unused and that have no effect but possibly
+throwing: those the optimizer flagged effect-free, and type computations (`apply_type`,
+`typejoin`, ...) that it keeps because they may throw. (Natively they run, and do not
+throw; here types cannot be built at run time.)
+"""
+function drop_unused!(ir::CC.IRCode)
+    stmts = ir.stmts
+    n = length(stmts)
+    nuses = zeros(Int, n)
+    for idx in 1:n
+        for ur in CC.userefs(stmts[idx][:stmt])
+            v = ur[]
+            v isa Core.SSAValue && (nuses[v.id] += 1)
+        end
+    end
+    work = [idx for idx in 1:n if nuses[idx] == 0]
+    while !isempty(work)
+        id = pop!(work)
+        stmt = stmts[id][:stmt]
+        stmt isa Expr && stmt.head in (:call, :invoke) || continue
+        stmts[id][:type] === Union{} && continue
+        droppable = (stmts[id][:flag] & CC.IR_FLAG_EFFECT_FREE) != 0 || is_type_computation(stmt)
+        droppable || continue
+        for ur in CC.userefs(stmt)
+            v = ur[]
+            if v isa Core.SSAValue
+                nuses[v.id] -= 1
+                nuses[v.id] == 0 && push!(work, v.id)
+            end
+        end
+        stmts[id][:stmt] = nothing
+        stmts[id][:type] = Nothing
+    end
+    return ir
+end
+
+const TYPE_FUNCTIONS = Any[Base.typejoin, Base.typeintersect, Base.promote_type,
+                           Base.promote_typejoin, Base.typesplit, Base.nonnothingtype,
+                           Base.nonmissingtype, Base.eltype]
+
+function is_type_computation(stmt::Expr)
+    if stmt.head === :call
+        f = stmt.args[1]
+        f isa GlobalRef && isdefined(f.mod, f.name) && isconst(f.mod, f.name) && (f = getglobal(f.mod, f.name))
+        return f === Core.apply_type || f === Core._typevar || f === Core.typeof
+    elseif stmt.head === :invoke
+        f = stmt.args[2]
+        f isa GlobalRef && isdefined(f.mod, f.name) && isconst(f.mod, f.name) && (f = getglobal(f.mod, f.name))
+        return any(g -> f === g, TYPE_FUNCTIONS)
+    end
+    return false
+end
+
+"""
     prepare_ir(world, mi) -> IRCode
 
 The IR of `mi`, ready for structurizing: exception handling removed, throws trapping.
@@ -132,5 +188,6 @@ function prepare_ir(w::ClosedWorld, mi::Core.MethodInstance)
     ir = get_ircode(w, mi)
     ir = strip_exception_handling!(ir)
     ir = trap_throws!(ir)
+    ir = drop_unused!(ir)
     return ir
 end

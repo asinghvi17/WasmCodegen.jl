@@ -9,7 +9,11 @@ CompilerCaching = "9db33cc3-5358-4881-8759-fa4194144afd"
 IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
 WasmBuilder = "c3e9a8f2-6b1d-4f7a-8e25-1a9d3b7c4e60"
 
+[sources]
+IRStructurizer = {path = "../IRStructurizer.jl"}
+WasmBuilder = {path = "../WasmBuilder.jl"}
+
 [compat]
 Binaryen_jll = "0.130.0"
 CompilerCaching = "0.5.1"
-julia = "1.12"
+julia = "1.12, 1.13"

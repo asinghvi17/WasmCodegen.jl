@@ -532,7 +532,7 @@ function convert_repr(fc::FnCtx, v, @nospecialize(T))
             length(lv.leaves) == length(lt.leaves) &&
                 all(i -> lv.leaves[i].type == lt.leaves[i].type, eachindex(lt.leaves)) ||
                 unsupported("a conversion from ", v.typ, " to ", T)
-            return CGVal(T, Inline, v.leaves, v.constant)
+            return CGVal(T, Inline, v.leaves, v.constant, v.origin)
         elseif lv.kind === Boxed
             return unbox!(fc, v, T)
         else

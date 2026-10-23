@@ -1,72 +1,35 @@
-# Overlays: methods of Base replaced for Wasm, where Base's implementation uses pointers
-# or the C runtime. They are written against `Intrinsics`, functions the code generator
-# compiles to Wasm instructions (and that have a native implementation, so that overlaid
-# code can also run natively).
+# The runtime: functions written in Julia that the code generator calls for what Wasm
+# lacks (an exact fused multiply-add, ...). They are compiled into the module on demand,
+# like the functions of libjulia native code calls.
+#
+# There are no overlays of Base's methods: inference is Julia's own (but for target facts
+# like `have_fma`), so the code compiled is the code juliac compiles. What Base does with
+# pointers and calls into the C runtime is compiled from the IR instead (`foreigncall.jl`,
+# pointers with origins).
 
 """
-    WasmCodegen.Intrinsics
+    runtime_function!(cgm, f, argtypes) -> FuncInfo
 
-Functions the code generator compiles to Wasm instructions, for overlays.
+The function compiled for the call `f(::argtypes...)`, which the code generator uses as
+part of its runtime; it (and what it calls) is added to the closed world.
 """
-module Intrinsics
-
-"Copy `n` elements from `src` to `dest` (which may overlap), as `memmove`."
-@noinline function memcopy!(dest::MemoryRef{T}, src::MemoryRef{T}, n::Int) where {T}
-    Base.unsafe_copyto!(dest, src, n)
-    return nothing
+function runtime_function!(cgm::CGModule, @nospecialize(f), @nospecialize(argtypes::Tuple))
+    w = cgm.world
+    mi = entry_instance(f, argtypes; world=w.world, method_table=w.method_table)
+    haskey(w.sources, mi) || extend_world!(w, Core.MethodInstance[mi])
+    return get_function!(cgm, mi)
 end
 
-end
-
-using Base.Experimental: @overlay
-
-@overlay WASM_MT function Base.unsafe_copyto!(dest::MemoryRef{T}, src::MemoryRef{T}, n) where {T}
-    n == 0 && return dest
-    @boundscheck memoryref(dest, n), memoryref(src, n)
-    Intrinsics.memcopy!(dest, src, Int(n))
-    return dest
-end
-
-# no fused multiply-add on Wasm: Base's exact emulation
-@overlay WASM_MT Base.fma(x::Float64, y::Float64, z::Float64) = Base.fma_emulated(x, y, z)
-@overlay WASM_MT Base.fma(x::Float32, y::Float32, z::Float32) = Base.fma_emulated(x, y, z)
-
-## the code generator's side
-
-const INTRINSIC_HANDLERS = IdDict{Method,Any}()
-
-function register_intrinsics!()
-    empty!(INTRINSIC_HANDLERS)
-    for m in methods(Intrinsics.memcopy!)
-        INTRINSIC_HANDLERS[m] = emit_memcopy!
-    end
+"Call the runtime function `f(args...)`."
+function call_runtime!(fc::FnCtx, @nospecialize(f), args::Vector{CGVal})
+    info = runtime_function!(fc.cgm, f, Tuple(a.typ for a in args))
+    return emit_call_info!(fc, info, CGVal[ghost(typeof(f), f), args...])
 end
 
 """
     emit_intrinsic_call!(fc, mi, ex, typ) -> Union{Nothing,CGVal}
 
-The code of an `:invoke` of a function of `Intrinsics`, or `nothing` for other calls.
+The code of an `:invoke` the code generator compiles itself, or `nothing` for other
+calls. (None for now: kept as the hook for intrinsics of the runtime.)
 """
-function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nospecialize(typ))
-    isempty(INTRINSIC_HANDLERS) && register_intrinsics!()
-    h = get(INTRINSIC_HANDLERS, mi.def, nothing)
-    h === nothing && return nothing
-    args = CGVal[operand(fc, a) for a in ex.args[3:end]]
-    return h(fc, args)
-end
-
-function emit_memcopy!(fc::FnCtx, args::Vector{CGVal})
-    dest, src, n = args
-    ml = memory_layout(fc.cgm.types, ref_eltype(dest.typ))
-    n = convert_repr(fc, n, Int)
-    push_element_address!(fc, dest, ml)
-    push_element_address!(fc, src, ml)
-    push_val!(fc, n)
-    emit!(fc.b, :i32_wrap_i64)
-    if ml.stride != 1
-        emit!(fc.b, :i32_const, ml.stride)
-        emit!(fc.b, :i32_mul)
-    end
-    emit!(fc.b, :array_copy, ml.array, ml.array)
-    return ghost(Nothing, nothing)
-end
+emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nospecialize(typ)) = nothing

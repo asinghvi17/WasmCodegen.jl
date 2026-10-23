@@ -66,6 +66,10 @@ boundscheck)` (to the element `i` from `ref`, 1-based).
 """
 function emit_memoryrefnew!(fc::FnCtx, args::Vector{Any})
     x = args[1]::CGVal
+    if is_memory_type(x.typ) && length(args) > 1
+        # memoryrefnew(mem, i, boundscheck) (Julia 1.13): from the first element
+        x = emit_memoryrefnew!(fc, Any[x])
+    end
     if length(args) == 1
         M = x.typ
         is_memory_type(M) || unsupported("memoryrefnew of ", M)
