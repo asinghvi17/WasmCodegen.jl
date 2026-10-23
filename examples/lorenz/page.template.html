@@ -1,0 +1,387 @@
+<title>Lorenz in WasmGC</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,500;0,8..60,600;1,8..60,500&display=swap">
+<style>
+  /* Layout: an instrument panel. Controls and readouts in a narrow column, the phase portrait large beside it; stacks on phones. */
+  :root {
+    --bg: #eef0f3;
+    --surface: #ffffff;
+    --ink: #18202b;
+    --muted: #5a6473;
+    --line: #d5dae1;
+    --accent: #1f5ca6;
+    --trace-a: #2c6ad8;
+    --trace-b: #d9692a;
+    --grid: #e6e9ee;
+    --font-display: "Source Serif 4", Georgia, "Times New Roman", serif;
+    --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-data: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f131a; --surface: #161b24; --ink: #e4e8ee; --muted: #949eac; --line: #2a313d;
+      --accent: #74a9f5; --trace-a: #5b97f2; --trace-b: #f39a54; --grid: #1f2530;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f131a; --surface: #161b24; --ink: #e4e8ee; --muted: #949eac; --line: #2a313d;
+    --accent: #74a9f5; --trace-a: #5b97f2; --trace-b: #f39a54; --grid: #1f2530;
+    color-scheme: dark;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 15px;
+    line-height: 1.5;
+  }
+  .page {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding-block: 28px 48px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    display: grid;
+    gap: 28px;
+  }
+  header { display: grid; gap: 6px; }
+  .eyebrow {
+    font-family: var(--font-data);
+    font-size: 12px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  h1 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: clamp(28px, 4vw, 40px);
+    line-height: 1.1;
+    margin: 0;
+    text-wrap: balance;
+  }
+  .lede { margin: 0; max-width: 68ch; color: var(--muted); }
+  .lede em { font-family: var(--font-display); font-style: italic; color: var(--ink); }
+
+  .instrument {
+    display: grid;
+    grid-template-columns: minmax(250px, 300px) minmax(0, 1fr);
+    gap: 20px;
+    align-items: start;
+  }
+  @media (max-width: 760px) { .instrument { grid-template-columns: minmax(0, 1fr); } }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 18px;
+    display: grid;
+    gap: 18px;
+  }
+  .eq {
+    font-family: var(--font-display);
+    font-size: 15px;
+    line-height: 1.7;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 14px;
+  }
+  .eq i { font-style: italic; }
+  .control { display: grid; gap: 6px; }
+  .control-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .control label { font-family: var(--font-display); font-style: italic; font-size: 17px; }
+  .control label small { font-family: var(--font-body); font-style: normal; font-size: 12px; color: var(--muted); margin-left: 6px; }
+  .control output { font-family: var(--font-data); font-size: 14px; font-variant-numeric: tabular-nums; }
+  input[type="range"] { width: 100%; accent-color: var(--accent); margin: 0; }
+  input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+  .row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .seg { display: flex; border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+  .seg button, .btn {
+    font: 500 13px var(--font-body);
+    color: var(--ink);
+    background: transparent;
+    border: 0;
+    padding: 7px 11px;
+    cursor: pointer;
+  }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--surface); }
+  .btn { border: 1px solid var(--line); border-radius: 5px; }
+  .seg button:focus-visible, .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .readouts {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    overflow: hidden;
+  }
+  .readout { background: var(--surface); padding: 8px 10px; display: grid; gap: 2px; }
+  .readout span { font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+  .readout b { font: 500 16px var(--font-data); font-variant-numeric: tabular-nums; }
+
+  .plot {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 12px;
+    min-width: 0;
+    display: grid;
+    gap: 8px;
+  }
+  .plot canvas { width: 100%; height: auto; aspect-ratio: 4 / 3; max-width: 100%; display: block; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; font-size: 12px; color: var(--muted); }
+  .ramp { width: 90px; height: 6px; border-radius: 3px; background: linear-gradient(90deg, var(--trace-a), var(--trace-b)); }
+  .status { font-size: 13px; color: var(--muted); }
+  .status.error { color: var(--trace-b); }
+
+  .notes {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 20px;
+    border-top: 1px solid var(--line);
+    padding-top: 22px;
+  }
+  .notes h2 { font-family: var(--font-display); font-weight: 600; font-size: 18px; margin: 0 0 6px; }
+  .notes p { margin: 0; color: var(--muted); max-width: 60ch; }
+  .notes code { font-family: var(--font-data); font-size: 13px; color: var(--ink); }
+  @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto; } }
+</style>
+
+<div class="page">
+  <header>
+    <div class="eyebrow">Julia → WebAssembly GC · no Julia runtime</div>
+    <h1>The Lorenz attractor, solved in your browser by Julia</h1>
+    <p class="lede">Every change re-solves the system with OrdinaryDiffEq's <em>Tsit5</em> adaptive
+      Runge–Kutta method over <em>t</em> ∈ [0, 40], saving a point every 0.01. The solver was compiled
+      from Julia to WasmGC; its integrator was built in Julia ahead of time and is part of the module.</p>
+  </header>
+
+  <section class="instrument" aria-label="Lorenz system">
+    <div class="panel">
+      <div class="eq" aria-label="The Lorenz equations">
+        <i>ẋ</i> = <i>σ</i>(<i>y</i> − <i>x</i>)<br>
+        <i>ẏ</i> = <i>x</i>(<i>ρ</i> − <i>z</i>) − <i>y</i><br>
+        <i>ż</i> = <i>xy</i> − <i>βz</i>
+      </div>
+      <div class="control">
+        <div class="control-head"><label for="sigma">σ<small>Prandtl number</small></label><output id="sigma-out" for="sigma"></output></div>
+        <input id="sigma" type="range" min="0.5" max="30" step="0.1" value="10">
+      </div>
+      <div class="control">
+        <div class="control-head"><label for="rho">ρ<small>Rayleigh number</small></label><output id="rho-out" for="rho"></output></div>
+        <input id="rho" type="range" min="0.5" max="60" step="0.1" value="28">
+      </div>
+      <div class="control">
+        <div class="control-head"><label for="beta">β<small>geometry</small></label><output id="beta-out" for="beta"></output></div>
+        <input id="beta" type="range" min="0.1" max="6" step="0.01" value="2.6667">
+      </div>
+      <div class="control">
+        <div class="control-head"><label for="x0">x₀<small>initial x (y₀ = z₀ = 1)</small></label><output id="x0-out" for="x0"></output></div>
+        <input id="x0" type="range" min="-15" max="15" step="0.01" value="1">
+      </div>
+      <div class="row">
+        <div class="seg" role="group" aria-label="Projection">
+          <button id="proj-xz" type="button" aria-pressed="true" data-proj="xz">x–z</button>
+          <button id="proj-xy" type="button" aria-pressed="false" data-proj="xy">x–y</button>
+          <button id="proj-yz" type="button" aria-pressed="false" data-proj="yz">y–z</button>
+        </div>
+        <button id="reset" class="btn" type="button">Classic: 10, 28, 8/3</button>
+      </div>
+      <div class="readouts" aria-live="polite">
+        <div class="readout"><span>Solve</span><b id="r-time">–</b></div>
+        <div class="readout"><span>Steps</span><b id="r-steps">–</b></div>
+        <div class="readout"><span>Points</span><b id="r-points">–</b></div>
+      </div>
+      <div id="status" class="status">Loading the module…</div>
+    </div>
+
+    <div class="plot">
+      <canvas id="canvas" width="960" height="720" aria-label="Phase portrait of the Lorenz attractor"></canvas>
+      <div class="legend"><span>t = 0</span><span class="ramp" aria-hidden="true"></span><span>t = 40</span><span id="axes-label"></span></div>
+    </div>
+  </section>
+
+  <section class="notes" aria-label="How it runs">
+    <div>
+      <h2>Compiled like juliac</h2>
+      <p>WasmCodegen collects the closed world of code the exported functions can run with Julia's own
+        inference, as <code>juliac --trim=safe</code> does, structures its control flow and emits
+        WebAssembly with garbage-collected structs and arrays.</p>
+    </div>
+    <div>
+      <h2>Objects in the module</h2>
+      <p>The integrator (<code>init(prob, Tsit5(); saveat = 0.01)</code>) is built natively when the
+        module is compiled, then serialized into it: __OBJECTS__ Julia objects, its caches and
+        Butcher tableau included. The page sets <code>p</code> and <code>u₀</code>, then calls
+        <code>reinit!</code> and <code>solve!</code>.</p>
+    </div>
+    <div>
+      <h2>This module</h2>
+      <p>__SIZE__ KB of WebAssembly, __FUNCS__ functions, no imports. Native Julia on the build
+        machine solves the classic case in about __NATIVE__ ms; the timing on this page is your
+        browser's.</p>
+    </div>
+  </section>
+</div>
+
+<script>
+(() => {
+  const WASM_BASE64 = "__WASM_BASE64__";
+  const $ = (id) => document.getElementById(id);
+  const inputs = { sigma: $("sigma"), rho: $("rho"), beta: $("beta"), x0: $("x0") };
+  const canvas = $("canvas");
+  const ctx = canvas.getContext("2d");
+  let exports = null;
+  let proj = "xz";
+  let pts = new Float64Array(0);
+  let npts = 0;
+  let pending = false;
+
+  const fmt = (v, d) => Number(v).toFixed(d);
+
+  function cssVar(name) {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  }
+  function hexToRgb(h) {
+    const m = h.replace("#", "");
+    const n = parseInt(m.length === 3 ? m.split("").map((c) => c + c).join("") : m, 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+  function mix(a, b, t) {
+    return `rgb(${a.map((v, i) => Math.round(v + (b[i] - v) * t)).join(",")})`;
+  }
+  // tick values: a "nice" step covering [lo, hi] with about n ticks
+  function ticks(lo, hi, n) {
+    const span = hi - lo, raw = span / n, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const step = [1, 2, 5, 10].map((m) => m * mag).find((s) => span / s <= n) || 10 * mag;
+    const out = [];
+    for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(Math.round(v / step) * step);
+    return out;
+  }
+
+  function solve() {
+    pending = false;
+    if (!exports) return;
+    const s = +inputs.sigma.value, r = +inputs.rho.value, b = +inputs.beta.value, x0 = +inputs.x0.value;
+    const t0 = performance.now();
+    const n = exports.lorenz_solve(s, r, b, x0);
+    const t1 = performance.now();
+    if (pts.length < 3 * n) pts = new Float64Array(3 * n);
+    for (let i = 1; i <= n; i++) {
+      pts[3 * (i - 1)] = exports.lorenz_point(i, 1);
+      pts[3 * (i - 1) + 1] = exports.lorenz_point(i, 2);
+      pts[3 * (i - 1) + 2] = exports.lorenz_point(i, 3);
+    }
+    npts = n;
+    $("r-time").textContent = `${fmt(t1 - t0, 2)} ms`;
+    $("r-steps").textContent = exports.lorenz_steps();
+    $("r-points").textContent = n;
+    draw();
+  }
+
+  function draw() {
+    const W = canvas.width, H = canvas.height;
+    const [ia, ib] = proj === "xz" ? [0, 2] : proj === "xy" ? [0, 1] : [1, 2];
+    const names = ["x", "y", "z"];
+    ctx.clearRect(0, 0, W, H);
+    if (npts < 2) return;
+    let amin = Infinity, amax = -Infinity, bmin = Infinity, bmax = -Infinity;
+    for (let i = 0; i < npts; i++) {
+      const a = pts[3 * i + ia], b = pts[3 * i + ib];
+      if (!isFinite(a) || !isFinite(b)) continue;
+      if (a < amin) amin = a; if (a > amax) amax = a;
+      if (b < bmin) bmin = b; if (b > bmax) bmax = b;
+    }
+    if (!isFinite(amin)) return;
+    if (amax - amin < 1e-6) { amin -= 1; amax += 1; }
+    if (bmax - bmin < 1e-6) { bmin -= 1; bmax += 1; }
+    const padL = 58, padR = 18, padT = 16, padB = 46;
+    const sx = (W - padL - padR) / (amax - amin), sy = (H - padT - padB) / (bmax - bmin);
+    const X = (a) => padL + (a - amin) * sx, Y = (b) => H - padB - (b - bmin) * sy;
+
+    // grid and tick labels, from the same scale as the trace
+    const grid = cssVar("--grid"), muted = cssVar("--muted"), line = cssVar("--line");
+    ctx.font = `22px ${cssVar("--font-data")}`;
+    ctx.lineWidth = 1.5;
+    ctx.fillStyle = muted;
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    for (const v of ticks(amin, amax, 6)) {
+      ctx.strokeStyle = grid; ctx.beginPath(); ctx.moveTo(X(v), padT); ctx.lineTo(X(v), H - padB); ctx.stroke();
+      ctx.fillText(String(+v.toFixed(6)), X(v), H - padB + 10);
+    }
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    for (const v of ticks(bmin, bmax, 6)) {
+      ctx.strokeStyle = grid; ctx.beginPath(); ctx.moveTo(padL, Y(v)); ctx.lineTo(W - padR, Y(v)); ctx.stroke();
+      ctx.fillText(String(+v.toFixed(6)), padL - 10, Y(v));
+    }
+    ctx.strokeStyle = line;
+    ctx.strokeRect(padL, padT, W - padL - padR, H - padT - padB);
+
+    // the trajectory, colored by time in segments
+    const ca = hexToRgb(cssVar("--trace-a")), cb = hexToRgb(cssVar("--trace-b"));
+    const chunks = 80, per = Math.ceil(npts / chunks);
+    ctx.lineWidth = 1.6; ctx.lineJoin = "round";
+    for (let c = 0; c < chunks; c++) {
+      const s = c * per, e = Math.min(npts - 1, (c + 1) * per);
+      if (s >= e) break;
+      ctx.strokeStyle = mix(ca, cb, c / (chunks - 1));
+      ctx.beginPath();
+      ctx.moveTo(X(pts[3 * s + ia]), Y(pts[3 * s + ib]));
+      for (let i = s + 1; i <= e; i++) ctx.lineTo(X(pts[3 * i + ia]), Y(pts[3 * i + ib]));
+      ctx.stroke();
+    }
+    // the end point
+    const last = npts - 1;
+    ctx.fillStyle = cssVar("--trace-b");
+    ctx.beginPath(); ctx.arc(X(pts[3 * last + ia]), Y(pts[3 * last + ib]), 6, 0, 2 * Math.PI); ctx.fill();
+    $("axes-label").textContent = `horizontal ${names[ia]}, vertical ${names[ib]}`;
+  }
+
+  function schedule() {
+    for (const k of Object.keys(inputs)) {
+      const d = k === "beta" ? 3 : k === "x0" ? 2 : 1;
+      $(`${k}-out`).textContent = fmt(inputs[k].value, d);
+    }
+    if (!pending) { pending = true; requestAnimationFrame(solve); }
+  }
+
+  for (const el of Object.values(inputs)) el.addEventListener("input", schedule);
+  for (const b of document.querySelectorAll(".seg button")) {
+    b.addEventListener("click", () => {
+      proj = b.dataset.proj;
+      for (const o of document.querySelectorAll(".seg button")) o.setAttribute("aria-pressed", String(o === b));
+      draw();
+    });
+  }
+  $("reset").addEventListener("click", () => {
+    inputs.sigma.value = 10; inputs.rho.value = 28; inputs.beta.value = 8 / 3; inputs.x0.value = 1;
+    schedule();
+  });
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", draw);
+  new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+  (async () => {
+    try {
+      const bytes = Uint8Array.from(atob(WASM_BASE64), (c) => c.charCodeAt(0));
+      const { instance } = await WebAssembly.instantiate(bytes, {});
+      exports = instance.exports;
+      $("status").textContent = "Drag a slider: the system is re-solved on every change.";
+      schedule();
+    } catch (err) {
+      const st = $("status");
+      st.classList.add("error");
+      st.textContent = "This browser could not load the module, which needs WebAssembly GC " +
+        "(Chrome 119, Firefox 120, Safari 18.2 or later). " + err.message;
+    }
+  })();
+  schedule();
+})();
+</script>
