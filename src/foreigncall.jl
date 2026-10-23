@@ -6,6 +6,8 @@ function foreigncall_name(@nospecialize(x))
     x isa QuoteNode && (x = x.value)
     x isa Symbol && return x
     x isa Tuple && return x[1] isa Symbol ? x[1] : nothing
+    # a constant naming the function (`Base.memhash` in Julia 1.12)
+    x isa GlobalRef && isconst(x.mod, x.name) && return foreigncall_name(getglobal(x.mod, x.name))
     if x isa Expr && x.head === :call && length(x.args) >= 2
         return foreigncall_name(x.args[2])
     elseif x isa Expr && x.head === :tuple && !isempty(x.args)
@@ -320,6 +322,8 @@ const RUNTIME_CCALLS = Dict{Symbol,RuntimeCcall}(
     :jl_strtof_c => RuntimeCcall(Runtime.Floats.strtof, [:val, :val]),
     :jl_set_errno => RuntimeCcall(Runtime.Floats.set_errno, [:val]),
     :jl_errno => RuntimeCcall(Runtime.Floats.get_errno, Symbol[]),
+    # hashing of strings before Julia 1.13
+    :memhash_seed => RuntimeCcall(Runtime.memhash_seed, [:val, :val, :val]),
 )
 
 runtime_ccall(name) = name === nothing ? nothing : get(RUNTIME_CCALLS, name, nothing)

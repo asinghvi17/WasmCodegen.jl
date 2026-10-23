@@ -26,26 +26,28 @@ function int64hash(key::UInt64)
     return key
 end
 
-# the little-endian UInt64 at the bytes i:i+7 (1-based) of s
-function load64(s::String, i::Int)
+# the little-endian UInt64 at the byte offsets i:i+7, `at(i)` being the byte at offset i
+function load64(at, i::Int)
     w = UInt64(0)
     for j in 7:-1:0
-        w = (w << 8) | UInt64(codeunit(s, i + j))
+        w = (w << 8) | UInt64(at(i + j))
     end
     return w
 end
 
-"Julia's `memhash`: the second half of MurmurHash3_x64_128 of the bytes of `s`."
-function memhash(s::String, seed::UInt32=0xcafe8881)
-    n = ncodeunits(s)
+"""
+The second half of MurmurHash3_x64_128 of the `n` bytes `at(0)`, ..., `at(n-1)`: the C
+runtime's `memhash_seed`, which `hash(::String)` calls before Julia 1.13.
+"""
+function murmur3_h2(at, n::Int, seed::UInt32)
     h1 = UInt64(seed)
     h2 = UInt64(seed)
     c1 = 0x87c37b91114253d5
     c2 = 0x4cf5ad432745937f
     nblocks = n ÷ 16
     for b in 0:nblocks-1
-        k1 = load64(s, 16b + 1)
-        k2 = load64(s, 16b + 9)
+        k1 = load64(at, 16b)
+        k2 = load64(at, 16b + 8)
         k1 *= c1; k1 = rotl64(k1, 31); k1 *= c2; h1 ⊻= k1
         h1 = rotl64(h1, 27); h1 += h2; h1 = h1 * 5 + 0x52dce729
         k2 *= c2; k2 = rotl64(k2, 33); k2 *= c1; h2 ⊻= k2
@@ -57,13 +59,13 @@ function memhash(s::String, seed::UInt32=0xcafe8881)
     k2 = UInt64(0)
     if r > 8
         for j in r-1:-1:8
-            k2 ⊻= UInt64(codeunit(s, tail + j + 1)) << (8 * (j - 8))
+            k2 ⊻= UInt64(at(tail + j)) << (8 * (j - 8))
         end
         k2 *= c2; k2 = rotl64(k2, 33); k2 *= c1; h2 ⊻= k2
     end
     if r > 0
         for j in min(r, 8)-1:-1:0
-            k1 ⊻= UInt64(codeunit(s, tail + j + 1)) << (8 * j)
+            k1 ⊻= UInt64(at(tail + j)) << (8 * j)
         end
         k1 *= c1; k1 = rotl64(k1, 31); k1 *= c2; h1 ⊻= k1
     end
@@ -77,6 +79,12 @@ function memhash(s::String, seed::UInt32=0xcafe8881)
     h2 += h1
     return h2
 end
+
+"Julia's `memhash` of the bytes of `s`."
+memhash(s::String, seed::UInt32=0xcafe8881) = murmur3_h2(i -> codeunit(s, i + 1), ncodeunits(s), seed)
+
+"`memhash_seed(buf, n, seed)`, through a pointer."
+memhash_seed(p::Ptr{UInt8}, n::UInt64, seed::UInt32) = murmur3_h2(i -> unsafe_load(p, i + 1), Int(n), seed)
 
 "The hash of the symbol named `s` (its `objectid`)."
 symbol_hash(s::String) = int64hash(-(memhash(s) ⊻ 0xaaaaaaaaaaaaaaaa))
