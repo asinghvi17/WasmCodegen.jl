@@ -33,8 +33,13 @@ include("foreigncall.jl")
 include("image.jl")
 include("overlays.jl")
 include("types_runtime.jl")
+include("patches.jl")
 include("driver.jl")
 
 export compile, Entry, Config
+
+function __init__()
+    COMPILER_WORLD[] = Base.get_world_counter()
+end
 
 end

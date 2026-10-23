@@ -8,11 +8,15 @@ The configuration of the code generator:
 - `on_unsupported`: what happens when a function uses an unsupported construct: `:error`
   (throw), or `:trap` (the construct compiles to a trap, and is reported in the
   compilation's diagnostics);
-- `verify`: the trim verification of the closed world (`:error`, `:warn`, `:off`).
+- `verify`: checking the entry points as `juliac --trim=safe` does (`:error`, `:warn`
+  (report), `:off`);
+- `trim_patches`: compile with the methods juliac redefines for trimmed programs
+  (`patches.jl`).
 """
 Base.@kwdef struct Config
     on_unsupported::Symbol = :error
     verify::Symbol = :warn
+    trim_patches::Bool = true
 end
 
 """

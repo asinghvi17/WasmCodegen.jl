@@ -34,8 +34,20 @@ points is collected, compiled, and the objects it refers to are serialized into 
 module.
 """
 function compile(entries::Vector; config::Config=Config(), validate::Bool=true,
-                 world::UInt=Base.get_world_counter())
+                 world::Union{Nothing,UInt}=nothing)
     entries = Entry[e isa Entry ? e : Entry(e[1], e[2]) for e in entries]
+    run(program_world) = Base.invoke_in_world(COMPILER_WORLD[], compile_in_world, entries,
+                                              config, validate, program_world)
+    if config.trim_patches && world === nothing
+        # the program in the latest world, with juliac's patches
+        return with_trim_patches() do _, _
+            run(Base.get_world_counter())
+        end
+    end
+    return run(something(world, Base.get_world_counter()))
+end
+
+function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool, world::UInt)
     mis = Core.MethodInstance[entry_instance(e.f, e.argtypes; world) for e in entries]
     w = collect_world(mis; world, verify=config.verify)
     cgm = CGModule(w, config)

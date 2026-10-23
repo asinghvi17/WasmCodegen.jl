@@ -1,0 +1,263 @@
+# From JuliaC.jl (src/scripts/juliac-trim-base.jl, commit a00d9ec), MIT license: the patches juliac
+# applies to Base and the standard library for --trim. WasmCodegen applies them the same
+# way (see src/patches.jl). Keep in sync with JuliaC.
+
+# This file is a part of Julia. License is MIT: https://julialang.org/license
+
+# Patches to Base needed for trimming
+
+@eval Core begin
+    DomainError(@nospecialize(val), @nospecialize(msg::AbstractString)) = (@noinline; $(Expr(:new, :DomainError, :val, :msg)))
+end
+
+(f::Base.RedirectStdStream)(io::Core.CoreSTDOUT) = Base._redirect_io_global(io, f.unix_fd)
+
+# Stub the ^C listener task out of trimmed binaries, on Julia versions
+# where SIGINT is delivered through the cancellation system (the listener
+# performs the Julia-side delivery; a trimmed binary has no interactive
+# episode to deliver to).
+if isdefined(Base, :start_sigint_listener)
+    @eval Base start_sigint_listener() = nothing
+end
+
+@eval Base begin
+    show(io::IO, ::Colon) = print(io, "Colon()")
+    depwarn(msg, funcsym; force::Bool=false) = nothing
+    _assert_tostring(msg) = ""
+    reinit_stdio() = nothing
+    wait_forever() = while true; wait(); end
+    JuliaSyntax.enable_in_core!() = nothing
+    init_active_project() = ACTIVE_PROJECT[] = nothing
+    set_active_project(projfile::Union{AbstractString,Nothing}) = ACTIVE_PROJECT[] = projfile
+    disable_library_threading() = nothing
+    start_profile_listener() = nothing
+    invokelatest_trimmed(f, args...; kwargs...) = f(args...; kwargs...)
+    const invokelatest = invokelatest_trimmed
+    function sprint(f::F, args::Vararg{Any,N}; context=nothing, sizehint::Integer=0) where {F<:Function,N}
+        s = IOBuffer(sizehint=sizehint)
+        if context isa Tuple
+            f(IOContext(s, context...), args...)
+        elseif context !== nothing
+            f(IOContext(s, context), args...)
+        else
+            f(s, args...)
+        end
+        String(_unsafe_take!(s))
+    end
+    function show_typeish(io::IO, @nospecialize(T))
+        if T isa Type
+            show(io, T)
+        elseif T isa TypeVar
+            print(io, (T::TypeVar).name)
+        else
+            print(io, "?")
+        end
+    end
+    function show(io::IO, T::Type)
+        if T isa DataType
+            print(io, T.name.name)
+            if T !== T.name.wrapper && length(T.parameters) > 0
+                print(io, "{")
+                first = true
+                for p in T.parameters
+                    if !first
+                        print(io, ", ")
+                    end
+                    first = false
+                    if p isa Int
+                        show(io, p)
+                    elseif p isa Type
+                        show(io, p)
+                    elseif p isa Symbol
+                        print(io, ":")
+                        print(io, p)
+                    elseif p isa TypeVar
+                        print(io, p.name)
+                    else
+                        print(io, "?")
+                    end
+                end
+                print(io, "}")
+            end
+        elseif T isa Union
+            print(io, "Union{")
+            show_typeish(io, T.a)
+            print(io, ", ")
+            show_typeish(io, T.b)
+            print(io, "}")
+        elseif T isa UnionAll
+            print(io, T.body::Type)
+            print(io, " where ")
+            print(io, T.var.name)
+        end
+    end
+    show_type_name(io::IO, tn::Core.TypeName) = print(io, tn.name)
+    # this function is not `--trim`-compatible if it resolves to a Varargs{...} specialization
+    # and since it only has 1-argument methods this happens too often by default (just 2-3 args)
+    mapreduce(f::F, op::F2, A::AbstractArrayOrBroadcasted; dims=:, init=_InitialValue()) where {F, F2} =
+    _mapreduce_dim(f, op, init, A, dims)
+    mapreduce(f::F, op::F2, A::AbstractArrayOrBroadcasted...; kw...) where {F, F2} =
+        reduce(op, map(f, A...); kw...)
+
+    function _mapreduce_dim(f::F, op::F2, nt, A::AbstractArrayOrBroadcasted, ::Colon) where {F, F2}
+        y = iterate(A)
+        y === nothing && return nt
+        v = op(nt, f(y[1]))
+        for x in Iterators.rest(A, y[2])
+            v = op(v, f(x))
+        end
+        return v
+    end
+
+    _mapreduce_dim(f::F, op::F2, ::_InitialValue, A::AbstractArrayOrBroadcasted, ::Colon) where {F, F2} =
+        _mapreduce(f, op, IndexStyle(A), A)
+
+    _mapreduce_dim(f::F, op::F2, nt, A::AbstractArrayOrBroadcasted, dims) where {F, F2} =
+        mapreducedim!(f, op, reducedim_initarray(A, dims, nt), A)
+
+    _mapreduce_dim(f::F, op::F2, ::_InitialValue, A::AbstractArrayOrBroadcasted, dims) where {F,F2} =
+        mapreducedim!(f, op, reducedim_init(f, op, A, dims), A)
+
+    mapreduce_empty_iter(f::F, op::F2, itr, ItrEltype) where {F, F2} =
+        reduce_empty_iter(MappingRF(f, op), itr, ItrEltype)
+        mapreduce_first(f::F, op::F2, x) where {F,F2} = reduce_first(op, f(x))
+
+    _mapreduce(f::F, op::F2, A::AbstractArrayOrBroadcasted) where {F,F2} = _mapreduce(f, op, IndexStyle(A), A)
+    mapreduce_empty(::typeof(identity), op::F, T) where {F} = reduce_empty(op, T)
+    mapreduce_empty(::typeof(abs), op::F, T) where {F}     = abs(reduce_empty(op, T))
+    mapreduce_empty(::typeof(abs2), op::F, T) where {F}    = abs2(reduce_empty(op, T))
+
+    # @noinline in front of function makes the setfield! not work properly
+    function throw_eachindex_mismatch_indices(::IndexLinear, inds...)
+        @noinline 
+        throw(DimensionMismatch("all inputs to eachindex must have the same indices"))
+    end
+    function throw_eachindex_mismatch_indices(::IndexCartesian, inds...)
+        @noinline
+        throw(DimensionMismatch("all inputs to eachindex must have the same axes"))
+    end
+    setfield!(typeof(throw_boundserror).name, :max_args, Int32(5), :monotonic)
+    setfield!(typeof(throw_eachindex_mismatch_indices).name, :max_args, Int32(5), :monotonic)
+    setfield!(typeof(Base.print).name, :max_args, Int32(10), :monotonic)
+    setfield!(typeof(Base.println).name, :max_args, Int32(10), :monotonic)
+    setfield!(typeof(Base.print_to_string).name, :max_args, Int32(10), :monotonic)
+    if @isdefined(_throw_boundserror_indices)
+        setfield!(typeof(_throw_boundserror_indices).name, :max_args, Int32(5), :monotonic)
+    end
+
+    # not `--trim`-compatible if these resolve to a Varargs{...} specialization, primarily
+    # due to `Core._apply_iterate` having no dispatch-resolved form (#57830)
+    setfield!(typeof(_cat).name, :max_args, Int32(10), :monotonic)
+    setfield!(typeof(__cat).name, :max_args, Int32(10), :monotonic)
+    setfield!(typeof(__cat_offset!).name, :max_args, Int32(10), :monotonic)
+    setfield!(typeof(cat_size_shape).name, :max_args, Int32(10), :monotonic)
+    setfield!(typeof(_cat_size_shape).name, :max_args, Int32(10), :monotonic)
+
+    # vcat / hcat / hvcat / hvncat / cat all use this
+    unwrap_val(dims) = dims
+    unwrap_val(::Val{dims}) where dims = dims
+    function _cat_t(dims, ::Type{T}, X::Vararg{AbstractArray,N}) where {T,N}
+        @inline
+        Ndims = maximum(map(ndims, X))
+        catdims = ntuple(in(unwrap_val(dims)), Val(Ndims))
+        shape = cat_size_shape(catdims, X...)
+        A = cat_similar(X[1], T, shape)
+        if count(!iszero, catdims)::Int > 1
+            fill!(A, zero(T))
+        end
+        return __cat(A, shape, catdims, X...)
+    end
+end
+
+# Used for LinearAlgebre ldiv with SVD
+for s in [:searchsortedfirst, :searchsortedlast, :searchsorted]
+    @eval Base.Sort begin
+        # identical to existing Base def. but specializes on `lt` / `by`
+        $s(v::AbstractVector, x, o::Ordering) = $s(v,x,firstindex(v),lastindex(v),o)
+        $s(v::AbstractVector, x;
+            lt::T=isless, by::F=identity, rev::Union{Bool,Nothing}=nothing, order::Ordering=Forward) where {T,F} =
+            $s(v,x,ord(lt,by,rev,order))
+    end
+end
+@eval Base.GMP begin
+    function __init__()
+        try
+            ccall((:__gmp_set_memory_functions, libgmp), Cvoid,
+                (Ptr{Cvoid},Ptr{Cvoid},Ptr{Cvoid}),
+                cglobal(:jl_gc_counted_malloc),
+                cglobal(:jl_gc_counted_realloc_with_old_size),
+                cglobal(:jl_gc_counted_free_with_size))
+            ZERO.alloc, ZERO.size, ZERO.d = 0, 0, C_NULL
+            ONE.alloc, ONE.size, ONE.d = 1, 1, pointer(_ONE)
+        catch ex
+            Base.showerror_nostdio(ex, "WARNING: Error during initialization of module GMP")
+        end
+        # This only works with a patched version of GMP, ignore otherwise
+        try
+            ccall((:__gmp_set_alloc_overflow_function, libgmp), Cvoid,
+                (Ptr{Cvoid},),
+                cglobal(:jl_throw_out_of_memory_error))
+            ALLOC_OVERFLOW_FUNCTION[] = true
+        catch ex
+            # ErrorException("ccall: could not find function...")
+            if !(ex isa ErrorException)
+                rethrow()
+            end
+        end
+    end
+end
+@eval Base.Sort begin
+    issorted(itr;
+        lt::T=isless, by::F=identity, rev::Union{Bool,Nothing}=nothing, order::Ordering=Forward) where {T,F} =
+        issorted(itr, ord(lt,by,rev,order))
+end
+@eval Base.TOML begin
+    function try_return_datetime(p, year, month, day, h, m, s, ms)
+        return DateTime(year, month, day, h, m, s, ms)
+    end
+    function try_return_date(p, year, month, day)
+        return Date(year, month, day)
+    end
+    function parse_local_time(l::Parser)
+        h = @try parse_int(l, false)
+        h in 0:23 || return ParserError(ErrParsingDateTime)
+        _, m, s, ms = @try _parse_local_time(l, true)
+        # TODO: Could potentially parse greater accuracy for the
+        # fractional seconds here.
+        return try_return_time(l, h, m, s, ms)
+    end
+    function try_return_time(p, h, m, s, ms)
+        return Time(h, m, s, ms)
+    end
+end
+
+@eval Base.CoreLogging begin
+    @inline current_logger_for_env(std_level::LogLevel, group, _module) = nothing
+end
+
+@eval Base.Libc.Libdl begin
+    @noinline _invoke_on_load_callback(@nospecialize(cb)) = error(
+        "LazyLibrary on_load_callback of type `", typeof(cb).name.name,
+        "` is not supported under --trim; register a C entry point via ",
+        "_on_load_c_callback instead"
+    )
+
+    @noinline _throw_unsupported_path_piece(@nospecialize(p)) = error(
+        "LazyLibraryPath path segment of type `", typeof(p).name.name,
+        "` is not supported under --trim; pieces must be String, ",
+        "SubString{String}, or PrivateShlibdirGetter"
+    )
+
+    function Base.string(llp::LazyLibraryPath)
+        n = nfields(llp.pieces)
+        parts = Vector{String}(undef, n)
+        for i in 1:n
+            p = getfield(llp.pieces, i)
+            parts[i] = p isa String                ? p :
+                       p isa SubString{String}     ? String(p) :
+                       p isa PrivateShlibdirGetter ? string(p) :
+                       _throw_unsupported_path_piece(p)
+        end
+        return joinpath(parts)
+    end
+end

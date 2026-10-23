@@ -52,23 +52,45 @@ function collect_world(entries::Vector{Core.MethodInstance};
     w = ClosedWorld(world, method_table, entries, Core.MethodInstance[],
                     IdDict{Core.MethodInstance,Tuple{Core.CodeInstance,Core.CodeInfo}}(),
                     Ref(""))
+    verify === :off || (w.trim_report[] = trim_check(entries; world, onlywarn=verify === :warn))
     extend_world!(w, entries)
-    if verify !== :off
-        all = Any[]
-        for mi in w.order
-            ci, src = w.sources[mi]
-            push!(all, ci, src)
-        end
-        io = IOBuffer()
-        try
-            CC.verify_typeinf_trim(io, all, verify === :warn)
-        catch err
-            err isa Core.TrimFailure || rethrow()
-            error("the code of the entry points is not trim-safe:\n", String(take!(io)))
-        end
-        w.trim_report[] = String(take!(io))
-    end
     return w
+end
+
+"""
+    TrimFailure
+
+The entry points are not trim-safe: juliac's verifier found dynamic dispatch (or other
+constructs that need the Julia runtime) in the code they run.
+"""
+struct TrimFailure <: Exception
+    report::String
+end
+Base.showerror(io::IO, e::TrimFailure) =
+    print(io, "the code of the entry points is not trim-safe (as juliac --trim=safe checks):\n", e.report)
+
+"""
+    trim_check(entries; world, onlywarn=false) -> String
+
+Check the entry points as `juliac --trim=safe` does: native inference collects the code
+they run (`Compiler.typeinf_ext_toplevel`), and juliac's verifier checks it. Returns the
+verifier's report, and throws a [`TrimFailure`](@ref) if it found errors (unless
+`onlywarn`). This is the subset of Julia the code generator targets.
+"""
+function trim_check(entries::Vector{Core.MethodInstance}; world::UInt=Base.get_world_counter(),
+                    onlywarn::Bool=false)
+    args = VERSION >= v"1.13-" ? (CC.TRIM_UNSAFE, false) : (CC.TRIM_UNSAFE,)
+    codeinfos = CC.typeinf_ext_toplevel(Any[entries...], UInt[world], args...)
+    io = IOBuffer()
+    try
+        redirect_stdout(devnull) do
+            CC.verify_typeinf_trim(io, codeinfos, onlywarn)
+        end
+    catch err
+        err isa Core.TrimFailure || rethrow()
+        throw(TrimFailure(String(take!(io))))
+    end
+    return String(take!(io))
 end
 
 """
