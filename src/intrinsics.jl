@@ -268,11 +268,13 @@ function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}
         emit!(fc.b, :i32_div_s)
         emit!(fc.b, f === II.add_ptr ? :i32_add : :i32_sub)
         emit!(fc.b, :local_set, idx)
-        return with_origin(r, PtrOrigin(o.array, idx, o.eltype))
+        return with_origin(r, PtrOrigin(o.mem, o.array, idx, o.eltype))
     elseif f === II.have_fma
         return const_value(fc, false)
     elseif f === II.atomic_fence
         return ghost(Nothing, nothing)
+    elseif f === II.pointerref || f === II.atomic_pointerref
+        return emit_pointerref!(fc, args[1], f === II.pointerref ? args[2] : const_value(fc, 1), typ)
     elseif f === II.atomic_pointerset || f === II.pointerset
         # a store through a pointer into a Memory: Base clears references with it
         # (`_unsetindex!`)
@@ -518,3 +520,26 @@ function emit_pointerset!(fc::FnCtx, p::CGVal, v::CGVal)
     end
     unsupported("storing through a pointer into a memory of ", o.eltype)
 end
+
+"""
+    emit_pointerref!(fc, p, i, typ) -> CGVal
+
+A load through the pointer `p` (with an origin), of the element `i` (1-based) from it: an
+element of a memory, or the field of a `Ref`.
+"""
+function emit_pointerref!(fc::FnCtx, p::CGVal, i::CGVal, @nospecialize(typ))
+    o = origin_of(fc, p, "a load")
+    if is_object_origin(o)
+        (isconstant(i) && constant_value(i) == 1) || unsupported("a load at an offset from a Ref")
+        return get_field(fc, CGVal(o.eltype, Boxed, LeafVal[o.mem]), 1)
+    end
+    R = memoryref_type(o)
+    ref = CGVal(R, Inline, LeafVal[something(o.mem, Inst(:ref_null, layout(fc, R).leaves[1].type.heap)), o.array, o.index])
+    if !(isconstant(i) && constant_value(i) == 1)
+        ref = emit_memoryrefnew!(fc, Any[ref, i, const_value(fc, false)])
+    end
+    return emit_memoryrefget!(fc, ref, const_value(fc, false), typ)
+end
+
+"The MemoryRef type of the elements a memory origin points to."
+memoryref_type(o::PtrOrigin) = MemoryRef{o.eltype}

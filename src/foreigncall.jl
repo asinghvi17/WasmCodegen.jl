@@ -57,6 +57,17 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return ghost(Nothing, nothing)
     elseif name === :memset
         return emit_memset!(fc, args[1], args[2], args[3])
+    elseif name === :jl_value_ptr
+        # the address of an object: a virtual one (see `push_memory_base!`), pointing into it
+        x = args[1]::CGVal
+        lx = layout(fc, x.typ)
+        (lx.kind === Boxed && ismutabletype(x.typ) && !isempty(lx.fields)) ||
+            unsupported("the address of a value of type ", x.typ)
+        push_memory_base!(fc, x)
+        v = pop_val!(fc, typ)
+        return with_origin(v, PtrOrigin(materialize!(fc, x), nothing, nothing, x.typ))
+    elseif (r = runtime_ccall(name)) !== nothing
+        return emit_runtime_ccall!(fc, r, args, typ)
     elseif name === :jl_get_world_counter || name === :jl_get_tls_world_age
         # the world the code was compiled in: there is one
         return const_value(fc, convert(typ, fc.cgm.world.world))
@@ -150,4 +161,45 @@ function emit_memset!(fc::FnCtx, p, val, n)
     end
     emit!(fc.b, :array_fill, ml.array)
     return p
+end
+
+## C library calls implemented by the runtime
+
+"""
+    RuntimeCcall(f, args)
+
+A C function implemented by the runtime function `f`. `args` says how each argument of the
+C call becomes an argument of `f`: `:val` (as it is), `:ref` (a pointer to a scalar, as
+Fortran passes them: the scalar), `:array` (a pointer into an array: a `MemoryRef`),
+`:skip` (dropped, e.g. the hidden lengths of Fortran strings).
+"""
+struct RuntimeCcall
+    f::Any
+    args::Vector{Symbol}
+end
+
+const RUNTIME_CCALLS = Dict{Symbol,RuntimeCcall}()
+
+runtime_ccall(name) = name === nothing ? nothing : get(RUNTIME_CCALLS, name, nothing)
+
+function emit_runtime_ccall!(fc::FnCtx, r::RuntimeCcall, args::Vector{Any}, @nospecialize(typ))
+    length(args) == length(r.args) ||
+        unsupported("a call of ", r.f, " with ", length(args), " arguments")
+    vals = CGVal[]
+    for (a, kind) in zip(args, r.args)
+        a = a::CGVal
+        if kind === :val
+            push!(vals, a)
+        elseif kind === :ref
+            push!(vals, emit_pointerref!(fc, a, const_value(fc, 1), Any))
+        elseif kind === :array
+            o = origin_of(fc, a, "an array argument")
+            (is_object_origin(o) || o.mem === nothing) &&
+                unsupported("an array argument that does not point into a Memory")
+            R = memoryref_type(o)
+            push!(vals, CGVal(R, Inline, LeafVal[o.mem, o.array, o.index]))
+        end
+    end
+    res = call_runtime!(fc, r.f, vals)
+    return res.kind === Ghost ? ghost(Nothing, nothing) : res
 end

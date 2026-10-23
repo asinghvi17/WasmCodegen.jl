@@ -124,7 +124,7 @@ function get_field(fc::FnCtx, x::CGVal, i::Int)
             push_memory_array!(fc, x)
             arr = new_local!(fc, RefType(memory_array_type!(fc.cgm.types, memory_eltype(T)), true))
             emit!(fc.b, :local_set, arr)
-            return with_origin(v, PtrOrigin(arr, Inst(:i32_const, 0), memory_eltype(T)))
+            return with_origin(v, PtrOrigin(materialize!(fc, x), arr, Inst(:i32_const, 0), memory_eltype(T)))
         end
         name === :length || unsupported("the field ", name, " of ", T)
         ml = memory_layout(fc.cgm.types, memory_eltype(T))
@@ -583,7 +583,7 @@ function memoryref_ptr!(fc::FnCtx, r::CGVal)
         emit!(fc.b, :i64_add)
     end
     v = pop_val!(fc, Ptr{Cvoid})
-    return with_origin(v, PtrOrigin(r.leaves[2], r.leaves[3], E))
+    return with_origin(v, PtrOrigin(r.leaves[1], r.leaves[2], r.leaves[3], E))
 end
 
 with_origin(v::CGVal, o::PtrOrigin) = CGVal(v.typ, v.kind, v.leaves, v.constant, o)

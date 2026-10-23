@@ -4,18 +4,24 @@
 const LeafVal = Union{Int,Inst}
 
 """
-    PtrOrigin(array, index, eltype)
+    PtrOrigin(mem, array, index, eltype)
 
 Where a pointer points: the element `index` (an i32 leaf, 0-based) of the array (a leaf)
-of a Memory of elements of type `eltype`. Pointers cannot be dereferenced on Wasm; the
-operations Base makes with pointers into memory (`memmove`, `memset`) are compiled from
-the origins of their pointers.
+of the Memory object `mem` (a leaf, or `nothing` if unknown) of elements of type `eltype`;
+or, with `array === nothing`, into the object `mem` itself (`jl_value_ptr` of a `Ref`).
+Pointers cannot be dereferenced on Wasm; the operations Base makes with pointers into
+memory (`memmove`, `memset`, `unsafe_load`, calls of C libraries such as BLAS) are compiled
+from the origins of their pointers.
 """
 struct PtrOrigin
+    mem::Any
     array::Any
     index::Any
     eltype::Any
 end
+PtrOrigin(array, index, eltype) = PtrOrigin(nothing, array, index, eltype)
+
+is_object_origin(o::PtrOrigin) = o.array === nothing
 
 """
     CGVal
