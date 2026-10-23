@@ -8,10 +8,11 @@ into it, as a juliac build would: the exported functions set the parameters and 
 condition, `reinit!` and `solve!`, and read the saved points.
 
 ```
-julia +1.13 --project=<env with OrdinaryDiffEqTsit5, StaticArrays, SciMLLogging, WasmCodegen> build.jl
-julia +1.13 --project=<env> page.jl   # lorenz.html, with the optimized module embedded
-node run.mjs lorenz.wasm              # solve and time in Node.js
+julia +1.13 --project=. -e 'using Pkg; Pkg.instantiate()'
+julia +1.13 --project=. build.jl     # lorenz.wasm
+julia +1.13 --project=. page.jl      # lorenz.html, with the optimized module embedded
+node --experimental-wasm-exnref run.mjs lorenz.wasm   # solve and time in Node.js 24
 ```
 
-The environment needs SciMLLogging's `logging_backend = "core"` preference (as juliac
-builds use) for the code to be trim-safe.
+`LocalPreferences.toml` sets SciMLLogging's `logging_backend = "core"` preference (as
+juliac builds use), which the code needs to be trim-safe.

@@ -1,0 +1,20 @@
+[deps]
+Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+CommonSolve = "38540f10-b2f7-11e9-35d8-d573e4eb0ff2"
+IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+ModelingToolkit = "961ee093-0014-501f-94e3-6117800e7a78"
+NodeJS_24_jll = "30a2228f-09fe-513d-9563-0d10bd40449a"
+OrdinaryDiffEqTsit5 = "b1df2697-797e-41e3-8120-5422d3b24e4a"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
+SciMLLogging = "a6db7da4-7206-11f0-1eab-35f2a5dbe1d1"
+SymbolicIndexingInterface = "2efcf032-c050-4f8e-a9bb-153293bab1f5"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+WasmBuilder = "c3e9a8f2-6b1d-4f7a-8e25-1a9d3b7c4e60"
+WasmCodegen = "5b0f1d7e-3c2a-4e8b-9a61-7d2f4c8e1a93"
+
+[sources]
+IRStructurizer = {url = "https://github.com/gbaraldi/IRStructurizer.jl", rev = "eh-tryop"}
+WasmBuilder = {url = "https://github.com/gbaraldi/WasmBuilder.jl", rev = "main"}
+WasmCodegen = {path = "../.."}

@@ -1,4 +1,4 @@
-# Build lorenz.wasm from model.jl: julia --project=<env with the model's packages> build.jl
+# Build lorenz.wasm from model.jl: julia +1.13 --project=. build.jl
 using WasmCodegen
 include("model.jl")
 

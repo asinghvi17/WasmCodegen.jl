@@ -1,0 +1,2 @@
+[SciMLLogging]
+logging_backend = "core"
