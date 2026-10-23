@@ -96,8 +96,11 @@ end
 # Julia's IR does not require the values of a phi on an edge to be of the phi's type (a
 # branch on a type test narrows them), which IRStructurizer's terminator validation
 # requires of the yields replacing phis: validate everything else.
+# Loops stay `LoopOp`s and `WhileOp`s, with their own exit conditions: promoting them to
+# counting `ForOp`s gains nothing on Wasm, and a `ForOp` has neither the signedness of the
+# comparison it came from (`ult_int`) nor room for an inclusive bound at `typemax`
 function structurize(ir::CC.IRCode)
-    sci = StructuredIRCode(ir; validate=false)
+    sci = StructuredIRCode(ir; validate=false, promote=false)
     IRStructurizer.validate_scf(sci.entry)
     IRStructurizer.validate_no_phis(sci.entry)
     return sci
@@ -147,6 +150,18 @@ function operand(fc::FnCtx, @nospecialize(x))
     return const_value(fc, x)
 end
 
+# an operand of a builtin: a constant module is compile-time information only (the module
+# of `getglobal`/`setglobal!`), never serialized
+function builtin_operand(fc::FnCtx, @nospecialize(x))
+    m = x isa QuoteNode ? x.value : x
+    if m isa GlobalRef
+        c = const_global(fc.cgm.world.world, m.mod, m.name)
+        c === nothing || (m = something(c))
+    end
+    m isa Module && return CGVal(Module, Ghost, LeafVal[], Some{Any}(m))
+    return operand(fc, x)
+end
+
 function const_global(world::UInt, m::Module, s::Symbol)
     Base.invoke_in_world(world, isconst, m, s) || return nothing
     return Some(Base.invoke_in_world(world, getglobal, m, s))
@@ -165,7 +180,13 @@ function emit_block!(fc::FnCtx, block)
             res = emit_stmt_or_trap!(fc, stmt, typ)
             if res !== nothing
                 if res isa CGVal && res.kind !== Bottom && typ !== Union{}
-                    res = convert_repr(fc, res, typ)
+                    res = try
+                        convert_repr(fc, res, typ)
+                    catch err
+                        err isa Unsupported || rethrow()
+                        push!(err.context, string("the result of ", sprint(show, stmt; context=:limit => true), "::", typ))
+                        rethrow()
+                    end
                 end
                 fc.ssavals[idx] = res
             end
@@ -247,6 +268,7 @@ function emit_stmt_or_trap!(fc::FnCtx, @nospecialize(stmt), @nospecialize(typ))
         fc.b.frames = frames
         fc.b.inits = inits
         fc.depth = depth
+        push!(err.context, string("the statement ", sprint(show, stmt; context=:limit => true), "::", typ))
         push!(err.context, fc.info.mi)
         push!(fc.cgm.diagnostics, fc.info.mi => err)
         unreachable!(fc.b)
@@ -459,9 +481,7 @@ function emit_expr!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return nothing
     elseif head === :isdefined
         x = ex.args[1]
-        if x isa GlobalRef
-            return const_value(fc, isdefinedglobal(x.mod, x.name))
-        end
+        x isa GlobalRef && return isdefined_global!(fc, x)
         unsupported("isdefined of ", x)
     elseif head === :the_exception
         unreachable!(fc.b)
@@ -478,7 +498,7 @@ function emit_call!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     (f isa CGVal && isconstant(f)) ||
         unsupported("a call of a function value of type ", f isa CGVal ? f.typ : f)
     fv = constant_value(f)
-    args = Any[operand(fc, a) for a in ex.args[2:end]]
+    args = Any[fv isa Core.Builtin ? builtin_operand(fc, a) : operand(fc, a) for a in ex.args[2:end]]
     if fv isa Core.IntrinsicFunction
         return emit_intrinsic!(fc, fv, args, typ)
     elseif fv isa Core.Builtin
@@ -559,6 +579,14 @@ function convert_repr(fc::FnCtx, v, @nospecialize(T))
                 all(i -> lv.leaves[i].type == lt.leaves[i].type, eachindex(lt.leaves)) ||
                 unsupported("a conversion from ", v.typ, " to ", T)
             return CGVal(T, Inline, v.leaves, v.constant, v.origin)
+        elseif lv.kind === Boxed && lv.elements !== nothing
+            # a tuple of unknown length (an array) as a tuple of known length: its elements
+            leaves = LeafVal[]
+            for i in 1:fieldcount(T)
+                e = convert_repr(fc, tuple_array_get!(fc, v, const_value(fc, i)), fieldtype(T, i))
+                append!(leaves, e.leaves)
+            end
+            return CGVal(T, Inline, leaves)
         elseif lv.kind === Boxed
             return unbox!(fc, v, T)
         else
@@ -573,6 +601,9 @@ function convert_repr(fc::FnCtx, v, @nospecialize(T))
             return box!(fc, v, T)
         elseif lv.kind === Boxed && lv.wtype == lt.wtype
             return CGVal(T, Boxed, v.leaves, v.constant)
+        elseif lt.elements !== nothing && lv.kind in (Inline, Ghost) && v.typ <: Tuple
+            # a tuple of known length as a tuple of unknown length (an array)
+            return new_tuple_array!(fc, T, CGVal[get_field(fc, v, i) for i in 1:fieldcount(v.typ)])
         elseif lv.kind === Boxed && lv.wtype == fc.cgm.types.jlvalue
             return unbox!(fc, v, T)
         else

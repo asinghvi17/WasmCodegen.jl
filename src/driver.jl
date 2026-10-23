@@ -68,6 +68,7 @@ end
 compile(f, argtypes::Tuple; kw...) = compile([Entry(f, argtypes)]; kw...)
 
 function finish_module!(cgm::CGModule)
+    finish_pointers!(cgm)
     finish_types!(cgm)
     finish_image!(cgm)
 end

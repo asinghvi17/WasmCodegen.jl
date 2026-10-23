@@ -5,7 +5,7 @@
 # There are no overlays of Base's methods: inference is Julia's own (but for target facts
 # like `have_fma`), so the code compiled is the code juliac compiles. What Base does with
 # pointers and calls into the C runtime is compiled from the IR instead (`foreigncall.jl`,
-# pointers with origins).
+# `pointers.jl`).
 
 """
     runtime_function!(cgm, f, argtypes) -> FuncInfo
@@ -15,7 +15,7 @@ part of its runtime; it (and what it calls) is added to the closed world.
 """
 function runtime_function!(cgm::CGModule, @nospecialize(f), @nospecialize(argtypes::Tuple))
     w = cgm.world
-    mi = entry_instance(f, argtypes; world=w.world, method_table=w.method_table)
+    mi = entry_instance(f, argtypes; world=w.world)
     haskey(w.sources, mi) || extend_world!(w, Core.MethodInstance[mi])
     return get_function!(cgm, mi)
 end
@@ -41,6 +41,10 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
         push_val!(fc, convert_repr(fc, b, UInt8))
         call!(fc.b, host_import!(fc.cgm, "write_byte", ValType[I32, I32], ValType[]))
         return ghost(Nothing, nothing)
+    elseif m.module === Runtime && m.name === :reinterpret_bits
+        Out = mi.specTypes.parameters[2].parameters[1]
+        In = mi.specTypes.parameters[3]
+        return emit_reinterpret_bits!(fc, Out, operand(fc, ex.args[4]), In)
     end
     return nothing
 end

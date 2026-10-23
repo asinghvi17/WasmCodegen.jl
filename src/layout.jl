@@ -181,7 +181,7 @@ memory_eltype(@nospecialize T) = T.parameters[2]
 # the runtime's own objects, which have no Julia-level layout to follow
 const RUNTIME_TYPES = Any[DataType, UnionAll, Union, Core.TypeofBottom, TypeVar,
                           Core.SimpleVector, Module, Method, Core.MethodInstance,
-                          Core.CodeInstance, Task, Core.TypeName]
+                          Core.CodeInstance, Core.TypeName]
 
 function primitive_leaves(@nospecialize T)
     T === Float64 && return [Leaf(F64)]
@@ -230,7 +230,10 @@ function compute_layout(ts::Types, @nospecialize(T))
         # abstract types, unions, type objects: any object
         return Layout(T, Boxed, [Leaf(jlvalue_ref(ts))], UnitRange{Int}[], ts.jlvalue)
     end
-    if isprimitivetype(T)
+    if is_ptr_type(T)
+        # the address and the object it points into (see pointers.jl)
+        return Layout(T, Inline, [Leaf(I64), Leaf(jlvalue_ref(ts))], UnitRange{Int}[], nothing)
+    elseif isprimitivetype(T)
         return Layout(T, Inline, primitive_leaves(T), UnitRange{Int}[], nothing)
     elseif is_memory_type(T)
         return boxed_layout(ts, T, memory_struct_type!(ts, memory_eltype(T)))

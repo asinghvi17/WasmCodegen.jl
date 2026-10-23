@@ -65,6 +65,40 @@ function object_hash_func!(cgm::CGModule)
     end
 end
 
+"""
+    bytes_egal_func!(cgm) -> Func
+
+`jl_bytes_egal(a, b) -> i32`: whether two byte arrays (of strings, symbols) have the same
+bytes, which is `===` of strings (Julia compares them by content).
+"""
+function bytes_egal_func!(cgm::CGModule)
+    get!(cgm.helpers, :bytes_egal) do
+        arr = array_type!(cgm.types, I8)
+        at = RefType(arr, true)
+        f = add_func!(cgm.mod, "jl_bytes_egal", ValType[at, at], ValType[I32])
+        b = Builder(cgm.mod, f)
+        i, n = add_local!(f, I32), add_local!(f, I32)
+        emit!(b, :local_get, 0); emit!(b, :local_get, 1); emit!(b, :ref_eq)
+        if!(b); emit!(b, :i32_const, 1); return!(b); end!(b)
+        emit!(b, :local_get, 0); emit!(b, :array_len); emit!(b, :local_set, n)
+        emit!(b, :local_get, n); emit!(b, :local_get, 1); emit!(b, :array_len); emit!(b, :i32_ne)
+        if!(b); emit!(b, :i32_const, 0); return!(b); end!(b)
+        block!(b); loop!(b)
+        emit!(b, :local_get, i); emit!(b, :local_get, n); emit!(b, :i32_ge_u)
+        br_if!(b, 1)
+        emit!(b, :local_get, 0); emit!(b, :local_get, i); emit!(b, :array_get_u, arr)
+        emit!(b, :local_get, 1); emit!(b, :local_get, i); emit!(b, :array_get_u, arr)
+        emit!(b, :i32_ne)
+        if!(b); emit!(b, :i32_const, 0); return!(b); end!(b)
+        emit!(b, :local_get, i); emit!(b, :i32_const, 1); emit!(b, :i32_add); emit!(b, :local_set, i)
+        br!(b, 0)
+        end!(b); end!(b)
+        emit!(b, :i32_const, 1)
+        finish!(b)
+        f
+    end
+end
+
 "Push the identity hash (an i32) of the object `x`."
 function push_object_hash!(fc::FnCtx, x::CGVal)
     push_val!(fc, x)
@@ -81,4 +115,34 @@ function push_memory_base!(fc::FnCtx, mem::CGVal)
     emit!(fc.b, :i64_extend_i32_u)
     emit!(fc.b, :i64_const, 32)
     emit!(fc.b, :i64_shl)
+end
+
+"""
+    current_task_global!(cgm) -> Global
+
+The task the module's code runs in (`current_task()`): a `Task` object, its fields zero
+or empty but for its random number generator's state (`rngState0` ... `rngState4`), seeded
+at start from the host (`julia.entropy`), as Julia seeds the root task from the system's
+entropy.
+"""
+function current_task_global!(cgm::CGModule)
+    g = get(cgm.helpers, :current_task, nothing)
+    g === nothing || return g::Global
+    ts = cgm.types
+    l = layout(ts, Task)
+    init = Inst[Inst(:i32_const, typeid!(ts, Task)), Inst(:i32_const, 0)]
+    fields = (typedef(cgm.mod, l.wtype).comp::StructType).fields
+    for f in fields[HEADER_FIELDS+1:end]
+        st = f.storage
+        push!(init, default_inst(st isa PackedType ? I32 : st))
+    end
+    push!(init, Inst(:struct_new, l.wtype))
+    g = add_global!(cgm.mod, "jl_current_task", RefType(l.wtype, false), false, init)
+    cgm.helpers[:current_task] = g
+    entropy = host_import!(cgm, "entropy", ValType[], ValType[I64])
+    for i in 0:4
+        w = first(l.fields[Base.fieldindex(Task, Symbol("rngState", i))]) - 1
+        push!(cgm.image.init, Inst(:global_get, g), Inst(:call, entropy), Inst(:struct_set, l.wtype, w))
+    end
+    return g
 end

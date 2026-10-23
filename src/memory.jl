@@ -129,6 +129,16 @@ function push_element_address!(fc::FnCtx, r::CGVal, ml::MemoryLayout, k::Int=0)
     end
 end
 
+# push whether the element `r` refers to is within its memory (an i32): a reference to
+# the first element of an empty memory exists, but not its element
+function push_in_bounds!(fc::FnCtx, r::CGVal, ml::MemoryLayout)
+    push_leaf!(fc, r.leaves[3])
+    push_leaf!(fc, r.leaves[2])
+    emit!(fc.b, :array_len)
+    ml.stride != 1 && (emit!(fc.b, :i32_const, ml.stride); emit!(fc.b, :i32_div_u))
+    emit!(fc.b, :i32_lt_u)
+end
+
 function array_get_op(st::StorageType)
     st isa PackedType && return :array_get_u
     return :array_get
@@ -144,7 +154,15 @@ function emit_memoryrefget!(fc::FnCtx, r::CGVal, bc, @nospecialize(typ))
     E = ref_eltype(R)
     ml = memory_layout(fc.cgm.types, E)
     el = ml.elem
-    el.kind === Ghost && return ghost(E, something(ghost_value(E)))
+    if el.kind === Ghost
+        # no storage to access: check the bounds (a BoundsError)
+        if !(bc isa CGVal && isconstant(bc) && constant_value(bc) === false)
+            push_in_bounds!(fc, r, ml)
+            emit!(fc.b, :i32_eqz)
+            if!(fc.b); unreachable!(fc.b); end!(fc.b)
+        end
+        return ghost(E, something(ghost_value(E)))
+    end
     if ml.boxed
         push_element_address!(fc, r, ml)
         emit!(fc.b, :array_get, ml.array)
@@ -219,15 +237,21 @@ function narrow_leaf!(fc::FnCtx, t::ValType)
     end
 end
 
+# whether the element `r` refers to is assigned: within the memory, and, for references,
+# not null
 function emit_memoryref_isassigned!(fc::FnCtx, r::CGVal, bc)
     E = ref_eltype(r.typ)
     ml = memory_layout(fc.cgm.types, E)
+    push_in_bounds!(fc, r, ml)
     if ml.boxed || ml.elem.kind === Boxed || (ml.storage isa RefType)
+        if!(fc.b, I32)
         push_element_address!(fc, r, ml)
         emit!(fc.b, :array_get, ml.array)
         emit!(fc.b, :ref_is_null)
         emit!(fc.b, :i32_eqz)
-        return pop_val!(fc, Bool)
+        else!(fc.b)
+        emit!(fc.b, :i32_const, 0)
+        end!(fc.b)
     end
-    return const_value(fc, true)
+    return pop_val!(fc, Bool)
 end

@@ -28,7 +28,7 @@ mutable struct Image
     object, Wasm type, field or element index, value, declared type)."
     patches::Vector{Any}
     "Global variables: (module, name) => the globals of the leaves of its value."
-    vars::Dict{Tuple{Module,Symbol},Tuple{Any,Vector{Global}}}
+    vars::Dict{Tuple{Module,Symbol},Tuple{Any,Vector{Global},Union{Nothing,Global}}}
     "The globals of the arrays of `Memory`, `String` and `Symbol` objects."
     arrays::IdDict{Any,Global}
     counter::Int
@@ -36,7 +36,7 @@ end
 
 Image(cgm) = Image(cgm, IdDict{Any,Global}(), IdDict{Any,Global}(), IdDict{Any,Global}(),
                    IdSet{Any}(), Inst[], Any[],
-                   Dict{Tuple{Module,Symbol},Tuple{Any,Vector{Global}}}(), IdDict{Any,Global}(), 0)
+                   Dict{Tuple{Module,Symbol},Tuple{Any,Vector{Global},Union{Nothing,Global}}}(), IdDict{Any,Global}(), 0)
 
 types(img::Image) = img.cgm.types
 
@@ -107,6 +107,9 @@ function const_leaves(img::Image, @nospecialize(x), @nospecialize(FT))
     lf.kind === Ghost && return Inst[]
     if lf.kind === Inline
         T = typeof(x)
+        # a pointer from the build process: an address without owner
+        is_ptr_type(T) && return Inst[Inst(:i64_const, reinterpret(Int64, UInt64(UInt(x)))),
+                                      Inst(:ref_null, ts.jlvalue)]
         isprimitivetype(T) && return primitive_const(x, lf.leaves)
         if is_memoryref_type(T)
             mem = x.mem
@@ -159,12 +162,22 @@ function boxed_object_global!(img::Image, @nospecialize(x))
     end
 end
 
+"The type `X` (in a `Some`) if `T` is `Type{X}`, the type only `X` is an instance of."
+function type_singleton(@nospecialize(T))
+    T isa DataType && T <: Type || return nothing
+    v = ghost_value(T)
+    return v !== nothing && something(v) isa Type ? v : nothing
+end
+
 """
     singleton_global!(img, T) -> Global
 
 The object of the singleton (ghost) type `T`, where it is stored as a `\$JlValue`.
 """
 function singleton_global!(img::Image, @nospecialize(T))
+    # a type (of type `Type{X}`): its type object, as types are interned
+    X = type_singleton(T)
+    X === nothing || return object_global!(img, something(X))
     get!(img.singletons, T) do
         ts = types(img)
         box = box_type!(ts, T)
@@ -185,6 +198,8 @@ function object_global!(img::Image, @nospecialize(x))
     g = get(img.globals, x, nothing)
     g === nothing || return g
     x in img.inprogress && unsupported("serializing a cycle of objects through ", typeof(x))
+    # types are objects even where their type is a singleton (`Union{}`)
+    x isa Type && return type_object_global!(img, x)
     ts = types(img)
     T = typeof(x)
     l = layout(ts, T)
@@ -193,8 +208,6 @@ function object_global!(img::Image, @nospecialize(x))
         return bytes_object_global!(img, x)
     elseif is_memory_type(T)
         return memory_global!(img, x)
-    elseif x isa Type
-        return type_object_global!(img, x)
     elseif any(R -> T === R, RUNTIME_TYPES)
         unsupported("serializing the runtime object ", x, " of type ", T)
     elseif T <: Ptr || T === Ptr
@@ -479,7 +492,12 @@ A read of the global variable `ref`: mutable globals of the module (one per leaf
 declared type), initialized with its value at compile time.
 """
 function nonconst_global(fc::FnCtx, ref::GlobalRef)
-    T, gs = global_var!(fc.cgm.image, ref)
+    T, gs, def = global_var!(fc.cgm.image, ref)
+    if def !== nothing
+        # not assigned yet: an UndefVarError
+        emit!(fc.b, :global_get, def); emit!(fc.b, :i32_eqz)
+        if!(fc.b); unreachable!(fc.b); end!(fc.b)
+    end
     l = layout(fc, T)
     l.kind === Ghost && return ghost(T, something(ghost_value(T)))
     for g in gs
@@ -506,19 +524,33 @@ function global_var!(img::Image, ref::GlobalRef)
         name = string("jl_global_", ref.mod, "_", ref.name, length(l.leaves) > 1 ? "_$i" : "")
         push!(gs, add_global!(img.cgm.mod, name, leaf.type, true, Inst[inits[i]]))
     end
-    img.vars[key] = (T, gs)
-    return (T, gs)
+    # a variable without a value at compile time: whether it has one since
+    def = defined ? nothing :
+          add_global!(img.cgm.mod, string("jl_global_", ref.mod, "_", ref.name, "_defined"),
+                      I32, true, Inst[Inst(:i32_const, 0)])
+    img.vars[key] = (T, gs, def)
+    return (T, gs, def)
+end
+
+"`isdefined` of the global variable `ref`."
+function isdefined_global!(fc::FnCtx, ref::GlobalRef)
+    const_global(fc.cgm.world.world, ref.mod, ref.name) === nothing || return const_value(fc, true)
+    _, _, def = global_var!(fc.cgm.image, ref)
+    def === nothing && return const_value(fc, true)
+    emit!(fc.b, :global_get, def)
+    return pop_val!(fc, Bool)
 end
 
 "Write the global variable `ref` (a `setglobal!`)."
 function set_global_var!(fc::FnCtx, ref::GlobalRef, v::CGVal)
-    T, gs = global_var!(fc.cgm.image, ref)
+    T, gs, def = global_var!(fc.cgm.image, ref)
     v = convert_repr(fc, v, T)
     v.kind === Bottom && return v
     push_val!(fc, v)
     for g in Iterators.reverse(gs)
         emit!(fc.b, :global_set, g)
     end
+    def === nothing || (emit!(fc.b, :i32_const, 1); emit!(fc.b, :global_set, def))
     return v
 end
 

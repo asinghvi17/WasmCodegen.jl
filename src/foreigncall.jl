@@ -1,6 +1,6 @@
 # Foreign calls: the few calls into Julia's C runtime that Base's code makes for things
-# Wasm does natively (allocation, strings as bytes). Others are unsupported; calls into C
-# libraries need overlays or host imports.
+# Wasm does natively (allocation, strings as bytes, copies of memory). Others are
+# unsupported; calls into C libraries need runtime functions or host imports.
 
 function foreigncall_name(@nospecialize(x))
     x isa QuoteNode && (x = x.value)
@@ -49,6 +49,14 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         emit!(fc.b, :array_copy, arr, arr)
         emit!(fc.b, :local_get, dst)
         return new_bytes_object!(fc, String)
+    elseif name === :jl_symbol_n
+        # not interned: symbols are === by their bytes (see `egal_bytes!`)
+        return bytes_from_ptr!(fc, args[1], args[2], Symbol)
+    elseif name === :jl_pchar_to_string
+        return bytes_from_ptr!(fc, args[1], args[2], String)
+    elseif name === :memcmp
+        return call_runtime!(fc, Runtime.ptr_memcmp, CGVal[byte_ptr(args[1]), byte_ptr(args[2]),
+                                                            convert_repr(fc, args[3], UInt)])
     elseif name === :memmove || name === :memcpy
         return emit_memmove!(fc, args[1], args[2], args[3], true)
     elseif name === :jl_genericmemory_copyto
@@ -57,28 +65,17 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return ghost(Nothing, nothing)
     elseif name === :memset
         return emit_memset!(fc, args[1], args[2], args[3])
+    elseif name === :jl_get_current_task
+        # one task: the module's (its RNG state seeded by the host at start)
+        emit!(fc.b, :global_get, current_task_global!(fc.cgm))
+        return pop_val!(fc, Task)
     elseif name === :jl_genericmemory_owner
         # a Memory owns itself here (none shares a String's storage as its owner)
         return convert_repr(fc, args[1]::CGVal, typ)
     elseif name === :jl_string_ptr
-        # the address of the bytes of a string: virtual, pointing into them
-        s = args[1]::CGVal
-        push_memory_base!(fc, convert_repr(fc, s, String))
-        v = pop_val!(fc, typ)
-        push_val!(fc, s)
-        emit!(fc.b, :struct_get, layout(fc, String).wtype, DATA_FIELD)
-        arr = new_local!(fc, RefType(array_type!(fc.cgm.types, I8), true))
-        emit!(fc.b, :local_set, arr)
-        return with_origin(v, PtrOrigin(nothing, arr, Inst(:i32_const, 0), UInt8))
+        return string_ptr!(fc, args[1]::CGVal, typ)
     elseif name === :jl_value_ptr
-        # the address of an object: a virtual one (see `push_memory_base!`), pointing into it
-        x = args[1]::CGVal
-        lx = layout(fc, x.typ)
-        (lx.kind === Boxed && ismutabletype(x.typ) && !isempty(lx.fields)) ||
-            unsupported("the address of a value of type ", x.typ)
-        push_memory_base!(fc, x)
-        v = pop_val!(fc, typ)
-        return with_origin(v, PtrOrigin(materialize!(fc, x), nothing, nothing, x.typ))
+        return object_ptr!(fc, args[1]::CGVal, typ)
     elseif (r = runtime_ccall(name)) !== nothing
         return emit_runtime_ccall!(fc, r, args, typ)
     elseif name === :jl_get_world_counter || name === :jl_get_tls_world_age
@@ -89,6 +86,19 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return bottom()
     end
     unsupported("the foreign call ", something(name, ex.args[1]))
+end
+
+"A `String` or `Symbol` (`T`) of a copy of the `n` bytes at the pointer `p`."
+function bytes_from_ptr!(fc::FnCtx, p::CGVal, n::CGVal, @nospecialize(T))
+    n = convert_repr(fc, n, Int)
+    arr = array_type!(fc.cgm.types, I8)
+    push_val!(fc, n); emit!(fc.b, :i32_wrap_i64)
+    emit!(fc.b, :array_new_default, arr)
+    s = new_bytes_object!(fc, String)
+    emit_memmove!(fc, string_ptr!(fc, s, Ptr{UInt8}), p, n, true)
+    T === String && return s
+    push_val!(fc, s); emit!(fc.b, :struct_get, layout(fc, String).wtype, DATA_FIELD)
+    return new_bytes_object!(fc, T)
 end
 
 "The `String` (or `Symbol`) object of type `T` of the bytes on the stack."
@@ -103,77 +113,137 @@ function new_bytes_object!(fc::FnCtx, @nospecialize(T))
     return pop_val!(fc, T)
 end
 
-function origin_of(fc::FnCtx, p, what)
-    p isa CGVal && p.origin !== nothing && return p.origin
-    unsupported(what, " of a pointer whose origin (a Memory) is not known")
+# the origin of the pointer `p` into the array of a memory, or nothing
+function array_origin(p::CGVal)
+    o = p.origin
+    return o === nothing || is_object_origin(o) ? nothing : o
 end
+
+# push the index of the array element the origin `o` points to, or the number of array
+# elements of `n` bytes (`count`)
+function push_array_index!(fc::FnCtx, o::PtrOrigin, n::Union{Nothing,CGVal}=nothing; elements::Bool=false)
+    ml = memory_layout(fc.cgm.types, o.eltype)
+    if n === nothing
+        push_leaf!(fc, o.index)
+    else
+        push_val!(fc, n)
+        layout(fc, n.typ).leaves[1].type === I64 && emit!(fc.b, :i32_wrap_i64)
+    end
+    if elements
+        ml.stride != 1 && (emit!(fc.b, :i32_const, ml.stride); emit!(fc.b, :i32_mul))
+    elseif byte_addressable(fc, o.eltype)
+        s = storage_size(fc, o.eltype)
+        s != 1 && (emit!(fc.b, :i32_const, s); emit!(fc.b, :i32_div_u))
+    else
+        u = elem_unit(o.eltype)
+        u != 1 && (emit!(fc.b, :i32_const, u); emit!(fc.b, :i32_div_u))
+        ml.stride != 1 && (emit!(fc.b, :i32_const, ml.stride); emit!(fc.b, :i32_mul))
+    end
+end
+
+# push whether the byte offsets of the origins and the length `n` are multiples of the
+# storage size `s` of their arrays' elements (an i32)
+function push_aligned!(fc::FnCtx, origins, n::CGVal, s::Int)
+    for (k, o) in enumerate(origins)
+        push_leaf!(fc, o.index)
+        k > 1 && emit!(fc.b, :i32_or)
+    end
+    push_val!(fc, n)
+    layout(fc, n.typ).leaves[1].type === I64 && emit!(fc.b, :i32_wrap_i64)
+    emit!(fc.b, :i32_or)
+    emit!(fc.b, :i32_const, s - 1); emit!(fc.b, :i32_and)
+    emit!(fc.b, :i32_eqz)
+end
+
+byte_ptr(p::CGVal) = CGVal(Ptr{UInt8}, Inline, p.leaves)
 
 """
     emit_memmove!(fc, dst, src, n, bytes) -> CGVal
 
-`memmove` (or `jl_genericmemory_copyto`) between the elements the pointers `dst` and `src`
-point to, `n` bytes (or elements): an `array.copy` between the arrays they come from.
+`memmove` (or `jl_genericmemory_copyto`) of `n` bytes (or elements) from `src` to `dst`:
+an `array.copy` between the arrays they point into, if known, of one type, and aligned to
+their elements, else a copy byte by byte (`Runtime.ptr_memmove`).
 """
 function emit_memmove!(fc::FnCtx, dst, src, n, bytes::Bool)
-    od, os = origin_of(fc, dst, "memmove"), origin_of(fc, src, "memmove")
+    dst, src, n = dst::CGVal, src::CGVal, n::CGVal
+    od, os = array_origin(dst), array_origin(src)
     ts = fc.cgm.types
-    md, ms = memory_layout(ts, od.eltype), memory_layout(ts, os.eltype)
-    md.array == ms.array || unsupported("memmove between memories of ", od.eltype, " and ", os.eltype)
-    ml = md
-    push_leaf!(fc, od.array)
-    push_leaf!(fc, od.index)
-    ml.stride != 1 && (emit!(fc.b, :i32_const, ml.stride); emit!(fc.b, :i32_mul))
-    push_leaf!(fc, os.array)
-    push_leaf!(fc, os.index)
-    ml.stride != 1 && (emit!(fc.b, :i32_const, ml.stride); emit!(fc.b, :i32_mul))
-    # the number of array elements
-    push_val!(fc, n::CGVal)
-    layout(fc, n.typ).leaves[1].type === I64 && emit!(fc.b, :i32_wrap_i64)
-    if bytes
-        sz = Base.aligned_sizeof(od.eltype)
-        emit!(fc.b, :i32_const, sz)
-        emit!(fc.b, :i32_div_u)
+    if od !== nothing && os !== nothing
+        md, ms = memory_layout(ts, od.eltype), memory_layout(ts, os.eltype)
+        ba = byte_addressable(fc, od.eltype) && byte_addressable(fc, os.eltype)
+        if md.array == ms.array && (od.eltype === os.eltype || ba)
+            # bytes of arrays of bytes, or whole elements (of elements not stored as bytes,
+            # pointers to whole elements)
+            s = bytes && ba ? storage_size(fc, od.eltype) : 1
+            if s > 1
+                push_aligned!(fc, (od, os), n, s)
+                if!(fc.b)
+            end
+            push_leaf!(fc, od.array); push_array_index!(fc, od)
+            push_leaf!(fc, os.array); push_array_index!(fc, os)
+            push_array_index!(fc, od, n; elements=!bytes)
+            emit!(fc.b, :array_copy, md.array, md.array)
+            if s > 1
+                else!(fc.b)
+                call_runtime!(fc, Runtime.ptr_memmove, CGVal[byte_ptr(dst), byte_ptr(src), convert_repr(fc, n, UInt)])
+                end!(fc.b)
+            end
+            return bytes ? dst : ghost(Nothing, nothing)
+        end
     end
-    ml.stride != 1 && (emit!(fc.b, :i32_const, ml.stride); emit!(fc.b, :i32_mul))
-    emit!(fc.b, :array_copy, ml.array, ml.array)
-    return bytes ? dst : ghost(Nothing, nothing)
+    bytes || unsupported("copying elements between memories not known at compile time")
+    call_runtime!(fc, Runtime.ptr_memmove, CGVal[byte_ptr(dst), byte_ptr(src), convert_repr(fc, n, UInt)])
+    return dst
 end
 
 """
     emit_memset!(fc, p, val, n) -> CGVal
 
-`memset` of `n` bytes at `p` to the byte `val`: an `array.fill` of a byte array, or of
-zeros.
+`memset` of `n` bytes at `p` to the byte `val`: an `array.fill` of the array it points
+into (of bytes, or of zeros aligned to its elements), else byte by byte
+(`Runtime.ptr_memset`).
 """
 function emit_memset!(fc::FnCtx, p, val, n)
-    o = origin_of(fc, p, "memset")
-    ml = memory_layout(fc.cgm.types, o.eltype)
-    bytewise = ml.storage === I8 && ml.stride == 1
-    val = val::CGVal
-    if !bytewise && !(isconstant(val) && iszero(constant_value(val)))
-        unsupported("memset of a nonzero byte in a memory of ", o.eltype)
+    p, val, n = p::CGVal, val::CGVal, n::CGVal
+    o = array_origin(p)
+    if o !== nothing
+        ml = memory_layout(fc.cgm.types, o.eltype)
+        bytewise = ml.storage === I8 && ml.stride == 1
+        if bytewise || (isconstant(val) && iszero(constant_value(val)))
+            s = !bytewise && byte_addressable(fc, o.eltype) ? storage_size(fc, o.eltype) : 1
+            if s > 1
+                push_aligned!(fc, (o,), n, s)
+                if!(fc.b)
+            end
+            push_leaf!(fc, o.array); push_array_index!(fc, o)
+            if bytewise
+                push_val!(fc, val)
+                layout(fc, val.typ).leaves[1].type === I64 && emit!(fc.b, :i32_wrap_i64)
+                emit!(fc.b, :i32_const, 0xff); emit!(fc.b, :i32_and)
+            else
+                st = ml.storage
+                push_default!(fc, st isa PackedType ? I32 : st)
+            end
+            push_array_index!(fc, o, n)
+            emit!(fc.b, :array_fill, ml.array)
+            if s > 1
+                else!(fc.b)
+                emit_memset_bytes!(fc, p, val, n)
+                end!(fc.b)
+            end
+            return p
+        end
     end
-    push_leaf!(fc, o.array)
-    push_leaf!(fc, o.index)
-    ml.stride != 1 && (emit!(fc.b, :i32_const, ml.stride); emit!(fc.b, :i32_mul))
-    if bytewise
-        push_val!(fc, val)
-        layout(fc, val.typ).leaves[1].type === I64 && emit!(fc.b, :i32_wrap_i64)
-        emit!(fc.b, :i32_const, 0xff)
-        emit!(fc.b, :i32_and)
-    else
-        st = ml.storage
-        push_default!(fc, st isa PackedType ? I32 : st)
-    end
-    push_val!(fc, n::CGVal)
-    layout(fc, n.typ).leaves[1].type === I64 && emit!(fc.b, :i32_wrap_i64)
-    if !bytewise
-        emit!(fc.b, :i32_const, Base.aligned_sizeof(o.eltype))
-        emit!(fc.b, :i32_div_u)
-        ml.stride != 1 && (emit!(fc.b, :i32_const, ml.stride); emit!(fc.b, :i32_mul))
-    end
-    emit!(fc.b, :array_fill, ml.array)
+    emit_memset_bytes!(fc, p, val, n)
     return p
+end
+
+function emit_memset_bytes!(fc::FnCtx, p::CGVal, val::CGVal, n::CGVal)
+    push_val!(fc, val)
+    layout(fc, val.typ).leaves[1].type === I64 && emit!(fc.b, :i32_wrap_i64)
+    emit!(fc.b, :i32_const, 0xff); emit!(fc.b, :i32_and)
+    b = pop_val!(fc, UInt8)
+    call_runtime!(fc, Runtime.ptr_memset, CGVal[byte_ptr(p), b, convert_repr(fc, n, UInt)])
 end
 
 ## C library calls implemented by the runtime
@@ -204,13 +274,11 @@ function emit_runtime_ccall!(fc::FnCtx, r::RuntimeCcall, args::Vector{Any}, @nos
         if kind === :val
             push!(vals, a)
         elseif kind === :ref
-            push!(vals, emit_pointerref!(fc, a, const_value(fc, 1), Any))
+            push!(vals, ptr_load!(fc, a, const_value(fc, 1), eltype(a.typ)))
         elseif kind === :array
-            o = origin_of(fc, a, "an array argument")
-            (is_object_origin(o) || o.mem === nothing) &&
-                unsupported("an array argument that does not point into a Memory")
-            R = memoryref_type(o)
-            push!(vals, CGVal(R, Inline, LeafVal[o.mem, o.array, o.index]))
+            o = array_origin(a)
+            o === nothing && unsupported("an array argument that does not point into a Memory")
+            push!(vals, element_ref!(fc, o, const_value(fc, 1), o.eltype))
         end
     end
     res = call_runtime!(fc, r.f, vals)

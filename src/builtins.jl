@@ -118,14 +118,7 @@ function get_field(fc::FnCtx, x::CGVal, i::Int)
         return pop_val!(fc, FT)
     elseif is_memory_type(T)
         name = fieldname(T, i)
-        if name === :ptr
-            push_memory_base!(fc, x)
-            v = pop_val!(fc, FT)
-            push_memory_array!(fc, x)
-            arr = new_local!(fc, RefType(memory_array_type!(fc.cgm.types, memory_eltype(T)), true))
-            emit!(fc.b, :local_set, arr)
-            return with_origin(v, PtrOrigin(materialize!(fc, x), arr, Inst(:i32_const, 0), memory_eltype(T)))
-        end
+        name === :ptr && return memory_ptr!(fc, x, FT)
         name === :length || unsupported("the field ", name, " of ", T)
         ml = memory_layout(fc.cgm.types, memory_eltype(T))
         push_memory_array!(fc, x)
@@ -262,6 +255,10 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
         m, s = args[1], args[2]
         (isconstant(m) && isconstant(s)) || unsupported("getglobal of a binding not known at compile time")
         return operand(fc, GlobalRef(constant_value(m), constant_value(s)))
+    elseif isdefined(Core, :isdefinedglobal) && f === getfield(Core, :isdefinedglobal)
+        m, s = args[1], args[2]
+        (isconstant(m) && isconstant(s)) || unsupported("isdefinedglobal of a binding not known at compile time")
+        return isdefined_global!(fc, GlobalRef(constant_value(m), constant_value(s)))
     elseif f === Core.setglobal!
         m, s = args[1], args[2]
         (isconstant(m) && isconstant(s)) || unsupported("setglobal! of a binding not known at compile time")
@@ -314,19 +311,26 @@ end
 """
     get_field_dynamic(fc, x, i, typ) -> CGVal
 
-The field of the tuple `x` at the run-time index `i` (1-based; Julia checks it): an
-element of the array of a large tuple; for an inline tuple of one element type, an
-element of a temporary array of its elements; otherwise a chain of tests of the index.
+The field of `x` at the run-time index or name `i` (1-based; out of bounds traps, as a
+BoundsError or FieldError would): an element of the array of a large tuple; for an inline
+tuple of one element type, an element of a temporary array of its elements; otherwise a
+chain of tests of the index.
 """
 function get_field_dynamic(fc::FnCtx, x::CGVal, i::CGVal, @nospecialize(typ))
     T = x.typ
     l = layout(fc, T)
-    l.kind === Boxed && l.elements !== nothing && return tuple_array_get!(fc, x, i)
-    (T isa DataType && T <: Tuple && l.kind === Inline) ||
+    l.kind === Boxed && l.elements !== nothing && i.typ !== Symbol &&
+        return tuple_array_get!(fc, x, i)
+    (T isa DataType && isconcretetype(T) && l.elements === nothing) ||
         unsupported("a field of ", T, " at an index not known at compile time")
     n = fieldcount(T)
+    i.typ === Symbol && (i = field_index_of!(fc, T, i))
     idx = convert_repr(fc, i, Int)
-    if is_homogeneous_tuple(T) && n > 4
+    # out of bounds: a BoundsError
+    push_val!(fc, idx); emit!(fc.b, :i64_const, 1); emit!(fc.b, :i64_sub)
+    emit!(fc.b, :i64_const, n); emit!(fc.b, :i64_ge_u)
+    if!(fc.b); unreachable!(fc.b); end!(fc.b)
+    if T <: Tuple && l.kind === Inline && is_homogeneous_tuple(T) && n > 4
         E = fieldtype(T, 1)
         ml = memory_layout(fc.cgm.types, E)
         if !ml.boxed && !ml.widened && layout(fc, E).kind !== Ghost
@@ -353,6 +357,18 @@ function get_field_dynamic(fc::FnCtx, x::CGVal, i::CGVal, @nospecialize(typ))
         end!(fc.b); close_label!(fc)
     end
     return res
+end
+
+# the index of the field of `T` named by the symbol `s` (an Int), 0 if there is none
+function field_index_of!(fc::FnCtx, @nospecialize(T), s::CGVal)
+    res = new_local!(fc, I64)
+    emit!(fc.b, :i64_const, 0); emit!(fc.b, :local_set, res)
+    for k in 1:fieldcount(T)
+        e = emit_egal!(fc, s, const_value(fc, fieldname(T, k)))
+        push_val!(fc, e)
+        if!(fc.b); emit!(fc.b, :i64_const, k); emit!(fc.b, :local_set, res); end!(fc.b)
+    end
+    return CGVal(Int, Inline, LeafVal[res])
 end
 
 # the element at the (1-based, Int) index `idx` of the array in local `arr`, stored as `ml`
@@ -452,6 +468,12 @@ function emit_egal!(fc::FnCtx, a::CGVal, b::CGVal)
     if Ta === Tb && la.kind === Inline
         return egal_inline!(fc, a, b)
     end
+    for S in (String, Symbol)
+        if Ta === S || Tb === S
+            # compared by content
+            return egal_bytes!(fc, a, b, S)
+        end
+    end
     if la.kind === Boxed && lb.kind === Boxed
         if (Ta === Tb && ismutabletype(Ta)) || (is_memory_type(Ta) && Ta === Tb)
             push_val!(fc, a); push_val!(fc, b)
@@ -468,12 +490,37 @@ function emit_egal!(fc::FnCtx, a::CGVal, b::CGVal)
     unsupported("=== of values of types ", Ta, " and ", Tb)
 end
 
+# `a === b` where one of them is a `S` (a String or Symbol): of two of them, the same bytes
+function egal_bytes!(fc::FnCtx, a::CGVal, b::CGVal, @nospecialize(S))
+    st = layout(fc, S).wtype
+    a.typ === S || ((a, b) = (b, a))
+    if b.typ === S
+        push_val!(fc, a); emit!(fc.b, :struct_get, st, DATA_FIELD)
+        push_val!(fc, b); emit!(fc.b, :struct_get, st, DATA_FIELD)
+        call!(fc.b, bytes_egal_func!(fc.cgm))
+        return pop_val!(fc, Bool)
+    end
+    # the other one may be a `S`
+    o = new_local!(fc, jlvalue_ref(fc.cgm.types))
+    push_val!(fc, convert_repr(fc, b, Any)); emit!(fc.b, :local_set, o)
+    emit!(fc.b, :local_get, o); emit!(fc.b, :ref_test, st)
+    if!(fc.b, I32)
+    push_val!(fc, a); emit!(fc.b, :struct_get, st, DATA_FIELD)
+    emit!(fc.b, :local_get, o); emit!(fc.b, :ref_cast, st); emit!(fc.b, :struct_get, st, DATA_FIELD)
+    call!(fc.b, bytes_egal_func!(fc.cgm))
+    else!(fc.b)
+    emit!(fc.b, :i32_const, 0)
+    end!(fc.b)
+    return pop_val!(fc, Bool)
+end
+
 # whether a value of type T may be an immutable non-ghost value (compared by content)
 function may_be_immutable(@nospecialize(T))
     T === Union{} && return false
     if T isa Union
         return may_be_immutable(T.a) || may_be_immutable(T.b)
     end
+    (T === String || T === Symbol) && return true
     T isa DataType && isconcretetype(T) && return !ismutabletype(T) && ghost_value(T) === nothing
     return true
 end
@@ -482,6 +529,8 @@ function egal_inline!(fc::FnCtx, a::CGVal, b::CGVal)
     T = a.typ
     if isprimitivetype(T) || is_memoryref_type(T)
         leaves = layout(fc, T).leaves
+        # pointers are the same if their addresses are
+        is_ptr_type(T) && (leaves = leaves[1:1])
         first_leaf = true
         for (la, lb, leaf) in zip(a.leaves, b.leaves, leaves)
             t = leaf.type
@@ -540,6 +589,26 @@ function emit_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
     end
     (lx.kind === Boxed && lx.wtype == fc.cgm.types.jlvalue) ||
         unsupported("isa(::", S, ", ", T, ")")
+    if (X = type_singleton(T)) !== nothing
+        # `Type{X}`: the type object of X itself
+        push_val!(fc, x)
+        emit!(fc.b, :global_get, object_global!(fc.cgm.image, something(X)))
+        emit!(fc.b, :ref_eq)
+        return pop_val!(fc, Bool)
+    elseif T isa Union && any(U -> type_singleton(U) !== nothing, Base.uniontypes(T))
+        # a union with some: of each member
+        res = nothing
+        for U in Base.uniontypes(T)
+            r = emit_isa!(fc, x, U)
+            if res === nothing
+                res = r
+            else
+                push_val!(fc, res); push_val!(fc, r); emit!(fc.b, :i32_or)
+                res = pop_val!(fc, Bool)
+            end
+        end
+        return res
+    end
     if T isa DataType && isconcretetype(T)
         push_val!(fc, x)
         emit!(fc.b, :struct_get, ts.jlvalue, 0)
@@ -578,28 +647,6 @@ function emit_ifelse!(fc::FnCtx, c::CGVal, a::CGVal, b::CGVal, @nospecialize(typ
     end
     return pop_val!(fc, typ)
 end
-
-"""
-    memoryref_ptr!(fc, r) -> CGVal
-
-The `ptr_or_offset` of the MemoryRef `r`: the index for elements of zero size or unions
-(as natively), else the virtual address of the element (see `push_memory_base!`).
-"""
-function memoryref_ptr!(fc::FnCtx, r::CGVal)
-    E = ref_eltype(r.typ)
-    push_leaf!(fc, r.leaves[3])
-    emit!(fc.b, :i64_extend_i32_u)
-    if !(E isa Union || Base.aligned_sizeof(E) == 0)
-        emit!(fc.b, :i64_const, Base.aligned_sizeof(E))
-        emit!(fc.b, :i64_mul)
-        push_memory_base!(fc, CGVal(memory_type(r.typ), Boxed, LeafVal[r.leaves[1]]))
-        emit!(fc.b, :i64_add)
-    end
-    v = pop_val!(fc, Ptr{Cvoid})
-    return with_origin(v, PtrOrigin(r.leaves[1], r.leaves[2], r.leaves[3], E))
-end
-
-with_origin(v::CGVal, o::PtrOrigin) = CGVal(v.typ, v.kind, v.leaves, v.constant, o)
 
 memory_type(@nospecialize(R)) = GenericMemory{R.parameters[1],R.parameters[2],R.parameters[3]}
 

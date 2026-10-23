@@ -10,6 +10,11 @@ const decoder = new TextDecoder();
 function makeImports(mod) {
   const julia = {
     write_byte: (fd, b) => { bytes.push(b); },
+    entropy: () => {
+      const w = new BigUint64Array(1);
+      crypto.getRandomValues(w);
+      return BigInt.asIntN(64, w[0]);
+    },
   };
   const imports = { julia };
   for (const imp of WebAssembly.Module.imports(mod)) {

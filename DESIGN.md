@@ -40,22 +40,29 @@ module bytes (wasm-tools validated; wasm-opt optional)
 ## 1. The program's world: no overlays, patches
 
 Inference is Julia's own: the same `InferenceParams`/`OptimizationParams` as juliac
-(`force_enable_inference`), concrete evaluation included (only semi-concrete evaluation is
-off), with its own cache owner. The only target-specific fact is `have_fma = false` (Wasm
-has no fused multiply-add), folded in `abstract_call_known`.
+(`force_enable_inference`), concrete and semi-concrete evaluation included, over Julia's
+own method table, with its own cache owner. The only target-specific fact is
+`have_fma = false` (Wasm has no fused multiply-add), folded in `abstract_call_known`.
 
-There is no overlay method table. Overlays taint effects (`nonoverlayed`), which disables
-concrete evaluation of everything that may reach them (a `typejoin` that builds a vector
-reaching an overlaid `unsafe_copyto!`); and code built on fake native bodies confuses
-effects (an overlay's native fallback made an intrinsic look effect-free, and it was
-deleted). What overlays would do is done instead:
+There is no overlay method table, not even an empty one. Stacking one makes the
+interpreter overlayed, and inference then taints every call it cannot resolve statically
+(`nonoverlayed`), which disables concrete evaluation of everything that may reach one (a
+`typejoin` building a vector; `Base.packedsize`, whose `padding` reflects on field types,
+so `reinterpret(NTuple{4,UInt8}, x)` compiled its reflection instead of folding it). And
+code built on fake native bodies confuses effects (an overlay's native fallback made an
+intrinsic look effect-free, and it was deleted). What overlays would do is done instead:
 
 - **juliac's trim patches** (`src/trim/juliac-*.jl`, from JuliaC.jl): the method
   redefinitions juliac applies in its build process (`invokelatest` as a direct call, no
   logger lookups, trim-friendly `show(::Type)`, raised `max_args`, ...);
 - **the pseudo-runtime's patches** (`src/trim/wasm-*.jl`): Base and Core methods
   redefined for what Wasm has no C runtime for, written over runtime primitives. IO:
-  Core's standard streams write through `Runtime.IO.write_byte` instead of libuv;
+  Core's standard streams write through `Runtime.IO.write_byte` instead of libuv.
+  `Base._reinterpret` of isbits values folds the padding reflection at compile time and
+  calls `Runtime.reinterpret_bits` (which the code generator compiles to a rearrangement of
+  leaves) instead of copying bytes between `Ref`s. Random's bulk generator's vector
+  operations (`llvmcall`s on `NTuple{N,VecElement{UInt64}}`) are the same operations on
+  each element, so its streams are the native ones;
 - **lowering in the code generator** of what Base does with pointers and C calls
   (`memmove`, `memset`, `jl_genericmemory_copyto`, `jl_alloc_genericmemory`, string
   conversions), from the IR (section 5);
@@ -135,7 +142,8 @@ As in JuliaCodegen (and Julia's code generator), a value's representation follow
 Primitives: 8/16/32-bit integers, `Bool`, `Char` (its bits) are `i32`, kept zero-extended
 (masked after arithmetic, sign-extended where signedness matters); 64-bit `i64`; floats
 `f32`/`f64`; 128-bit integers two `i64` leaves (low, high), their arithmetic in the
-runtime; pointers `i64` (virtual, section 5).
+runtime; pointers two leaves, an `i64` virtual address and the object they point into
+(section 5).
 
 **Objects** are `$JlValue` subtypes: `(struct (field $typeid i32) (field $hash (mut i32)) ...)`.
 The type id indexes the closed world's types (for `isa`, `typeof`); the hash is the
@@ -166,18 +174,36 @@ isbits values as their leaves widened to `i64` (never `#undef`); other inline va
 element index. `Array` is then Base's own mutable struct, and Base's array code (growth
 with `_growend!`, `copyto!`, broadcasting, `sort!`, `cat`) compiles from its Julia source.
 
-## 5. Pointers: provenance
+## 5. Pointers: address and owner
 
 Wasm has no addresses. Base takes pointers into memory (`ptr_or_offset`, `pointer(s)`,
-`jl_value_ptr` of a `Ref`) to call C (`memmove`, `memset`, ...) or for alias checks
-(`dataids`). A pointer value is a virtual address: each Memory/String object gets a range
-from its identity hash shifted by 32 bits, plus the element offset, so comparisons and
-differences behave as natively. And a pointer value carries its **origin** through SSA
-values (bitcasts, `add_ptr`/`sub_ptr`): the object, array and element it points to. A C
-call with pointer arguments (`memmove`, `memset`, `jl_genericmemory_copyto`), a load or
-store through a pointer (`pointerref`/`pointerset`) compile from the origins: `array.copy`,
-`array.fill`, `array.get`/`set`. A pointer without a known origin (it crossed a call) is
-an unsupported construct, never a guess.
+`jl_value_ptr` of a `Ref`) to call C (`memmove`, `memset`, ...), for alias checks
+(`dataids`), and to read memory as other types (SHA reads its byte buffer as `UInt32`s,
+Random writes `UInt64`s into a `Vector{UInt8}`). A `Ptr` is two leaves (`pointers.jl`):
+
+- a **virtual address** (`i64`): each object gets a range from its identity hash shifted by
+  32 bits, plus the byte offset, so comparisons and differences behave as natively; integer
+  operations on pointers are operations on their addresses;
+- its **owner**, the object it points into (a Memory, a String, a `Ref`), or null for a
+  pointer made from an integer, which cannot be dereferenced.
+
+Pointer arithmetic moves the address and keeps the owner, and both cross calls with the
+pointer, as any value's leaves do. Memory is addressed by bytes as Julia lays it out, so a
+pointer may reinterpret it.
+
+Within a function, a pointer also carries its **origin** when it is known statically: the
+array of its owner, the byte offset into it, and the type of its elements. A load, store,
+`memmove` or `memset` through pointers with origins compiles to array accesses
+(`array.get`/`set`, `array.copy`, `array.fill`): of whole elements when aligned to them
+(checked at run time, as Julia allows any alignment), else of the bytes of the elements
+holding them. Without an origin (a pointer that crossed a call), the access goes byte by
+byte through two run-time helpers, `jl_ptr_load_byte(address, owner)` and
+`jl_ptr_store_byte(address, owner, byte)`, generated once the module's types are known:
+they find the byte from the owner's type id: of a memory whose elements are stored as
+laid out, of a memory of widened or padded isbits elements (by the leaves of an element),
+of a string, or of the isbits fields of a mutable object. `memmove` and `memset` without
+origins are byte loops in the runtime (`Runtime.ptr_memmove`/`ptr_memset`). An owner whose
+bytes are not addressable (a memory of references) traps.
 
 ## 6. The image: serializing objects
 
@@ -202,7 +228,8 @@ built it.
 - `MemoryRef` constants are (Memory object, array, index); type objects are interned.
 - Global variables are mutable globals (one per leaf of the declared type), initialized
   with their value at compile time.
-- Not serializable (an error naming the object): pointers, tasks, modules, methods.
+- A `Ptr` constant is its address without owner (an address of the build process).
+- Not serializable (an error naming the object): tasks, modules, methods.
 
 ## 7. Functions, calls, intrinsics
 

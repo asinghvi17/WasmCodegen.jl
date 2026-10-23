@@ -1,0 +1,801 @@
+# Pointers. Wasm has no addresses: a `Ptr` is two leaves, a virtual address and the object
+# it points into, its *owner* (a Memory, a String, a Ref), or null for a pointer made from
+# an integer, which cannot be dereferenced. Each owner has a range of virtual addresses,
+# from its identity hash shifted by 32 bits (`push_memory_base!`), so that comparisons and
+# differences of pointers behave as natively; arithmetic changes the address and keeps
+# the owner.
+#
+# A load or store through a pointer is compiled from its origin when it is known
+# statically (it was made in the same function): the array of the owner, the byte offset
+# into it, and the type of its elements. Otherwise it dispatches on the owner's kind at run
+# time (`jl_ptr_load_byte`/`jl_ptr_store_byte`, generated once the module's types are
+# known). The memory is addressed by bytes as Julia lays it out, so a pointer may
+# reinterpret it (`Ptr{UInt64}` into bytes, bytes of `UInt32`s).
+
+is_ptr_type(@nospecialize(T)) = T isa DataType && T.name === Ptr.body.name
+
+"The address of the pointer `p`, as a UInt64."
+ptr_address(p::CGVal) = CGVal(UInt64, Inline, LeafVal[p.leaves[1]], nothing)
+
+"The owner (an object, or null) of the pointer `p`."
+ptr_owner(p::CGVal) = p.leaves[2]
+
+"""
+    new_ptr!(fc, T, owner, origin) -> CGVal
+
+The pointer of type `T` whose address is on the stack, into `owner` (a leaf).
+"""
+function new_ptr!(fc::FnCtx, @nospecialize(T), owner::LeafVal, origin::Union{Nothing,PtrOrigin})
+    a = new_local!(fc, I64)
+    emit!(fc.b, :local_set, a)
+    return CGVal(T, Inline, LeafVal[a, owner], nothing, origin)
+end
+
+## making pointers
+
+"The pointer to the first element of the Memory `mem` (`mem.ptr`)."
+function memory_ptr!(fc::FnCtx, mem::CGVal, @nospecialize(T))
+    E = memory_eltype(mem.typ)
+    owner = materialize!(fc, mem)
+    push_memory_base!(fc, mem)
+    push_memory_array!(fc, mem)
+    arr = new_local!(fc, RefType(memory_array_type!(fc.cgm.types, E), true))
+    emit!(fc.b, :local_set, arr)
+    return new_ptr!(fc, T, owner, PtrOrigin(owner, arr, Inst(:i32_const, 0), E))
+end
+
+"""
+    memoryref_ptr!(fc, r) -> CGVal
+
+The `ptr_or_offset` of the MemoryRef `r`: the index for elements of zero size or unions
+(as natively), else a pointer to the element.
+"""
+function memoryref_ptr!(fc::FnCtx, r::CGVal)
+    E = ref_eltype(r.typ)
+    sz = elem_unit(E)
+    push_leaf!(fc, r.leaves[3])
+    emit!(fc.b, :i64_extend_i32_u)
+    if !(E isa Union || Base.aligned_sizeof(E) == 0)
+        emit!(fc.b, :i64_const, sz)
+        emit!(fc.b, :i64_mul)
+        push_memory_base!(fc, CGVal(memory_type(r.typ), Boxed, LeafVal[r.leaves[1]]))
+        emit!(fc.b, :i64_add)
+    end
+    # the byte offset of the element
+    off = new_local!(fc, I32)
+    push_leaf!(fc, r.leaves[3])
+    sz != 1 && (emit!(fc.b, :i32_const, sz); emit!(fc.b, :i32_mul))
+    emit!(fc.b, :local_set, off)
+    return new_ptr!(fc, Ptr{Cvoid}, r.leaves[1], PtrOrigin(r.leaves[1], r.leaves[2], off, E))
+end
+
+# the bytes of an element of a memory of `E` in pointer offsets: 1 for unions and elements
+# of no size, whose "pointers" are their indices (as natively)
+elem_unit(@nospecialize(E)) = E isa Union || Base.aligned_sizeof(E) == 0 ? 1 : Base.aligned_sizeof(E)
+
+"The pointer to the bytes of the String `s` (`jl_string_ptr`)."
+function string_ptr!(fc::FnCtx, s::CGVal, @nospecialize(T))
+    s = convert_repr(fc, s, String)
+    owner = materialize!(fc, s)
+    push_memory_base!(fc, s)
+    push_val!(fc, s)
+    emit!(fc.b, :struct_get, layout(fc, String).wtype, DATA_FIELD)
+    arr = new_local!(fc, RefType(array_type!(fc.cgm.types, I8), true))
+    emit!(fc.b, :local_set, arr)
+    return new_ptr!(fc, T, owner, PtrOrigin(owner, arr, Inst(:i32_const, 0), UInt8))
+end
+
+"The pointer to the mutable object `x` (`jl_value_ptr`): to its first field."
+function object_ptr!(fc::FnCtx, x::CGVal, @nospecialize(T))
+    lx = layout(fc, x.typ)
+    (lx.kind === Boxed && ismutabletype(x.typ) && !isempty(lx.fields)) ||
+        unsupported("the address of a value of type ", x.typ)
+    owner = materialize!(fc, x)
+    push_memory_base!(fc, x)
+    return new_ptr!(fc, T, owner, PtrOrigin(owner, nothing, nothing, x.typ))
+end
+
+"`p + off` (or `p - off`): the same owner, the address moved."
+function ptr_offset!(fc::FnCtx, p::CGVal, off::CGVal, add::Bool)
+    push_leaf!(fc, p.leaves[1])
+    push_val!(fc, off)
+    prim_wtype(fc, off.typ) === I32 && emit!(fc.b, :i64_extend_i32_s)
+    emit!(fc.b, add ? :i64_add : :i64_sub)
+    o = p.origin
+    if o !== nothing && !is_object_origin(o)
+        b = new_local!(fc, I32)
+        push_leaf!(fc, o.index)
+        push_val!(fc, off)
+        prim_wtype(fc, off.typ) === I64 && emit!(fc.b, :i32_wrap_i64)
+        emit!(fc.b, add ? :i32_add : :i32_sub)
+        emit!(fc.b, :local_set, b)
+        o = PtrOrigin(o.mem, o.array, b, o.eltype)
+    else
+        o = nothing
+    end
+    return new_ptr!(fc, p.typ, ptr_owner(p), o)
+end
+
+"A pointer from an integer: an address without owner."
+function int_ptr!(fc::FnCtx, @nospecialize(T), x::CGVal)
+    push_val!(fc, x)
+    prim_wtype(fc, x.typ) === I32 && emit!(fc.b, :i64_extend_i32_u)
+    return new_ptr!(fc, T, Inst(:ref_null, fc.cgm.types.jlvalue), nothing)
+end
+
+## loads and stores
+
+"""
+    bit_leaves(T) -> Vector{Tuple{Any,Int}}
+
+The leaves of an isbits value of type `T`, in order, as the primitive type each holds and
+its byte offset in the value: 128-bit primitives are two `UInt64` leaves, and a pointer is
+its address and its owner (`:owner`, which has no bytes).
+"""
+function bit_leaves(@nospecialize(T), base::Int=0, out=Tuple{Any,Int}[])
+    if is_ptr_type(T)
+        push!(out, (UInt64, base), (:owner, base))
+    elseif isprimitivetype(T) && sizeof(T) == 16
+        push!(out, (UInt64, base), (UInt64, base + 8))
+    elseif isprimitivetype(T)
+        push!(out, (T, base))
+    else
+        for i in 1:fieldcount(T)
+            FT = fieldtype(T, i)
+            sizeof(FT) == 0 && continue
+            isbitstype(FT) || unsupported("the bytes of a value of type ", T, " with references")
+            bit_leaves(FT, base + Int(fieldoffset(T, i)), out)
+        end
+    end
+    return out
+end
+
+nbytes(@nospecialize(P)) = P === :owner ? 0 : sizeof(P)
+
+# the leaves of an inline value of the isbits type `T`
+function bits_value_leaves(fc::FnCtx, x::CGVal, @nospecialize(T))
+    x = convert_repr(fc, x, T)
+    bl = bit_leaves(T)
+    (x.kind === Inline && length(x.leaves) == length(bl)) ||
+        unsupported("the bytes of a value of type ", T)
+    return zip(bl, x.leaves)
+end
+
+"""
+    emit_reinterpret_bits!(fc, Out, x) -> CGVal
+
+The bytes of the isbits value `x` as a value of the isbits type `Out` of the same size
+(`Runtime.reinterpret_bits`): its leaves made of the bits of the leaves of `x` they
+overlap.
+"""
+function emit_reinterpret_bits!(fc::FnCtx, @nospecialize(Out), x::CGVal, @nospecialize(In))
+    ins = Tuple{Int,Int,Int}[]
+    for ((P, off), leaf) in bits_value_leaves(fc, x, In)
+        P === :owner && continue
+        push!(ins, (off, nbytes(P), leaf_to_bits!(fc, leaf, P)))
+    end
+    leaves = LeafVal[]
+    for (P, off) in bit_leaves(Out)
+        if P === :owner
+            push!(leaves, Inst(:ref_null, fc.cgm.types.jlvalue))
+            continue
+        end
+        n = nbytes(P)
+        acc = new_local!(fc, I64)
+        emit!(fc.b, :i64_const, 0)
+        for (ioff, isz, bits) in ins
+            lo, hi = max(off, ioff), min(off + n, ioff + isz)
+            lo < hi || continue
+            emit!(fc.b, :local_get, bits)
+            lo > ioff && (emit!(fc.b, :i64_const, 8(lo - ioff)); emit!(fc.b, :i64_shr_u))
+            hi - lo < 8 && (emit!(fc.b, :i64_const, (Int64(1) << 8(hi - lo)) - 1); emit!(fc.b, :i64_and))
+            lo > off && (emit!(fc.b, :i64_const, 8(lo - off)); emit!(fc.b, :i64_shl))
+            emit!(fc.b, :i64_or)
+        end
+        emit!(fc.b, :local_set, acc)
+        push!(leaves, bits_to_leaf!(fc, acc, P))
+    end
+    l = layout(fc, Out)
+    (l.kind === Inline && length(l.leaves) == length(leaves)) ||
+        unsupported("reinterpreting as a value of type ", Out)
+    return CGVal(Out, Inline, leaves)
+end
+
+# whether the elements of a memory of `E` are stored as Julia lays them out, so that its
+# array is addressable by bytes: primitives, and inline values of primitives of one size
+# without padding (a uniform array)
+function byte_addressable(ts::Types, @nospecialize(E))
+    isprimitivetype(E) && !is_ptr_type(E) && sizeof(E) <= 8 && return true
+    isbitstype(E) || return false
+    ml = memory_layout(ts, E)
+    return !ml.boxed && !ml.widened && ml.storage isa Union{NumType,PackedType} &&
+           sum(nbytes(P) for (P, _) in bit_leaves(E); init=0) == sizeof(E)
+end
+byte_addressable(fc::FnCtx, @nospecialize(E)) = byte_addressable(fc.cgm.types, E)
+
+# the byte size of the storage of the array elements of the memory of `E`
+function storage_size(fc::FnCtx, @nospecialize(E))
+    st = memory_layout(fc.cgm.types, E).storage
+    return st === I8 ? 1 : st === I16 ? 2 : st === I32 || st === F32 ? 4 : 8
+end
+
+"""
+    ptr_load!(fc, p, i, T) -> CGVal
+
+`unsafe_load(p, i)`: the value of type `T` at the `i`-th element (1-based) from `p`.
+"""
+function ptr_load!(fc::FnCtx, p::CGVal, i::CGVal, @nospecialize(T))
+    o = p.origin
+    if o !== nothing && is_object_origin(o) && isconstant(i) && constant_value(i) == 1 &&
+       fieldcount(o.eltype) >= 1 && fieldtype(o.eltype, 1) === T
+        # the first field of a `Ref`
+        return get_field(fc, CGVal(o.eltype, Boxed, LeafVal[o.mem]), 1)
+    end
+    if o !== nothing && !is_object_origin(o) && T === o.eltype && !byte_addressable(fc, T)
+        # a whole element of a memory whose elements are not stored as bytes
+        return emit_memoryrefget!(fc, element_ref!(fc, o, i, T), const_value(fc, false), T)
+    end
+    isbitstype(T) || unsupported("a load of a ", T, " through a pointer")
+    byte = byte_offset!(fc, p, i, T)
+    leaves = LeafVal[]
+    for (P, off) in bit_leaves(T)
+        if P === :owner
+            # a pointer loaded from memory: an address without owner
+            push!(leaves, Inst(:ref_null, fc.cgm.types.jlvalue))
+            continue
+        end
+        bits = load_bits!(fc, p, byte, off, nbytes(P))
+        push!(leaves, bits_to_leaf!(fc, bits, P))
+    end
+    l = layout(fc, T)
+    (l.kind === Inline && length(l.leaves) == length(leaves)) ||
+        unsupported("a load of a ", T, " through a pointer")
+    return CGVal(T, Inline, leaves)
+end
+
+"""
+    ptr_store!(fc, p, v, i) -> CGVal
+
+`unsafe_store!(p, v, i)`.
+"""
+function ptr_store!(fc::FnCtx, p::CGVal, v::CGVal, i::CGVal)
+    T = v.typ
+    o = p.origin
+    if o !== nothing && !is_object_origin(o) && memory_layout(fc.cgm.types, o.eltype).storage isa RefType
+        # a memory of references: only clearing (storing a null pointer) is meaningful
+        (isconstant(v) && constant_value(v) == C_NULL) ||
+            unsupported("storing a ", v.typ, " through a pointer into a memory of references")
+        ml = memory_layout(fc.cgm.types, o.eltype)
+        push_leaf!(fc, o.array)
+        push_leaf!(fc, o.index)
+        emit!(fc.b, :i32_const, elem_unit(o.eltype)); emit!(fc.b, :i32_div_u)
+        emit!(fc.b, :ref_null, (ml.storage::RefType).heap)
+        emit!(fc.b, :array_set, ml.array)
+        return p
+    end
+    if o !== nothing && !is_object_origin(o) && T === o.eltype && !byte_addressable(fc, T)
+        emit_memoryrefset!(fc, element_ref!(fc, o, i, T), v, const_value(fc, false))
+        return p
+    end
+    isbitstype(T) || unsupported("a store of a ", T, " through a pointer")
+    byte = byte_offset!(fc, p, i, T)
+    for ((P, off), leaf) in bits_value_leaves(fc, v, T)
+        P === :owner && continue
+        bits = leaf_to_bits!(fc, leaf, P)
+        store_bits!(fc, p, byte, off, nbytes(P), bits)
+    end
+    return p
+end
+
+# the MemoryRef of the element at the byte offset of the origin, plus `i - 1` elements
+function element_ref!(fc::FnCtx, o::PtrOrigin, i::CGVal, @nospecialize(T))
+    R = MemoryRef{o.eltype}
+    sz = elem_unit(o.eltype)
+    idx = new_local!(fc, I32)
+    push_leaf!(fc, o.index); emit!(fc.b, :i32_const, sz); emit!(fc.b, :i32_div_u)
+    push_val!(fc, convert_repr(fc, i, Int)); emit!(fc.b, :i32_wrap_i64)
+    emit!(fc.b, :i32_add); emit!(fc.b, :i32_const, 1); emit!(fc.b, :i32_sub)
+    emit!(fc.b, :local_set, idx)
+    mem = something(o.mem, Inst(:ref_null, layout(fc, memory_type(R)).wtype))
+    return CGVal(R, Inline, LeafVal[mem, o.array, idx])
+end
+
+# the byte offset of the `i`-th T from `p`: into its origin's array (an i32), or for a
+# pointer without origin, the address (an i64)
+function byte_offset!(fc::FnCtx, p::CGVal, i::CGVal, @nospecialize(T))
+    o = p.origin
+    # an origin whose elements are not stored as bytes is read through its owner
+    static = o !== nothing && !is_object_origin(o) && byte_addressable(fc, o.eltype)
+    sz = sizeof(T)
+    if static
+        r = new_local!(fc, I32)
+        push_leaf!(fc, o.index)
+        if !(isconstant(i) && constant_value(i) == 1)
+            push_val!(fc, convert_repr(fc, i, Int)); emit!(fc.b, :i32_wrap_i64)
+            emit!(fc.b, :i32_const, 1); emit!(fc.b, :i32_sub)
+            emit!(fc.b, :i32_const, sz); emit!(fc.b, :i32_mul)
+            emit!(fc.b, :i32_add)
+        end
+        emit!(fc.b, :local_set, r)
+        return (:static, r)
+    end
+    r = new_local!(fc, I64)
+    push_leaf!(fc, p.leaves[1])
+    if !(isconstant(i) && constant_value(i) == 1)
+        push_val!(fc, convert_repr(fc, i, Int))
+        emit!(fc.b, :i64_const, 1); emit!(fc.b, :i64_sub)
+        emit!(fc.b, :i64_const, sz); emit!(fc.b, :i64_mul)
+        emit!(fc.b, :i64_add)
+    end
+    emit!(fc.b, :local_set, r)
+    return (:dynamic, r)
+end
+
+# the `n` bytes at `byte + off` (little-endian), as an i64 local
+function load_bits!(fc::FnCtx, p::CGVal, byte, off::Int, n::Int)
+    kind, b = byte
+    acc = new_local!(fc, I64)
+    if kind === :static
+        o = p.origin
+        s = storage_size(fc, o.eltype)
+        if s == n
+            # a whole array element, if aligned to it
+            if s > 1
+                push_misaligned!(fc, b, off, s)
+                if!(fc.b)
+                load_static_bytes!(fc, o, b, off, n, s, acc)
+                else!(fc.b)
+            end
+            push_array_elem_bits!(fc, o, b, off, s)
+            emit!(fc.b, :local_set, acc)
+            s > 1 && end!(fc.b)
+        else
+            load_static_bytes!(fc, o, b, off, n, s, acc)
+        end
+        return acc
+    end
+    # through the owner, at run time, byte by byte
+    emit!(fc.b, :i64_const, 0); emit!(fc.b, :local_set, acc)
+    loadb = ptr_byte_helper!(fc.cgm, :load)
+    for j in 0:n-1
+        emit!(fc.b, :local_get, b); emit!(fc.b, :i64_const, off + j); emit!(fc.b, :i64_add)
+        push_leaf!(fc, ptr_owner(p))
+        call!(fc.b, loadb)
+        emit!(fc.b, :i64_extend_i32_u)
+        if j > 0
+            emit!(fc.b, :i64_const, 8j); emit!(fc.b, :i64_shl)
+        end
+        emit!(fc.b, :local_get, acc); emit!(fc.b, :i64_or); emit!(fc.b, :local_set, acc)
+    end
+    return acc
+end
+
+# push whether the byte offset `b + off` is not a multiple of `s` (an i32)
+function push_misaligned!(fc::FnCtx, b::Int, off::Int, s::Int)
+    emit!(fc.b, :local_get, b)
+    off != 0 && (emit!(fc.b, :i32_const, off); emit!(fc.b, :i32_add))
+    emit!(fc.b, :i32_const, s - 1); emit!(fc.b, :i32_and)
+end
+
+# load the `n` bytes at `b + off` from the array elements of `s` bytes holding them, into
+# the i64 local `acc`
+function load_static_bytes!(fc::FnCtx, o::PtrOrigin, b::Int, off::Int, n::Int, s::Int, acc::Int)
+    emit!(fc.b, :i64_const, 0); emit!(fc.b, :local_set, acc)
+    for j in 0:n-1
+        # the byte at b + off + j: of the element (b+off+j) ÷ s, shifted
+        push_array_elem_bits!(fc, o, b, off + j, s)
+        emit!(fc.b, :local_get, b); emit!(fc.b, :i32_const, off + j); emit!(fc.b, :i32_add)
+        emit!(fc.b, :i32_const, s); emit!(fc.b, :i32_rem_u)
+        emit!(fc.b, :i32_const, 8); emit!(fc.b, :i32_mul)
+        emit!(fc.b, :i64_extend_i32_u)
+        emit!(fc.b, :i64_shr_u)
+        emit!(fc.b, :i64_const, 0xff); emit!(fc.b, :i64_and)
+        if j > 0
+            emit!(fc.b, :i64_const, 8j); emit!(fc.b, :i64_shl)
+        end
+        emit!(fc.b, :local_get, acc); emit!(fc.b, :i64_or); emit!(fc.b, :local_set, acc)
+    end
+end
+
+# store the `n` low bytes of the i64 local `bits` at `byte + off`
+function store_bits!(fc::FnCtx, p::CGVal, byte, off::Int, n::Int, bits::Int)
+    kind, b = byte
+    if kind === :static
+        o = p.origin
+        s = storage_size(fc, o.eltype)
+        if s == n
+            # a whole array element, if aligned to it
+            if s > 1
+                push_misaligned!(fc, b, off, s)
+                if!(fc.b)
+                store_static_bytes!(fc, o, b, off, n, s, bits)
+                else!(fc.b)
+            end
+            set_array_elem_bits!(fc, o, b, off, s, bits)
+            s > 1 && end!(fc.b)
+        else
+            store_static_bytes!(fc, o, b, off, n, s, bits)
+        end
+        return
+    end
+    storeb = ptr_byte_helper!(fc.cgm, :store)
+    for j in 0:n-1
+        emit!(fc.b, :local_get, b); emit!(fc.b, :i64_const, off + j); emit!(fc.b, :i64_add)
+        push_leaf!(fc, ptr_owner(p))
+        emit!(fc.b, :local_get, bits)
+        j > 0 && (emit!(fc.b, :i64_const, 8j); emit!(fc.b, :i64_shr_u))
+        emit!(fc.b, :i32_wrap_i64)
+        call!(fc.b, storeb)
+    end
+end
+
+# store the `n` low bytes of the i64 local `bits` at `b + off` into the array elements of
+# `s` bytes holding them
+function store_static_bytes!(fc::FnCtx, o::PtrOrigin, b::Int, off::Int, n::Int, s::Int, bits::Int)
+    if s == 1
+        for j in 0:n-1
+            part = new_local!(fc, I64)
+            emit!(fc.b, :local_get, bits)
+            j > 0 && (emit!(fc.b, :i64_const, 8j); emit!(fc.b, :i64_shr_u))
+            emit!(fc.b, :local_set, part)
+            set_array_elem_bits!(fc, o, b, off + j, 1, part)
+        end
+        return
+    end
+    for j in 0:n-1
+        # read-modify-write the element holding the byte
+        cur = new_local!(fc, I64)
+        push_array_elem_bits!(fc, o, b, off + j, s)
+        emit!(fc.b, :local_set, cur)
+        sh = new_local!(fc, I64)
+        emit!(fc.b, :local_get, b); emit!(fc.b, :i32_const, off + j); emit!(fc.b, :i32_add)
+        emit!(fc.b, :i32_const, s); emit!(fc.b, :i32_rem_u)
+        emit!(fc.b, :i32_const, 8); emit!(fc.b, :i32_mul)
+        emit!(fc.b, :i64_extend_i32_u); emit!(fc.b, :local_set, sh)
+        emit!(fc.b, :local_get, cur)
+        emit!(fc.b, :i64_const, 0xff); emit!(fc.b, :local_get, sh); emit!(fc.b, :i64_shl)
+        emit!(fc.b, :i64_const, -1); emit!(fc.b, :i64_xor); emit!(fc.b, :i64_and)
+        emit!(fc.b, :local_get, bits)
+        j > 0 && (emit!(fc.b, :i64_const, 8j); emit!(fc.b, :i64_shr_u))
+        emit!(fc.b, :i64_const, 0xff); emit!(fc.b, :i64_and)
+        emit!(fc.b, :local_get, sh); emit!(fc.b, :i64_shl)
+        emit!(fc.b, :i64_or)
+        emit!(fc.b, :local_set, cur)
+        set_array_elem_bits!(fc, o, b, off + j, s, cur)
+    end
+end
+
+# push the array and index of the array element of `s` bytes holding the byte `b + off`
+function push_elem_address!(fc::FnCtx, o::PtrOrigin, b::Int, off::Int, s::Int)
+    push_leaf!(fc, o.array)
+    emit!(fc.b, :local_get, b)
+    off != 0 && (emit!(fc.b, :i32_const, off); emit!(fc.b, :i32_add))
+    emit!(fc.b, :i32_const, s); emit!(fc.b, :i32_div_u)
+end
+
+# push the bits of an array element, zero-extended to i64
+function push_array_elem_bits!(fc::FnCtx, o::PtrOrigin, b::Int, off::Int, s::Int)
+    ml = memory_layout(fc.cgm.types, o.eltype)
+    push_elem_address!(fc, o, b, off, s)
+    st = ml.storage
+    emit!(fc.b, st isa PackedType ? :array_get_u : :array_get, ml.array)
+    st === F64 && emit!(fc.b, :i64_reinterpret_f64)
+    st === F32 && emit!(fc.b, :i32_reinterpret_f32)
+    (st === I32 || st === F32 || st isa PackedType) && emit!(fc.b, :i64_extend_i32_u)
+end
+
+# set an array element from the bits of the i64 local `bits`
+function set_array_elem_bits!(fc::FnCtx, o::PtrOrigin, b::Int, off::Int, s::Int, bits::Int)
+    ml = memory_layout(fc.cgm.types, o.eltype)
+    push_elem_address!(fc, o, b, off, s)
+    emit!(fc.b, :local_get, bits)
+    st = ml.storage
+    (st === I32 || st === F32 || st isa PackedType) && emit!(fc.b, :i32_wrap_i64)
+    st === F64 && emit!(fc.b, :f64_reinterpret_i64)
+    st === F32 && emit!(fc.b, :f32_reinterpret_i32)
+    emit!(fc.b, :array_set, ml.array)
+end
+
+# a primitive leaf of type P from the bits in the i64 local `bits`
+function bits_to_leaf!(fc::FnCtx, bits::Int, @nospecialize(P))
+    t = prim_wtype(fc, P)
+    emit!(fc.b, :local_get, bits)
+    if t === I32 || t === F32
+        emit!(fc.b, :i32_wrap_i64)
+        t === F32 && emit!(fc.b, :f32_reinterpret_i32)
+    elseif t === F64
+        emit!(fc.b, :f64_reinterpret_i64)
+    end
+    r = new_local!(fc, t)
+    emit!(fc.b, :local_set, r)
+    return r
+end
+
+# the bits of a primitive leaf of type P, in an i64 local
+function leaf_to_bits!(fc::FnCtx, leaf::LeafVal, @nospecialize(P))
+    t = prim_wtype(fc, P)
+    push_leaf!(fc, leaf)
+    t === F64 && emit!(fc.b, :i64_reinterpret_f64)
+    t === F32 && emit!(fc.b, :i32_reinterpret_f32)
+    (t === I32 || t === F32) && emit!(fc.b, :i64_extend_i32_u)
+    r = new_local!(fc, I64)
+    emit!(fc.b, :local_set, r)
+    return r
+end
+
+## the run-time helpers
+
+"""
+    ptr_byte_helper!(cgm, kind) -> Func
+
+`jl_ptr_load_byte(address, owner) -> i32` or `jl_ptr_store_byte(address, owner, byte)`:
+a byte of the memory a pointer without a static origin points into, found from its
+owner's kind at run time. Their bodies are generated with the module's types
+(`finish_pointers!`).
+"""
+function ptr_byte_helper!(cgm::CGModule, kind::Symbol)
+    get!(cgm.helpers, (:ptr, kind)) do
+        jl = jlvalue_ref(cgm.types)
+        kind === :load ?
+            add_func!(cgm.mod, "jl_ptr_load_byte", ValType[I64, jl], ValType[I32]) :
+            add_func!(cgm.mod, "jl_ptr_store_byte", ValType[I64, jl, I32], ValType[])
+    end
+end
+
+# the owners whose bytes are addressable, by the Wasm types of their objects (object struct
+# type, array type, element storage) => their type ids: memories whose elements are stored
+# as Julia lays them out, strings and symbols
+function byte_owners(cgm::CGModule)
+    ts = cgm.types
+    owners = Dict{Tuple{TypeRef,TypeRef,StorageType},Vector{Int32}}()
+    for (id, T) in enumerate(copy(ts.typelist))
+        if T === String || T === Symbol
+            key = (bytes_object_type!(ts, T), array_type!(ts, I8), I8)
+        elseif is_memory_type(T) && byte_addressable(ts, memory_eltype(T))
+            ml = memory_layout(ts, memory_eltype(T))
+            key = (memory_struct_type!(ts, memory_eltype(T)), ml.array, ml.storage)
+        else
+            continue
+        end
+        push!(get!(Vector{Int32}, owners, key), Int32(id))
+    end
+    return owners
+end
+
+# the mutable objects whose bytes are addressable (a `Ref` a pointer was taken to), by
+# type id: their Wasm struct type and the leaves of their isbits fields, as (Wasm field
+# index, storage, byte offset, byte size)
+function object_owners(cgm::CGModule)
+    ts = cgm.types
+    owners = Tuple{Int32,TypeRef,Vector{Tuple{Int,StorageType,Int,Int}}}[]
+    for (id, T) in enumerate(copy(ts.typelist))
+        (T isa DataType && isconcretetype(T) && ismutabletype(T) && !is_memory_type(T) &&
+         !(T <: Task) && !any(R -> T === R, RUNTIME_TYPES)) || continue
+        l = layout(ts, T)
+        l.kind === Boxed || continue
+        fields = (typedef(cgm.mod, l.wtype).comp::StructType).fields
+        leaves = Tuple{Int,StorageType,Int,Int}[]
+        for i in 1:fieldcount(T)
+            FT = fieldtype(T, i)
+            isbitstype(FT) && sizeof(FT) > 0 || continue
+            for ((P, off), w) in zip(bit_leaves(FT, Int(fieldoffset(T, i))), l.fields[i])
+                P === :owner && continue
+                push!(leaves, (w - 1, fields[w].storage, off, nbytes(P)))
+            end
+        end
+        isempty(leaves) || push!(owners, (Int32(id), l.wtype, leaves))
+    end
+    return owners
+end
+
+# the memories of isbits elements not stored as bytes (widened, padded), by type id: their
+# Wasm struct and array types, element storage, element size and stride, and the leaves of
+# an element as (index among its array elements, byte offset, byte size)
+function leaf_memory_owners(cgm::CGModule)
+    ts = cgm.types
+    owners = Tuple{Int32,TypeRef,TypeRef,StorageType,Int,Int,Vector{Tuple{Int,Int,Int}}}[]
+    for (id, T) in enumerate(copy(ts.typelist))
+        is_memory_type(T) || continue
+        E = memory_eltype(T)
+        (isbitstype(E) && sizeof(E) > 0 && !byte_addressable(ts, E)) || continue
+        ml = memory_layout(ts, E)
+        (ml.boxed || !(ml.storage isa Union{NumType,PackedType})) && continue
+        leaves = Tuple{Int,Int,Int}[]
+        for (j, (P, off)) in enumerate(bit_leaves(E))
+            P === :owner || push!(leaves, (j - 1, off, nbytes(P)))
+        end
+        push!(owners, (Int32(id), memory_struct_type!(ts, E), ml.array, ml.storage,
+                       Base.aligned_sizeof(E), ml.stride, leaves))
+    end
+    return owners
+end
+
+storage_bytes(st::StorageType) = st === I8 ? 1 : st === I16 ? 2 : st === I32 || st === F32 ? 4 : 8
+
+# convert the value of storage `st` on the stack (as read) to its bits as an i64, or back
+function storage_to_bits!(b::Builder, st::StorageType)
+    st === F64 && emit!(b, :i64_reinterpret_f64)
+    st === F32 && emit!(b, :i32_reinterpret_f32)
+    (st === I32 || st === F32 || st isa PackedType) && emit!(b, :i64_extend_i32_u)
+end
+function bits_to_storage!(b::Builder, st::StorageType)
+    (st === I32 || st === F32 || st isa PackedType) && emit!(b, :i32_wrap_i64)
+    st === F64 && emit!(b, :f64_reinterpret_i64)
+    st === F32 && emit!(b, :f32_reinterpret_i32)
+end
+
+# with the bits of a value of `n` bytes on the stack (an i64) and the byte offset `boff`
+# into it (an i64 local): the bits with that byte replaced by the byte in local 2
+function replace_byte!(b::Builder, boff::Int)
+    emit!(b, :i64_const, 0xff); emit!(b, :local_get, boff); emit!(b, :i64_const, 8); emit!(b, :i64_mul)
+    emit!(b, :i64_shl)
+    emit!(b, :i64_const, -1); emit!(b, :i64_xor); emit!(b, :i64_and)
+    emit!(b, :local_get, 2); emit!(b, :i64_extend_i32_u)
+    emit!(b, :i64_const, 0xff); emit!(b, :i64_and)
+    emit!(b, :local_get, boff); emit!(b, :i64_const, 8); emit!(b, :i64_mul)
+    emit!(b, :i64_shl)
+    emit!(b, :i64_or)
+end
+
+# the byte at offset `off` of a mutable object of struct type `st` (local 1), among its
+# isbits leaves; a padding byte reads as zero
+function object_byte_access!(b::Builder, f::Func, kind::Symbol, off::Int, boff::Int,
+                             st::TypeRef, leaves, objs::Dict{TypeRef,Int})
+    obj = get!(() -> add_local!(f, RefType(st, true)), objs, st)
+    emit!(b, :local_get, 1); emit!(b, :ref_cast, st); emit!(b, :local_set, obj)
+    for (w, stg, loff, n) in leaves
+        # the byte offset into the leaf, if within it
+        emit!(b, :local_get, off); emit!(b, :i64_const, loff); emit!(b, :i64_sub)
+        emit!(b, :local_set, boff)
+        emit!(b, :local_get, boff); emit!(b, :i64_const, n); emit!(b, :i64_lt_u)
+        if!(b)
+        if kind === :load
+            emit!(b, :local_get, obj)
+            emit!(b, stg isa PackedType ? :struct_get_u : :struct_get, st, w)
+            storage_to_bits!(b, stg)
+            emit!(b, :local_get, boff); emit!(b, :i64_const, 8); emit!(b, :i64_mul)
+            emit!(b, :i64_shr_u)
+            emit!(b, :i32_wrap_i64); emit!(b, :i32_const, 0xff); emit!(b, :i32_and)
+        else
+            emit!(b, :local_get, obj)
+            emit!(b, :local_get, obj)
+            emit!(b, stg isa PackedType ? :struct_get_u : :struct_get, st, w)
+            storage_to_bits!(b, stg)
+            replace_byte!(b, boff)
+            bits_to_storage!(b, stg)
+            emit!(b, :struct_set, st, w)
+        end
+        return!(b)
+        end!(b)
+    end
+    kind === :load && emit!(b, :i32_const, 0)
+    return!(b)
+end
+
+# push the index of the array element (in the local `a`) holding the byte at offset `off`
+function push_byte_elem!(b::Builder, a::Int, off::Int, s::Int)
+    emit!(b, :local_get, a)
+    emit!(b, :local_get, off)
+    s != 1 && (emit!(b, :i64_const, s); emit!(b, :i64_div_u))
+    emit!(b, :i32_wrap_i64)
+end
+
+# push the shift of the byte at offset `off` in its element (an i64)
+function push_byte_shift!(b::Builder, off::Int, s::Int)
+    emit!(b, :local_get, off)
+    emit!(b, :i64_const, s); emit!(b, :i64_rem_u)
+    emit!(b, :i64_const, 8); emit!(b, :i64_mul)
+end
+
+# push the bits of the array element on the stack (array, index), as an i64
+function get_elem_bits!(b::Builder, at::TypeRef, st::StorageType)
+    emit!(b, st isa PackedType ? :array_get_u : :array_get, at)
+    storage_to_bits!(b, st)
+end
+
+function finish_pointers!(cgm::CGModule)
+    owners = objects = leafmems = nothing
+    for kind in (:load, :store)
+        f = get(cgm.helpers, (:ptr, kind), nothing)
+        f === nothing && continue
+        if owners === nothing
+            owners, objects, leafmems = byte_owners(cgm), object_owners(cgm), leaf_memory_owners(cgm)
+        end
+        b = Builder(cgm.mod, f)
+        off = add_local!(f, I64)
+        tid = add_local!(f, I32)
+        boff = add_local!(f, I64)
+        arrays = Dict{TypeRef,Int}()
+        # a pointer without owner cannot be dereferenced
+        emit!(b, :local_get, 1); emit!(b, :ref_is_null)
+        if!(b); unreachable!(b); end!(b)
+        # the offset into the owner: the address minus its base
+        emit!(b, :local_get, 0)
+        emit!(b, :local_get, 1)
+        call!(b, object_hash_func!(cgm))
+        emit!(b, :i64_extend_i32_u); emit!(b, :i64_const, 32); emit!(b, :i64_shl)
+        emit!(b, :i64_sub)
+        emit!(b, :local_set, off)
+        emit!(b, :local_get, 1); emit!(b, :struct_get, cgm.types.jlvalue, 0)
+        emit!(b, :local_set, tid)
+        for ((st, at, stg), ids) in owners
+            s = storage_bytes(stg)
+            a = get!(() -> add_local!(f, RefType(at, true)), arrays, at)
+            for (k, id) in enumerate(ids)
+                emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+                k > 1 && emit!(b, :i32_or)
+            end
+            if!(b)
+            emit!(b, :local_get, 1); emit!(b, :ref_cast, st)
+            emit!(b, :struct_get, st, DATA_FIELD)
+            emit!(b, :local_set, a)
+            if kind === :load
+                push_byte_elem!(b, a, off, s)
+                get_elem_bits!(b, at, stg)
+                push_byte_shift!(b, off, s); emit!(b, :i64_shr_u)
+                emit!(b, :i32_wrap_i64); emit!(b, :i32_const, 0xff); emit!(b, :i32_and)
+            else
+                push_byte_elem!(b, a, off, s)
+                push_byte_elem!(b, a, off, s)
+                get_elem_bits!(b, at, stg)
+                emit!(b, :local_get, off); emit!(b, :i64_const, s); emit!(b, :i64_rem_u)
+                emit!(b, :local_set, boff)
+                replace_byte!(b, boff)
+                bits_to_storage!(b, stg)
+                emit!(b, :array_set, at)
+            end
+            return!(b)
+            end!(b)
+        end
+        idx = add_local!(f, I64)
+        for (id, st, at, stg, esz, stride, leaves) in leafmems
+            a = get!(() -> add_local!(f, RefType(at, true)), arrays, at)
+            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+            if!(b)
+            emit!(b, :local_get, 1); emit!(b, :ref_cast, st)
+            emit!(b, :struct_get, st, DATA_FIELD)
+            emit!(b, :local_set, a)
+            # the first array element of the element at the offset
+            emit!(b, :local_get, off); emit!(b, :i64_const, esz); emit!(b, :i64_div_u)
+            emit!(b, :i64_const, stride); emit!(b, :i64_mul)
+            emit!(b, :local_set, idx)
+            for (j, loff, n) in leaves
+                emit!(b, :local_get, off); emit!(b, :i64_const, esz); emit!(b, :i64_rem_u)
+                emit!(b, :i64_const, loff); emit!(b, :i64_sub)
+                emit!(b, :local_set, boff)
+                emit!(b, :local_get, boff); emit!(b, :i64_const, n); emit!(b, :i64_lt_u)
+                if!(b)
+                push_elem() = (emit!(b, :local_get, a); emit!(b, :local_get, idx);
+                               emit!(b, :i64_const, j); emit!(b, :i64_add); emit!(b, :i32_wrap_i64))
+                if kind === :load
+                    push_elem(); get_elem_bits!(b, at, stg)
+                    emit!(b, :local_get, boff); emit!(b, :i64_const, 8); emit!(b, :i64_mul)
+                    emit!(b, :i64_shr_u)
+                    emit!(b, :i32_wrap_i64); emit!(b, :i32_const, 0xff); emit!(b, :i32_and)
+                else
+                    push_elem(); push_elem(); get_elem_bits!(b, at, stg)
+                    replace_byte!(b, boff)
+                    bits_to_storage!(b, stg)
+                    emit!(b, :array_set, at)
+                end
+                return!(b)
+                end!(b)
+            end
+            # padding
+            kind === :load && emit!(b, :i32_const, 0)
+            return!(b)
+            end!(b)
+        end
+        objs = Dict{TypeRef,Int}()
+        for (id, st, leaves) in objects
+            emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+            if!(b)
+            object_byte_access!(b, f, kind, off, boff, st, leaves, objs)
+            end!(b)
+        end
+        # an owner whose bytes are not addressable (a Ref, a memory of references or of
+        # elements stored otherwise than as Julia lays them out)
+        unreachable!(b)
+        finish!(b)
+    end
+end

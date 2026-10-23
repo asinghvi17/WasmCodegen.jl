@@ -11,7 +11,6 @@ source, in the order they were collected, and the entry points.
 """
 struct ClosedWorld
     world::UInt
-    method_table::Core.MethodTable
     entries::Vector{Core.MethodInstance}
     order::Vector{Core.MethodInstance}
     sources::IdDict{Core.MethodInstance,Tuple{Core.CodeInstance,Core.CodeInfo}}
@@ -25,9 +24,9 @@ end
 The method instance a call of `f` with arguments of types `argtypes` dispatches to.
 """
 function entry_instance(@nospecialize(f), @nospecialize(argtypes::Tuple);
-                        world::UInt=Base.get_world_counter(), method_table=WASM_MT)
+                        world::UInt=Base.get_world_counter())
     tt = Tuple{Core.Typeof(f),argtypes...}
-    matches = CC.findall(tt, StackedMethodTable(world, method_table); limit=1)
+    matches = CC.findall(tt, CC.InternalMethodTable(world); limit=1)
     (matches === nothing || length(matches) != 1) &&
         error("no unique method for $tt")
     match = CC.getindex(matches, 1)::Core.MethodMatch
@@ -47,9 +46,8 @@ inferred too, to a fixpoint. With `verify` (`:error`, `:warn` or `:off`), the re
 checked with juliac's trim verifier, which reports dynamic dispatch.
 """
 function collect_world(entries::Vector{Core.MethodInstance};
-                       world::UInt=Base.get_world_counter(), verify::Symbol=:warn,
-                       method_table=WASM_MT)
-    w = ClosedWorld(world, method_table, entries, Core.MethodInstance[],
+                       world::UInt=Base.get_world_counter(), verify::Symbol=:warn)
+    w = ClosedWorld(world, entries, Core.MethodInstance[],
                     IdDict{Core.MethodInstance,Tuple{Core.CodeInstance,Core.CodeInfo}}(),
                     Ref(""))
     verify === :off || (w.trim_report[] = trim_check(entries; world, onlywarn=verify === :warn))
@@ -100,7 +98,7 @@ Add the method instances `mis` and everything they call to the closed world `w` 
 code generator asks for the functions of its runtime this way).
 """
 function extend_world!(w::ClosedWorld, mis::Vector{Core.MethodInstance})
-    interp = WasmInterpreter(; world=w.world, method_table=w.method_table)
+    interp = WasmInterpreter(; world=w.world)
     codeinfos = Any[]
     wq = CC.CompilationQueue(; interp)
     ilq = CC.CompilationQueue(; interp)

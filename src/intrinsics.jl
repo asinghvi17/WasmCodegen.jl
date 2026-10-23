@@ -72,6 +72,14 @@ const FLOAT_UNOPS = Dict(II.neg_float => "neg", II.neg_float_fast => "neg",
                          II.ceil_llvm => "ceil", II.trunc_llvm => "trunc",
                          II.rint_llvm => "nearest")
 
+# intrinsics on pointers themselves (others act on their addresses)
+const PTR_INTRINSICS = Any[II.add_ptr, II.sub_ptr, II.bitcast, II.pointerref, II.pointerset,
+                           II.atomic_pointerref, II.atomic_pointerset]
+# loads and stores through pointers: never evaluated at compile time (a constant pointer is
+# an address of the build process), and of any isbits type (see pointers.jl)
+const NO_FOLD = Any[II.have_fma, II.pointerref, II.pointerset, II.atomic_pointerref,
+                    II.atomic_pointerset]
+
 """
     emit_intrinsic!(fc, f, args, typ) -> CGVal
 
@@ -79,14 +87,20 @@ Emit the intrinsic `f` on the values `args`, of result type `typ`.
 """
 function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}, @nospecialize(typ))
     args = CGVal[a for a in args]
-    if all(isconstant, args) && f !== II.have_fma
+    if !(f in PTR_INTRINSICS) && (any(a -> is_ptr_type(a.typ), args) || is_ptr_type(typ))
+        # integer operations on pointers: of their addresses
+        r = emit_intrinsic!(fc, f, Any[is_ptr_type(a.typ) ? ptr_address(a) : a for a in args],
+                            is_ptr_type(typ) ? UInt64 : typ)
+        return is_ptr_type(typ) ? int_ptr!(fc, typ, r) : r
+    end
+    if all(isconstant, args) && !(f in NO_FOLD)
         # fold (as inference would have, had it known)
         try
             return const_value(fc, f(map(constant_value, args)...))
         catch
         end
     end
-    if any(a -> is128(a.typ), args) || (typ isa Type && is128(typ) && f !== II.bitcast)
+    if !(f in NO_FOLD) && (any(a -> is128(a.typ), args) || (typ isa Type && is128(typ) && f !== II.bitcast))
         r = emit_intrinsic128!(fc, f, args, typ)
         r === nothing || return r
     end
@@ -252,33 +266,19 @@ function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}
                  II.checked_urem_int)
         return emit_checked_div!(fc, f, args[1], args[2])
     elseif f === II.add_ptr || f === II.sub_ptr
-        a, b = args
-        push_val!(fc, a); push_val!(fc, b)
-        emit!(fc.b, f === II.add_ptr ? :i64_add : :i64_sub)
-        r = pop_val!(fc, a.typ)
-        a.origin === nothing && return r
-        # the origin moves by the offset, in elements
-        o = a.origin
-        sz = Base.aligned_sizeof(o.eltype)
-        idx = new_local!(fc, I32)
-        push_leaf!(fc, o.index)
-        push_val!(fc, b)
-        prim_wtype(fc, b.typ) === I64 && emit!(fc.b, :i32_wrap_i64)
-        emit!(fc.b, :i32_const, sz)
-        emit!(fc.b, :i32_div_s)
-        emit!(fc.b, f === II.add_ptr ? :i32_add : :i32_sub)
-        emit!(fc.b, :local_set, idx)
-        return with_origin(r, PtrOrigin(o.mem, o.array, idx, o.eltype))
+        return ptr_offset!(fc, args[1], args[2], f === II.add_ptr)
     elseif f === II.have_fma
         return const_value(fc, false)
     elseif f === II.atomic_fence
         return ghost(Nothing, nothing)
     elseif f === II.pointerref || f === II.atomic_pointerref
-        return emit_pointerref!(fc, args[1], f === II.pointerref ? args[2] : const_value(fc, 1), typ)
+        p = args[1]
+        return ptr_load!(fc, p, f === II.pointerref ? args[2] : const_value(fc, 1), eltype(p.typ))
     elseif f === II.atomic_pointerset || f === II.pointerset
-        # a store through a pointer into a Memory: Base clears references with it
-        # (`_unsetindex!`)
-        return emit_pointerset!(fc, args[1], args[2])
+        p = args[1]
+        T = eltype(p.typ)
+        v = T === Cvoid || !isconcretetype(T) ? args[2] : convert_repr(fc, args[2], T)
+        return ptr_store!(fc, p, v, f === II.pointerset ? args[3] : const_value(fc, 1))
     end
     unsupported("the intrinsic ", f)
 end
@@ -335,6 +335,14 @@ end
 
 function emit_bitcast!(fc::FnCtx, @nospecialize(R), x::CGVal)
     S = x.typ
+    if is_ptr_type(R) && is_ptr_type(S)
+        return CGVal(R, Inline, x.leaves, nothing, x.origin)
+    elseif is_ptr_type(R)
+        return int_ptr!(fc, R, x)
+    elseif is_ptr_type(S)
+        x = ptr_address(x)
+        S = UInt64
+    end
     sizeof(R) == sizeof(S) || unsupported("bitcast from ", S, " to ", R)
     lr, ls = layout(fc, R), layout(fc, S)
     tr, ts = lr.leaves[1].type, ls.leaves[1].type
@@ -439,20 +447,22 @@ function emit_checked!(fc::FnCtx, f, a::CGVal, b::CGVal)
         elseif op == "sub"
             push_val!(fc, a); push_val!(fc, b); emit!(fc.b, :i64_lt_u)
         else
-            # a != 0 && (r / a != b || (signed && a == -1 && b == typemin))
+            # a == 0: no overflow; signed a == -1: overflow iff b == typemin (where r / a
+            # would trap); else overflow iff r / a != b
             push_val!(fc, a); emit!(fc.b, :i64_eqz)
             if!(fc.b, I32)
             emit!(fc.b, :i32_const, 0)
             else!(fc.b)
+            if signed
+                push_val!(fc, a); emit!(fc.b, :i64_const, -1); emit!(fc.b, :i64_eq)
+                if!(fc.b, I32)
+                push_val!(fc, b); emit!(fc.b, :i64_const, typemin(Int64)); emit!(fc.b, :i64_eq)
+                else!(fc.b)
+            end
             emit!(fc.b, :local_get, r); push_val!(fc, a)
             emit!(fc.b, signed ? :i64_div_s : :i64_div_u)
             push_val!(fc, b); emit!(fc.b, :i64_ne)
-            if signed
-                push_val!(fc, a); emit!(fc.b, :i64_const, -1); emit!(fc.b, :i64_eq)
-                push_val!(fc, b); emit!(fc.b, :i64_const, typemin(Int64)); emit!(fc.b, :i64_eq)
-                emit!(fc.b, :i32_and)
-                emit!(fc.b, :i32_or)
-            end
+            signed && end!(fc.b)
             end!(fc.b)
         end
         emit!(fc.b, :local_set, ovf)
@@ -499,47 +509,3 @@ function emit_checked_div!(fc::FnCtx, f, a::CGVal, b::CGVal)
     return pop_val!(fc, T)
 end
 
-"""
-    emit_pointerset!(fc, p, v) -> CGVal
-
-A store of `v` through the pointer `p` (with an origin): clearing a reference element
-(storing a null pointer into a memory of references), or storing an element.
-"""
-function emit_pointerset!(fc::FnCtx, p::CGVal, v::CGVal)
-    o = origin_of(fc, p, "a store")
-    ml = memory_layout(fc.cgm.types, o.eltype)
-    if ml.storage isa RefType
-        (isconstant(v) && constant_value(v) == C_NULL) ||
-            unsupported("storing a ", v.typ, " through a pointer into a memory of references")
-        push_leaf!(fc, o.array)
-        push_leaf!(fc, o.index)
-        ml.stride != 1 && (emit!(fc.b, :i32_const, ml.stride); emit!(fc.b, :i32_mul))
-        emit!(fc.b, :ref_null, (ml.storage::RefType).heap)
-        emit!(fc.b, :array_set, ml.array)
-        return p
-    end
-    unsupported("storing through a pointer into a memory of ", o.eltype)
-end
-
-"""
-    emit_pointerref!(fc, p, i, typ) -> CGVal
-
-A load through the pointer `p` (with an origin), of the element `i` (1-based) from it: an
-element of a memory, or the field of a `Ref`.
-"""
-function emit_pointerref!(fc::FnCtx, p::CGVal, i::CGVal, @nospecialize(typ))
-    o = origin_of(fc, p, "a load")
-    if is_object_origin(o)
-        (isconstant(i) && constant_value(i) == 1) || unsupported("a load at an offset from a Ref")
-        return get_field(fc, CGVal(o.eltype, Boxed, LeafVal[o.mem]), 1)
-    end
-    R = memoryref_type(o)
-    ref = CGVal(R, Inline, LeafVal[something(o.mem, Inst(:ref_null, layout(fc, R).leaves[1].type.heap)), o.array, o.index])
-    if !(isconstant(i) && constant_value(i) == 1)
-        ref = emit_memoryrefnew!(fc, Any[ref, i, const_value(fc, false)])
-    end
-    return emit_memoryrefget!(fc, ref, const_value(fc, false), typ)
-end
-
-"The MemoryRef type of the elements a memory origin points to."
-memoryref_type(o::PtrOrigin) = MemoryRef{o.eltype}

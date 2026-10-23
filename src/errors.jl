@@ -37,7 +37,8 @@ function Base.showerror(io::IO, e::UnsupportedConstructs)
     counts = Dict{String,Int}()
     order = String[]
     for (mi, err) in e.errors
-        msg = string("WasmCodegen: unsupported: ", err.parts..., "\n    in ", mi)
+        msg = string("WasmCodegen: unsupported: ", err.parts...,
+                     join(("\n    in " * string(c) for c in err.context[1:end-1]), ""), "\n    in ", mi)
         haskey(counts, msg) || push!(order, msg)
         counts[msg] = get(counts, msg, 0) + 1
     end

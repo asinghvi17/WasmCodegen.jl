@@ -51,9 +51,12 @@ end
 
 Where throwing traps, the exception a `throw` throws is never observed: `throw(x)` becomes
 `throw(nothing)`, and the computations of values used only to be thrown are removed when
-they build an exception or its message (an `Exception`, a string, a symbol) or have no
-effects. Error paths then do not compile the code that formats error messages. Calls of
-functions that never return stay: their effects before they throw still happen.
+they have no effects (they may throw: on this path that traps too), or when they are
+Base's own construction of an exception or its message (`print_to_string` of the
+arguments of an error: effects on the buffer it allocates, which inference cannot prove
+effect-free). Error paths then do not compile the code that formats error messages.
+Calls of the program's functions stay even when they build exceptions, and calls of
+functions that never return: their effects before they throw still happen.
 """
 function trap_throws!(ir::CC.IRCode)
     stmts = ir.stmts
@@ -84,17 +87,27 @@ function trap_throws!(ir::CC.IRCode)
         id = pop!(work)
         stmt = stmts[id][:stmt]
         stmt isa Expr && stmt.head in (:call, :invoke, :new, :foreigncall, :splatnew) || continue
-        T = CC.widenconst(stmts[id][:type])
-        removable = T <: Union{Exception,AbstractString,Symbol} ||
-                    (stmts[id][:flag] & CC.IR_FLAG_EFFECT_FREE) != 0 ||
+        removable = (stmts[id][:flag] & CC.IR_FLAG_EFFECT_FREE) != 0 ||
                     stmt.head === :new || stmt.head === :splatnew ||
-                    is_pure_builtin_call(stmt) || is_pure_foreigncall(stmt)
+                    is_pure_builtin_call(stmt) || is_pure_foreigncall(stmt) ||
+                    is_base_message(stmt, stmts[id][:type])
         removable || continue
         release!(stmt)
         stmts[id][:stmt] = nothing
         stmts[id][:type] = Nothing
     end
     return ir
+end
+
+# a call of a method of Base or Core building an exception or the message of one
+function is_base_message(stmt::Expr, @nospecialize(typ))
+    stmt.head === :invoke || return false
+    CC.widenconst(typ) <: Union{Exception,AbstractString,Symbol} || return false
+    target = stmt.args[1]
+    mi = target isa Core.CodeInstance ? CC.get_ci_mi(target) : target
+    mi isa Core.MethodInstance && mi.def isa Method || return false
+    root = Base.moduleroot(mi.def.module)
+    return root === Base || root === Core
 end
 
 # builtins without effects on existing objects (they may allocate)
@@ -126,8 +139,8 @@ end
 """
     drop_unused!(ir) -> IRCode
 
-Remove statements whose results are unused and that have no effect but possibly
-throwing: those the optimizer flagged effect-free, and type computations (`apply_type`,
+Remove statements whose results are unused and that the optimizer could have removed (no
+effects, no throwing, terminating), and type computations without effects (`apply_type`,
 `typejoin`, ...) that it keeps because they may throw. (Natively they run, and do not
 throw; here types cannot be built at run time.)
 """
@@ -147,7 +160,9 @@ function drop_unused!(ir::CC.IRCode)
         stmt = stmts[id][:stmt]
         stmt isa Expr && stmt.head in (:call, :invoke) || continue
         stmts[id][:type] === Union{} && continue
-        droppable = (stmts[id][:flag] & CC.IR_FLAG_EFFECT_FREE) != 0 || is_type_computation(stmt)
+        flag = stmts[id][:flag]
+        droppable = (flag & CC.IR_FLAGS_REMOVABLE) == CC.IR_FLAGS_REMOVABLE ||
+                    is_type_computation(stmt, flag)
         droppable || continue
         for ur in CC.userefs(stmt)
             v = ur[]
@@ -166,12 +181,15 @@ const TYPE_FUNCTIONS = Any[Base.typejoin, Base.typeintersect, Base.promote_type,
                            Base.promote_typejoin, Base.typesplit, Base.nonnothingtype,
                            Base.nonmissingtype, Base.eltype]
 
-function is_type_computation(stmt::Expr)
+# a builtin computing a type, or a call of a type function (methods of which may be the
+# program's, so only without effects)
+function is_type_computation(stmt::Expr, flag)
     if stmt.head === :call
         f = stmt.args[1]
         f isa GlobalRef && isdefined(f.mod, f.name) && isconst(f.mod, f.name) && (f = getglobal(f.mod, f.name))
         return f === Core.apply_type || f === Core._typevar || f === Core.typeof
     elseif stmt.head === :invoke
+        (flag & CC.IR_FLAG_EFFECT_FREE) != 0 || return false
         f = stmt.args[2]
         f isa GlobalRef && isdefined(f.mod, f.name) && isconst(f.mod, f.name) && (f = getglobal(f.mod, f.name))
         return any(g -> f === g, TYPE_FUNCTIONS)

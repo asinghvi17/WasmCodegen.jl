@@ -51,7 +51,7 @@ mutable struct CGModule
     funcs::IdDict{Core.MethodInstance,FuncInfo}
     worklist::Vector{FuncInfo}
     image::Any
-    helpers::Dict{Any,Func}
+    helpers::Dict{Any,Any}
     "Diagnostics: the unsupported constructs compiled as traps, by function."
     diagnostics::Vector{Pair{Core.MethodInstance,Unsupported}}
     "Instructions of the start function (initializing objects of the image)."
@@ -62,7 +62,7 @@ function CGModule(world::ClosedWorld, config::Config)
     m = WModule()
     types = Types(m)
     cgm = CGModule(world, m, types, config, IdDict{Core.MethodInstance,FuncInfo}(),
-                   FuncInfo[], nothing, Dict{Any,Func}(), Pair{Core.MethodInstance,Unsupported}[],
+                   FuncInfo[], nothing, Dict{Any,Any}(), Pair{Core.MethodInstance,Unsupported}[],
                    Inst[])
     cgm.image = Image(cgm)
     return cgm

@@ -1,7 +1,7 @@
 # Differential testing: compile, run in Node.js, compare with native Julia.
 
 using Test, WasmCodegen, WasmBuilder, Base64, SHA
-import JSON3
+import JSON
 import NodeJS_24_jll
 
 # Node.js from NodeJS_24_jll (WasmGC, exnref exceptions, js-string builtins), or the executable
@@ -80,13 +80,13 @@ function wasm_run(c, name::String, args...; rettype)
     results = rl.kind === WasmCodegen.Inline ? [wtype_name(l.type) for l in rl.leaves] : String[]
     req = Dict("id" => id, "wasmId" => wasmid, "wasm" => base64encode(c.bytes), "fn" => name,
                "args" => [Dict("t" => t, "bits" => b) for (t, b) in leaves], "results" => results)
-    println(r, JSON3.write(req))
-    resp = JSON3.read(readline(r))
-    haskey(resp, :error) && error("runner: ", resp[:error])
-    LAST_OUTPUT[] = String(get(resp, :output, ""))
-    haskey(resp, :trap) && return (:trap, String(resp[:trap]))
+    println(r, JSON.json(req))
+    resp = JSON.parse(readline(r))
+    haskey(resp, "error") && error("runner: ", resp["error"])
+    LAST_OUTPUT[] = String(get(resp, "output", ""))
+    haskey(resp, "trap") && return (:trap, String(resp["trap"]))
     rl.kind === WasmCodegen.Ghost && return rettype.instance
-    return from_leaves(rettype, String[x for x in resp[:results]], Ref(1))
+    return from_leaves(rettype, String[x for x in resp["results"]], Ref(1))
 end
 
 "What the last run printed."
