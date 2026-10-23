@@ -1,0 +1,203 @@
+# The state of a compilation: one `CGModule` per Wasm module, one `FnCtx` per function.
+
+"""
+    Config(; on_unsupported=:error)
+
+The configuration of the code generator:
+
+- `on_unsupported`: what happens when a function uses an unsupported construct: `:error`
+  (throw), or `:trap` (the construct compiles to a trap, and is reported in the
+  compilation's diagnostics);
+- `verify`: the trim verification of the closed world (`:error`, `:warn`, `:off`).
+"""
+Base.@kwdef struct Config
+    on_unsupported::Symbol = :error
+    verify::Symbol = :warn
+end
+
+"""
+    FuncInfo
+
+A Wasm function compiled for a method instance: its Julia argument types (with the
+function object first, varargs packed in a tuple, as the IR has them) and return type.
+"""
+struct FuncInfo
+    mi::Core.MethodInstance
+    func::Func
+    argtypes::Vector{Any}
+    rettype::Any
+end
+
+"""
+    CGModule
+
+The state of generating a module: the closed world, the Wasm module and its types, the
+functions emitted for method instances, the image of serialized objects, and helper
+functions generated on demand.
+"""
+mutable struct CGModule
+    world::ClosedWorld
+    mod::WModule
+    types::Types
+    config::Config
+    funcs::IdDict{Core.MethodInstance,FuncInfo}
+    worklist::Vector{FuncInfo}
+    image::Any
+    helpers::Dict{Any,Func}
+    "Diagnostics: the unsupported constructs compiled as traps, by function."
+    diagnostics::Vector{Pair{Core.MethodInstance,Unsupported}}
+    "Instructions of the start function (initializing objects of the image)."
+    start::Vector{Inst}
+end
+
+function CGModule(world::ClosedWorld, config::Config)
+    m = WModule()
+    types = Types(m)
+    cgm = CGModule(world, m, types, config, IdDict{Core.MethodInstance,FuncInfo}(),
+                   FuncInfo[], nothing, Dict{Any,Func}(), Pair{Core.MethodInstance,Unsupported}[],
+                   Inst[])
+    cgm.image = Image(cgm)
+    return cgm
+end
+
+layout(cgm::CGModule, @nospecialize(T)) = layout(cgm.types, T)
+valtypes(cgm::CGModule, @nospecialize(T)) = valtypes(cgm.types, T)
+
+"""
+    LoopTarget
+
+An enclosing loop: the depths of its labels (`exit`: the block around the loop; `cont`:
+the loop itself), the locals of its carried values and results, and for a `for` loop its
+induction variable and step.
+"""
+struct LoopTarget
+    exit::Int
+    cont::Int
+    carries::Vector{CGVal}
+    results::Vector{CGVal}
+    iv::Union{Nothing,CGVal}
+    step::Any
+end
+
+"""
+    FnCtx
+
+The state of emitting one function: its structured IR, the builder, the value of each
+argument, statement and block argument, the enclosing loops and the label depth.
+"""
+mutable struct FnCtx
+    cgm::CGModule
+    info::FuncInfo
+    sci::Any
+    b::Builder
+    args::Vector{CGVal}
+    ssavals::Dict{Int,Any}
+    blockargs::Dict{Int,CGVal}
+    loops::Vector{LoopTarget}
+    "The number of labels (blocks, loops, ifs) enclosing the current position."
+    depth::Int
+    "The results of the enclosing ifs, which `YieldOp`s assign."
+    yields::Vector{Vector{CGVal}}
+end
+
+layout(fc::FnCtx, @nospecialize(T)) = layout(fc.cgm.types, T)
+valtypes(fc::FnCtx, @nospecialize(T)) = valtypes(fc.cgm.types, T)
+
+"The depth of a branch to the label opened when the depth was `d`."
+br_depth(fc::FnCtx, d::Int) = fc.depth - d
+
+function open_label!(fc::FnCtx)
+    fc.depth += 1
+    return fc.depth
+end
+close_label!(fc::FnCtx) = (fc.depth -= 1)
+
+## locals and values
+
+"A new local of type `t`."
+new_local!(fc::FnCtx, t::ValType) = add_local!(fc.b.func, t)
+
+"Push the leaf `l` on the operand stack."
+function push_leaf!(fc::FnCtx, l::LeafVal)
+    if l isa Int
+        emit!(fc.b, :local_get, l)
+    else
+        emit!(fc.b, l.op, l.imm...)
+    end
+end
+
+"Push the leaves of `v` on the operand stack."
+function push_val!(fc::FnCtx, v::CGVal)
+    foreach(l -> push_leaf!(fc, l), v.leaves)
+end
+
+"""
+    new_val!(fc, T) -> CGVal
+
+A value of type `T` in new locals (unassigned).
+"""
+function new_val!(fc::FnCtx, @nospecialize(T))
+    l = layout(fc, T)
+    l.kind === Ghost && return ghost(T, something(ghost_value(T)))
+    l.kind === Bottom && return bottom()
+    return CGVal(T, l.kind, LeafVal[new_local!(fc, leaf.type) for leaf in l.leaves])
+end
+
+"Assign the leaves on the operand stack to the locals of `dst`."
+function pop_to!(fc::FnCtx, dst::CGVal)
+    for l in Iterators.reverse(dst.leaves)
+        emit!(fc.b, :local_set, l::Int)
+    end
+end
+
+"""
+    pop_val!(fc, T) -> CGVal
+
+Pop a value of type `T` (its leaves) from the operand stack into new locals.
+"""
+function pop_val!(fc::FnCtx, @nospecialize(T))
+    l = layout(fc, T)
+    if l.kind === Bottom
+        is_unreachable(fc.b) || unreachable!(fc.b)
+        return bottom()
+    end
+    v = new_val!(fc, T)
+    pop_to!(fc, v)
+    return v
+end
+
+"Assign the value `v` to the locals of `dst` (converted to its type)."
+function assign!(fc::FnCtx, dst::CGVal, v::CGVal)
+    v = convert_repr(fc, v, dst.typ)
+    v.kind === Bottom && return
+    push_val!(fc, v)
+    pop_to!(fc, dst)
+end
+
+"Push the default value of each Wasm type in `ts` (zero or null)."
+function push_default!(fc::FnCtx, t::ValType)
+    if t === I32
+        emit!(fc.b, :i32_const, 0)
+    elseif t === I64
+        emit!(fc.b, :i64_const, 0)
+    elseif t === F32
+        emit!(fc.b, :f32_const, 0.0f0)
+    elseif t === F64
+        emit!(fc.b, :f64_const, 0.0)
+    else
+        emit!(fc.b, :ref_null, (t::RefType).heap)
+    end
+end
+
+default_inst(t::ValType) =
+    t === I32 ? Inst(:i32_const, 0) : t === I64 ? Inst(:i64_const, 0) :
+    t === F32 ? Inst(:f32_const, 0.0f0) : t === F64 ? Inst(:f64_const, 0.0) :
+    Inst(:ref_null, (t::RefType).heap)
+
+"An undefined value of type `T` (never observed): defaults."
+function undef_val(fc::FnCtx, @nospecialize(T))
+    l = layout(fc, T)
+    l.kind === Ghost && return ghost(T, something(ghost_value(T)))
+    l.kind === Bottom && return bottom()
+    return CGVal(T, l.kind, LeafVal[default_inst(leaf.type) for leaf in l.leaves])
+end

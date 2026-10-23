@@ -1,0 +1,454 @@
+# Builtin functions (`Core.Builtin`s): object construction and access, identity, type
+# tests, memory.
+
+## construction
+
+"""
+    emit_new!(fc, T, args) -> CGVal
+
+A new object of type `T` with the fields `args` (fewer than the fields of `T` leaves
+the rest undefined).
+"""
+function emit_new!(fc::FnCtx, @nospecialize(T), args::Vector{CGVal})
+    l = layout(fc, T)
+    l.kind === Ghost && return ghost(T, something(ghost_value(T)))
+    if l.kind === Inline
+        leaves = LeafVal[]
+        for i in 1:fieldcount(T)
+            FT = fieldtype(T, i)
+            if i <= length(args)
+                v = convert_repr(fc, args[i], FT)
+                v.kind === Bottom && return v
+                append!(leaves, v.leaves)
+            else
+                append!(leaves, undef_val(fc, FT).leaves)
+            end
+        end
+        return CGVal(T, Inline, leaves)
+    end
+    is_memory_type(T) && unsupported("`new` of ", T)
+    # an object: the header, then the fields
+    ts = fc.cgm.types
+    emit!(fc.b, :i32_const, typeid!(ts, T))
+    emit!(fc.b, :i32_const, 0)
+    for i in 1:fieldcount(T)
+        FT = fieldtype(T, i)
+        if i <= length(args)
+            v = convert_repr(fc, args[i], FT)
+            v.kind === Bottom && return v
+            push_val!(fc, v)
+        else
+            for leaf in field_leaves(ts, FT)
+                push_default!(fc, leaf.type)
+            end
+        end
+    end
+    emit!(fc.b, :struct_new, l.wtype)
+    return pop_val!(fc, T)
+end
+
+"""
+    make_tuple(fc, T, vals) -> CGVal
+
+The tuple of type `T` (concrete or not) of the values `vals`.
+"""
+function make_tuple(fc::FnCtx, @nospecialize(T), vals::Vector{CGVal})
+    if !isconcretetype(T) && !is_inline_tuple(T)
+        # the concrete tuple type of the values
+        T = Tuple{(v.typ for v in vals)...}
+        isconcretetype(T) || unsupported("a tuple of abstract type ", T)
+    end
+    return emit_new!(fc, T, vals)
+end
+
+"The elements of the tuple value `t`."
+function tuple_elements(fc::FnCtx, t::CGVal)
+    T = t.typ
+    (T isa DataType && T <: Tuple && isconcretetype(T)) ||
+        unsupported("the elements of a tuple of type ", T)
+    return CGVal[get_field(fc, t, i) for i in 1:fieldcount(T)]
+end
+
+## fields
+
+function field_index(@nospecialize(T), f)
+    if f isa Symbol
+        i = Base.fieldindex(T, f, false)
+        i == 0 && unsupported("the field ", f, " of ", T)
+        return i
+    end
+    f isa Integer || unsupported("a field index ", f)
+    return Int(f)
+end
+
+"""
+    get_field(fc, x, i) -> CGVal
+
+The field `i` (constant) of the value `x`.
+"""
+function get_field(fc::FnCtx, x::CGVal, i::Int)
+    T = x.typ
+    l = layout(fc, T)
+    if isconstant(x) && !ismutable(constant_value(x))
+        return const_value(fc, getfield(constant_value(x), i))
+    end
+    FT = fieldtype(T, i)
+    if l.kind === Inline
+        if is_memoryref_type(T)
+            i == 2 && return CGVal(FT, Boxed, LeafVal[x.leaves[1]])
+            unsupported("the pointer of a MemoryRef")
+        end
+        fl = layout(fc, FT)
+        fl.kind === Ghost && return ghost(FT, something(ghost_value(FT)))
+        return CGVal(FT, fl.kind, x.leaves[l.fields[i]])
+    elseif l.kind === Boxed && !isempty(l.fields)
+        fl = layout(fc, FT)
+        fl.kind === Ghost && return ghost(FT, something(ghost_value(FT)))
+        fields = (typedef(fc.cgm.mod, l.wtype).comp::StructType).fields
+        tmp = materialize!(fc, x)
+        for w in l.fields[i]
+            push_leaf!(fc, tmp)
+            emit!(fc.b, fields[w].storage isa PackedType ? :struct_get_u : :struct_get, l.wtype, w - 1)
+        end
+        return pop_val!(fc, FT)
+    elseif is_memory_type(T)
+        name = fieldname(T, i)
+        name === :length || unsupported("the field ", name, " of ", T)
+        ml = memory_layout(fc.cgm.types, memory_eltype(T))
+        push_val!(fc, x)
+        emit!(fc.b, :array_len)
+        if ml.stride != 1
+            emit!(fc.b, :i32_const, ml.stride)
+            emit!(fc.b, :i32_div_u)
+        end
+        emit!(fc.b, :i64_extend_i32_u)
+        return pop_val!(fc, Int)
+    else
+        unsupported("a field of a value of type ", T)
+    end
+end
+
+# a leaf holding `x`'s reference (its local, or a new local for a constant)
+function materialize!(fc::FnCtx, x::CGVal)
+    leaf = only(x.leaves)
+    leaf isa Int && return leaf
+    push_leaf!(fc, leaf)
+    tmp = new_local!(fc, layout(fc, x.typ).leaves[1].type)
+    emit!(fc.b, :local_set, tmp)
+    return tmp
+end
+
+function set_field!(fc::FnCtx, x::CGVal, i::Int, v::CGVal)
+    T = x.typ
+    l = layout(fc, T)
+    (l.kind === Boxed && !isempty(l.fields) && ismutabletype(T)) ||
+        unsupported("setfield! of a value of type ", T)
+    FT = fieldtype(T, i)
+    v = convert_repr(fc, v, FT)
+    v.kind === Bottom && return v
+    tmp = materialize!(fc, x)
+    for (w, leaf) in zip(l.fields[i], v.leaves)
+        push_leaf!(fc, tmp)
+        push_leaf!(fc, leaf)
+        emit!(fc.b, :struct_set, l.wtype, w - 1)
+    end
+    return v
+end
+
+## builtins
+
+"""
+    emit_builtin!(fc, f, args, typ) -> Union{Nothing,CGVal,MultiVal}
+
+Emit a call of the builtin function `f`.
+"""
+function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecialize(typ))
+    if f === Core.getfield
+        x = args[1]
+        idx = args[2]
+        if x isa MultiVal
+            (idx isa CGVal && isconstant(idx)) || unsupported("a dynamic index into results")
+            return x.vals[constant_value(idx)]
+        end
+        x = x::CGVal
+        if isconstant(idx)
+            return get_field(fc, x, field_index(x.typ, constant_value(idx)))
+        end
+        return get_field_dynamic(fc, x, idx, typ)
+    elseif f === Core.setfield!
+        x, idx, v = args[1], args[2], args[3]
+        isconstant(idx) || unsupported("setfield! with a field not known at compile time")
+        return set_field!(fc, x, field_index(x.typ, constant_value(idx)), v)
+    elseif f === Core.isdefined
+        x, idx = args[1], args[2]
+        isconstant(idx) || unsupported("isdefined with a field not known at compile time")
+        return emit_isdefined!(fc, x, field_index(x.typ, constant_value(idx)))
+    elseif f === Core.:(===)
+        return emit_egal!(fc, args[1], args[2])
+    elseif f === Core.isa
+        T = args[2]
+        isconstant(T) || unsupported("isa with a type not known at compile time")
+        return emit_isa!(fc, args[1], constant_value(T))
+    elseif f === Core.typeassert
+        T = args[2]
+        isconstant(T) || unsupported("typeassert with a type not known at compile time")
+        t = emit_isa!(fc, args[1], constant_value(T))
+        if !(isconstant(t) && constant_value(t))
+            push_val!(fc, t)
+            emit!(fc.b, :i32_eqz)
+            if!(fc.b); unreachable!(fc.b); end!(fc.b)
+        end
+        return convert_repr(fc, args[1], typ)
+    elseif f === Core.typeof
+        x = args[1]::CGVal
+        isconcretetype(x.typ) && return const_value(fc, x.typ)
+        unsupported("typeof of a value of abstract type ", x.typ)
+    elseif f === Core.tuple
+        return make_tuple(fc, typ, CGVal[a for a in args])
+    elseif f === Core.ifelse
+        return emit_ifelse!(fc, args[1], args[2], args[3], typ)
+    elseif f === Core.throw
+        unreachable!(fc.b)
+        return bottom()
+    elseif f === Core.nfields
+        x = args[1]::CGVal
+        isconcretetype(x.typ) && return const_value(fc, fieldcount(x.typ))
+        unsupported("nfields of a value of abstract type ", x.typ)
+    elseif f === Core.sizeof
+        x = args[1]::CGVal
+        isconstant(x) && return const_value(fc, Core.sizeof(constant_value(x)))
+        isconcretetype(x.typ) && !is_memory_type(x.typ) && x.typ !== String &&
+            return const_value(fc, Core.sizeof(x.typ))
+        unsupported("sizeof of a value of type ", x.typ)
+    elseif f === Core.compilerbarrier
+        return args[2]
+    elseif f === Core.donotdelete || f === Core.finalizer
+        return ghost(Nothing, nothing)
+    elseif f === Core.getglobal
+        m, s = args[1], args[2]
+        (isconstant(m) && isconstant(s)) || unsupported("getglobal of a binding not known at compile time")
+        return operand(fc, GlobalRef(constant_value(m), constant_value(s)))
+    elseif f === Core.setglobal!
+        m, s = args[1], args[2]
+        (isconstant(m) && isconstant(s)) || unsupported("setglobal! of a binding not known at compile time")
+        return set_global_var!(fc, GlobalRef(constant_value(m), constant_value(s)), args[3])
+    elseif f === Core.memoryrefnew
+        return emit_memoryrefnew!(fc, args)
+    elseif f === Core.memoryrefget
+        return emit_memoryrefget!(fc, args[1], args[3], typ)
+    elseif f === Core.memoryrefset!
+        return emit_memoryrefset!(fc, args[1], args[2], args[4])
+    elseif f === Core.memoryref_isassigned
+        return emit_memoryref_isassigned!(fc, args[1], args[3])
+    elseif f === Core.memoryrefoffset
+        r = args[1]::CGVal
+        push_leaf!(fc, r.leaves[2])
+        emit!(fc.b, :i32_const, 1)
+        emit!(fc.b, :i32_add)
+        emit!(fc.b, :i64_extend_i32_u)
+        return pop_val!(fc, Int)
+    elseif isdefined(Core, :memorynew) && f === getfield(Core, :memorynew)
+        return emit_memorynew!(fc, constant_value(args[1]), args[2])
+    elseif f === Core.apply_type
+        all(a -> a isa CGVal && isconstant(a), args) &&
+            return const_value(fc, Core.apply_type(map(constant_value, args)...))
+        unsupported("apply_type of types not known at compile time")
+    end
+    unsupported("the builtin ", f)
+end
+
+function emit_isdefined!(fc::FnCtx, x::CGVal, i::Int)
+    T = x.typ
+    l = layout(fc, T)
+    if l.kind === Boxed && !isempty(l.fields)
+        FT = fieldtype(T, i)
+        fls = field_leaves(fc.cgm.types, FT)
+        if !isempty(fls) && fls[1].type isa RefType
+            tmp = materialize!(fc, x)
+            push_leaf!(fc, tmp)
+            emit!(fc.b, :struct_get, l.wtype, first(l.fields[i]) - 1)
+            emit!(fc.b, :ref_is_null)
+            emit!(fc.b, :i32_eqz)
+            return pop_val!(fc, Bool)
+        end
+    end
+    return const_value(fc, true)
+end
+
+"""
+    get_field_dynamic(fc, x, i, typ) -> CGVal
+
+The field of the tuple `x` at the run-time index `i` (1-based): a select among the
+fields.
+"""
+function get_field_dynamic(fc::FnCtx, x::CGVal, i::CGVal, @nospecialize(typ))
+    T = x.typ
+    (T isa DataType && T <: Tuple && layout(fc, T).kind === Inline) ||
+        unsupported("a field of ", T, " at an index not known at compile time")
+    n = fieldcount(T)
+    res = new_val!(fc, typ)
+    idx = convert_repr(fc, i, Int)
+    # a chain of ifs on the index, the last field otherwise (indices are checked by Julia)
+    for k in 1:n
+        if k < n
+            push_val!(fc, idx)
+            emit!(fc.b, :i64_const, k)
+            emit!(fc.b, :i64_eq)
+            if!(fc.b); open_label!(fc)
+        end
+        assign!(fc, res, get_field(fc, x, k))
+        k < n && else!(fc.b)
+    end
+    for k in 1:n-1
+        end!(fc.b); close_label!(fc)
+    end
+    return res
+end
+
+## identity
+
+"""
+    emit_egal!(fc, a, b) -> CGVal
+
+`a === b`: identity for mutable objects, equality of the bits for inline values.
+"""
+function emit_egal!(fc::FnCtx, a::CGVal, b::CGVal)
+    if isconstant(a) && isconstant(b)
+        return const_value(fc, constant_value(a) === constant_value(b))
+    end
+    Ta, Tb = a.typ, b.typ
+    typeintersect(Ta, Tb) === Union{} && return const_value(fc, false)
+    la, lb = layout(fc, Ta), layout(fc, Tb)
+    if la.kind === Ghost && lb.kind === Ghost
+        return const_value(fc, constant_value(a) === constant_value(b))
+    end
+    if la.kind === Ghost || lb.kind === Ghost
+        # a singleton against a boxed value: its object
+        g, o = la.kind === Ghost ? (a, b) : (b, a)
+        lo = layout(fc, o.typ)
+        lo.kind === Boxed && lo.wtype == fc.cgm.types.jlvalue ||
+            unsupported("=== of ", Ta, " and ", Tb)
+        push_val!(fc, o)
+        emit!(fc.b, :global_get, singleton_global!(fc.cgm.image, g.typ))
+        emit!(fc.b, :ref_eq)
+        return pop_val!(fc, Bool)
+    end
+    if Ta === Tb && la.kind === Inline
+        return egal_inline!(fc, a, b)
+    end
+    if la.kind === Boxed && lb.kind === Boxed
+        if (Ta === Tb && ismutabletype(Ta)) || (is_memory_type(Ta) && Ta === Tb)
+            push_val!(fc, a); push_val!(fc, b)
+            emit!(fc.b, :ref_eq)
+            return pop_val!(fc, Bool)
+        end
+        if !may_be_immutable(Ta) || !may_be_immutable(Tb)
+            # one side is always a mutable object: identity
+            push_val!(fc, convert_repr(fc, a, Any)); push_val!(fc, convert_repr(fc, b, Any))
+            emit!(fc.b, :ref_eq)
+            return pop_val!(fc, Bool)
+        end
+    end
+    unsupported("=== of values of types ", Ta, " and ", Tb)
+end
+
+# whether a value of type T may be an immutable non-ghost value (compared by content)
+function may_be_immutable(@nospecialize(T))
+    T === Union{} && return false
+    if T isa Union
+        return may_be_immutable(T.a) || may_be_immutable(T.b)
+    end
+    T isa DataType && isconcretetype(T) && return !ismutabletype(T) && ghost_value(T) === nothing
+    return true
+end
+
+function egal_inline!(fc::FnCtx, a::CGVal, b::CGVal)
+    T = a.typ
+    if isprimitivetype(T) || is_memoryref_type(T)
+        leaves = layout(fc, T).leaves
+        first_leaf = true
+        for (la, lb, leaf) in zip(a.leaves, b.leaves, leaves)
+            t = leaf.type
+            push_leaf!(fc, la)
+            t === F64 && emit!(fc.b, :i64_reinterpret_f64)
+            t === F32 && emit!(fc.b, :i32_reinterpret_f32)
+            push_leaf!(fc, lb)
+            t === F64 && emit!(fc.b, :i64_reinterpret_f64)
+            t === F32 && emit!(fc.b, :i32_reinterpret_f32)
+            if t isa RefType
+                emit!(fc.b, :ref_eq)
+            else
+                emit!(fc.b, (t === I64 || t === F64) ? :i64_eq : :i32_eq)
+            end
+            first_leaf || emit!(fc.b, :i32_and)
+            first_leaf = false
+        end
+        return pop_val!(fc, Bool)
+    end
+    res = const_value(fc, true)
+    for i in 1:fieldcount(T)
+        e = emit_egal!(fc, get_field(fc, a, i), get_field(fc, b, i))
+        if isconstant(res)
+            res = e
+        else
+            push_val!(fc, res); push_val!(fc, e)
+            emit!(fc.b, :i32_and)
+            res = pop_val!(fc, Bool)
+        end
+    end
+    return res
+end
+
+## type tests
+
+"""
+    emit_isa!(fc, x, T) -> CGVal
+
+`isa(x, T)`: known at compile time from the type of `x`, or a test of its type id.
+"""
+function emit_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
+    S = x.typ
+    S <: T && return const_value(fc, true)
+    typeintersect(S, T) === Union{} && return const_value(fc, false)
+    lx = layout(fc, S)
+    (lx.kind === Boxed && lx.wtype == fc.cgm.types.jlvalue) ||
+        unsupported("isa(::", S, ", ", T, ")")
+    ts = fc.cgm.types
+    if T isa DataType && isconcretetype(T)
+        push_val!(fc, x)
+        emit!(fc.b, :struct_get, ts.jlvalue, 0)
+        emit!(fc.b, :i32_const, typeid!(ts, T))
+        emit!(fc.b, :i32_eq)
+        return pop_val!(fc, Bool)
+    end
+    # an abstract type or a union: the concrete types of the closed world that are its
+    # subtypes (known when the module is complete)
+    push_val!(fc, x)
+    emit!(fc.b, :struct_get, ts.jlvalue, 0)
+    call!(fc.b, isa_predicate!(fc.cgm, T))
+    return pop_val!(fc, Bool)
+end
+
+## ifelse
+
+function emit_ifelse!(fc::FnCtx, c::CGVal, a::CGVal, b::CGVal, @nospecialize(typ))
+    c = convert_repr(fc, c, Bool)
+    if isconstant(c)
+        return convert_repr(fc, constant_value(c) ? a : b, typ)
+    end
+    a = convert_repr(fc, a, typ)
+    b = convert_repr(fc, b, typ)
+    l = layout(fc, typ)
+    l.kind === Ghost && return a
+    for (i, leaf) in enumerate(l.leaves)
+        push_leaf!(fc, a.leaves[i])
+        push_leaf!(fc, b.leaves[i])
+        push_val!(fc, c)
+        if leaf.type isa RefType
+            emit!(fc.b, :select_t, ValType[leaf.type])
+        else
+            emit!(fc.b, :select)
+        end
+    end
+    return pop_val!(fc, typ)
+end
