@@ -56,6 +56,9 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
         add_export!(cgm.mod, e.name, info.func)
     end
     process_worklist!(cgm)
+    if cgm.config.trim === :safe && !isempty(cgm.diagnostics)
+        throw(UnsupportedConstructs(cgm.diagnostics))
+    end
     finish_module!(cgm)
     bytes = to_bytes(cgm.mod)
     validate && WasmBuilder.validate(bytes)

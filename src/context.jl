@@ -11,12 +11,16 @@ The configuration of the code generator:
 - `verify`: checking the entry points as `juliac --trim=safe` does (`:error`, `:warn`
   (report), `:off`);
 - `trim_patches`: compile with the methods juliac redefines for trimmed programs
-  (`patches.jl`).
+  (`patches.jl`);
+- `trim`: as juliac's `--trim`: `:safe`, a statement the code generator cannot compile
+  (dynamic dispatch, ...) is an error; `:unsafe`, it compiles to a trap where it is (an
+  error if it runs), recorded in the diagnostics.
 """
 Base.@kwdef struct Config
     on_unsupported::Symbol = :error
     verify::Symbol = :warn
     trim_patches::Bool = true
+    trim::Symbol = :safe
 end
 
 """

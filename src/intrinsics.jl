@@ -58,9 +58,9 @@ const FLOAT_BINOPS = Dict(II.add_float => "add", II.sub_float => "sub",
                           II.mul_float_fast => "mul", II.div_float_fast => "div",
                           II.copysign_float => "copysign")
 # IEEE minimum/maximum (NaN if either is, -0.0 < 0.0): Wasm's min/max
-if isdefined(II, :min_float)
-    FLOAT_BINOPS[II.min_float] = "min"
-    FLOAT_BINOPS[II.max_float] = "max"
+for (name, op) in ((:min_float, "min"), (:max_float, "max"), (:min_float_fast, "min"),
+                   (:max_float_fast, "max"))
+    isdefined(II, name) && (FLOAT_BINOPS[getfield(II, name)] = op)
 end
 const FLOAT_CMPS = Dict(II.eq_float => "eq", II.ne_float => "ne", II.lt_float => "lt",
                         II.le_float => "le", II.eq_float_fast => "eq",
@@ -85,6 +85,10 @@ function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}
             return const_value(fc, f(map(constant_value, args)...))
         catch
         end
+    end
+    if any(a -> is128(a.typ), args) || (typ isa Type && is128(typ) && f !== II.bitcast)
+        r = emit_intrinsic128!(fc, f, args, typ)
+        r === nothing || return r
     end
     if haskey(INT_BINOPS, f)
         a, b = args
@@ -251,11 +255,28 @@ function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}
         a, b = args
         push_val!(fc, a); push_val!(fc, b)
         emit!(fc.b, f === II.add_ptr ? :i64_add : :i64_sub)
-        return pop_val!(fc, a.typ)
+        r = pop_val!(fc, a.typ)
+        a.origin === nothing && return r
+        # the origin moves by the offset, in elements
+        o = a.origin
+        sz = Base.aligned_sizeof(o.eltype)
+        idx = new_local!(fc, I32)
+        push_leaf!(fc, o.index)
+        push_val!(fc, b)
+        prim_wtype(fc, b.typ) === I64 && emit!(fc.b, :i32_wrap_i64)
+        emit!(fc.b, :i32_const, sz)
+        emit!(fc.b, :i32_div_s)
+        emit!(fc.b, f === II.add_ptr ? :i32_add : :i32_sub)
+        emit!(fc.b, :local_set, idx)
+        return with_origin(r, PtrOrigin(o.array, idx, o.eltype))
     elseif f === II.have_fma
         return const_value(fc, false)
     elseif f === II.atomic_fence
         return ghost(Nothing, nothing)
+    elseif f === II.atomic_pointerset || f === II.pointerset
+        # a store through a pointer into a Memory: Base clears references with it
+        # (`_unsetindex!`)
+        return emit_pointerset!(fc, args[1], args[2])
     end
     unsupported("the intrinsic ", f)
 end
@@ -316,7 +337,7 @@ function emit_bitcast!(fc::FnCtx, @nospecialize(R), x::CGVal)
     lr, ls = layout(fc, R), layout(fc, S)
     tr, ts = lr.leaves[1].type, ls.leaves[1].type
     length(lr.leaves) == 1 || unsupported("bitcast to ", R)
-    tr === ts && return CGVal(R, Inline, x.leaves)
+    tr === ts && return CGVal(R, Inline, x.leaves, nothing, x.origin)
     push_val!(fc, x)
     emit!(fc.b, Symbol(wprefix(tr), "_reinterpret_", wprefix(ts)))
     return pop_val!(fc, R)
@@ -474,4 +495,26 @@ function emit_checked_div!(fc::FnCtx, f, a::CGVal, b::CGVal)
     emit!(fc.b, wop(t, op))
     mask!(fc, T)
     return pop_val!(fc, T)
+end
+
+"""
+    emit_pointerset!(fc, p, v) -> CGVal
+
+A store of `v` through the pointer `p` (with an origin): clearing a reference element
+(storing a null pointer into a memory of references), or storing an element.
+"""
+function emit_pointerset!(fc::FnCtx, p::CGVal, v::CGVal)
+    o = origin_of(fc, p, "a store")
+    ml = memory_layout(fc.cgm.types, o.eltype)
+    if ml.storage isa RefType
+        (isconstant(v) && constant_value(v) == C_NULL) ||
+            unsupported("storing a ", v.typ, " through a pointer into a memory of references")
+        push_leaf!(fc, o.array)
+        push_leaf!(fc, o.index)
+        ml.stride != 1 && (emit!(fc.b, :i32_const, ml.stride); emit!(fc.b, :i32_mul))
+        emit!(fc.b, :ref_null, (ml.storage::RefType).heap)
+        emit!(fc.b, :array_set, ml.array)
+        return p
+    end
+    unsupported("storing through a pointer into a memory of ", o.eltype)
 end

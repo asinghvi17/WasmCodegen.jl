@@ -19,6 +19,11 @@ using CompilerCaching: StackedMethodTable
 const CC = Base.Compiler
 
 include("errors.jl")
+
+"Functions the code generator calls for what Wasm lacks, compiled into the module on demand."
+module Runtime
+include("runtime/int128.jl")
+end
 include("interpreter.jl")
 include("collect.jl")
 include("prepare.jl")
@@ -29,6 +34,7 @@ include("emit.jl")
 include("builtins.jl")
 include("memory.jl")
 include("intrinsics.jl")
+include("intrinsics128.jl")
 include("foreigncall.jl")
 include("image.jl")
 include("overlays.jl")
@@ -36,7 +42,7 @@ include("types_runtime.jl")
 include("patches.jl")
 include("driver.jl")
 
-export compile, Entry, Config
+export compile, Entry, Config, UnsupportedConstructs
 
 function __init__()
     COMPILER_WORLD[] = Base.get_world_counter()

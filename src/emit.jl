@@ -162,7 +162,7 @@ function emit_block!(fc::FnCtx, block)
         if stmt isa IRStructurizer.ControlFlowOp
             fc.ssavals[idx] = emit_cfop!(fc, stmt, typ)
         else
-            res = emit_stmt!(fc, stmt, typ)
+            res = emit_stmt_or_trap!(fc, stmt, typ)
             if res !== nothing
                 if res isa CGVal && res.kind !== Bottom && typ !== Union{}
                     res = convert_repr(fc, res, typ)
@@ -225,6 +225,32 @@ function assign_all!(fc::FnCtx, dsts::Vector{CGVal}, vals)
     end
     for d in Iterators.reverse(dsts)
         pop_to!(fc, d)
+    end
+end
+
+# A statement; where it cannot be compiled, a trap, and the error is recorded: with
+# `trim = :safe` the compilation fails at the end with every such error (as juliac's
+# verifier reports them all), with `trim = :unsafe` the trap stays.
+function emit_stmt_or_trap!(fc::FnCtx, @nospecialize(stmt), @nospecialize(typ))
+    # (a statement that fails leaves no partial code: its instructions are dropped)
+    mark = length(fc.b.func.body)
+    stack = copy(fc.b.stack)
+    frames = copy(fc.b.frames)
+    inits = copy(fc.b.inits)
+    depth = fc.depth
+    try
+        return emit_stmt!(fc, stmt, typ)
+    catch err
+        err isa Unsupported || rethrow()
+        resize!(fc.b.func.body, mark)
+        fc.b.stack = stack
+        fc.b.frames = frames
+        fc.b.inits = inits
+        fc.depth = depth
+        push!(err.context, fc.info.mi)
+        push!(fc.cgm.diagnostics, fc.info.mi => err)
+        unreachable!(fc.b)
+        return bottom()
     end
 end
 
@@ -330,7 +356,7 @@ function emit_cfop!(fc::FnCtx, op::IRStructurizer.WhileOp, @nospecialize(typ))
         if stmt isa IRStructurizer.ControlFlowOp
             fc.ssavals[inst.ssa_idx] = emit_cfop!(fc, stmt, typ_i)
         else
-            res = emit_stmt!(fc, stmt, typ_i)
+            res = emit_stmt_or_trap!(fc, stmt, typ_i)
             res isa CGVal && res.kind !== Bottom && typ_i !== Union{} &&
                 (res = convert_repr(fc, res, typ_i))
             res === nothing || (fc.ssavals[inst.ssa_idx] = res)
