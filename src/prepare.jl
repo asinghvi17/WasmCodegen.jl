@@ -49,11 +49,11 @@ end
 """
     trap_throws!(ir) -> IRCode
 
-Where throwing traps: every statement that always throws (a `throw`, or a call of a
-function that never returns) becomes `throw(nothing)`, and the statements computing
-values used only to be thrown (exception objects and their messages) are removed, with
-their effects. The exception is never built: its construction and the code formatting its
-message are not compiled.
+Where throwing traps, the exception a `throw` throws is never observed: `throw(x)` becomes
+`throw(nothing)`, and the computations of values used only to be thrown are removed when
+they build an exception or its message (an `Exception`, a string, a symbol) or have no
+effects. Error paths then do not compile the code that formats error messages. Calls of
+functions that never return stay: their effects before they throw still happen.
 """
 function trap_throws!(ir::CC.IRCode)
     stmts = ir.stmts
@@ -75,18 +75,21 @@ function trap_throws!(ir::CC.IRCode)
     end
     for idx in 1:n
         stmt = stmts[idx][:stmt]
-        stmts[idx][:type] === Union{} || continue
-        stmt isa Expr && stmt.head in (:call, :invoke, :foreigncall) || continue
-        is_throw_call(stmt) && length(stmt.args) == 2 && stmt.args[2] === nothing && continue
+        stmt isa Expr && is_throw_call(stmt) && length(stmt.args) == 2 || continue
+        stmt.args[2] === nothing && continue
         release!(stmt)
         stmts[idx][:stmt] = Expr(:call, GlobalRef(Core, :throw), nothing)
     end
     while !isempty(work)
         id = pop!(work)
         stmt = stmts[id][:stmt]
-        # only plain computations: control flow stays
-        (stmt isa Expr || stmt isa Core.PiNode) || continue
         stmt isa Expr && stmt.head in (:call, :invoke, :new, :foreigncall, :splatnew) || continue
+        T = CC.widenconst(stmts[id][:type])
+        removable = T <: Union{Exception,AbstractString,Symbol} ||
+                    (stmts[id][:flag] & CC.IR_FLAG_EFFECT_FREE) != 0 ||
+                    stmt.head === :new || stmt.head === :splatnew ||
+                    is_pure_builtin_call(stmt) || is_pure_foreigncall(stmt)
+        removable || continue
         release!(stmt)
         stmts[id][:stmt] = nothing
         stmts[id][:type] = Nothing
@@ -94,9 +97,31 @@ function trap_throws!(ir::CC.IRCode)
     return ir
 end
 
-is_throw_call(stmt::Expr) = stmt.head === :call &&
-    (stmt.args[1] === GlobalRef(Core, :throw) || stmt.args[1] === Core.throw ||
-     stmt.args[1] === GlobalRef(Base, :throw))
+# builtins without effects on existing objects (they may allocate)
+const PURE_BUILTINS = Any[Core.tuple, Core.getfield, Core._apply_iterate, Core.typeof,
+                          Core.isa, Core.:(===), Core.memorynew, Core.memoryrefnew,
+                          Core.memoryrefget, Core.nfields, Core.svec, Core.apply_type]
+
+function is_pure_builtin_call(stmt::Expr)
+    stmt.head === :call || return false
+    f = stmt.args[1]
+    f isa GlobalRef && isdefined(f.mod, f.name) && isconst(f.mod, f.name) && (f = getglobal(f.mod, f.name))
+    return f isa Core.IntrinsicFunction || any(b -> f === b, PURE_BUILTINS)
+end
+
+const PURE_FOREIGNCALLS = (:jl_get_world_counter, :jl_get_tls_world_age, :jl_alloc_genericmemory, :jl_alloc_string,
+                           :jl_string_to_genericmemory, :jl_genericmemory_to_string,
+                           :jl_symbol_name, :jl_cstr_to_string, :jl_pchar_to_string)
+
+is_pure_foreigncall(stmt::Expr) =
+    stmt.head === :foreigncall && foreigncall_name(stmt.args[1]) in PURE_FOREIGNCALLS
+
+function is_throw_call(stmt::Expr)
+    stmt.head === :call || return false
+    f = stmt.args[1]
+    f isa GlobalRef && isdefined(f.mod, f.name) && isconst(f.mod, f.name) && (f = getglobal(f.mod, f.name))
+    return f === Core.throw
+end
 
 """
     prepare_ir(world, mi) -> IRCode

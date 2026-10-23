@@ -1,7 +1,8 @@
 # Memory: allocation, references to elements, loads and stores.
 #
-# A `Memory{T}` is a Wasm array (see `memory_layout`); a `MemoryRef{T}` is inline: the
-# array and the index of its element (0-based, in Julia elements).
+# A `Memory{T}` is an object holding a Wasm array (see `memory_layout`); a `MemoryRef{T}`
+# is inline: the Memory, its array (so that accesses do not load it) and the index of its
+# element (0-based, in Julia elements).
 
 ref_eltype(@nospecialize(R)) = memory_eltype(R)
 
@@ -36,7 +37,25 @@ function emit_memorynew!(fc::FnCtx, @nospecialize(M), n::CGVal)
         emit!(fc.b, :i32_mul)
     end
     emit!(fc.b, :array_new_default, ml.array)
+    return new_memory_object!(fc, M)
+end
+
+"The `Memory` object of type `M` of the array on the stack."
+function new_memory_object!(fc::FnCtx, @nospecialize(M))
+    ts = fc.cgm.types
+    arr = new_local!(fc, RefType(memory_array_type!(ts, memory_eltype(M)), true))
+    emit!(fc.b, :local_set, arr)
+    emit!(fc.b, :i32_const, typeid!(ts, M))
+    emit!(fc.b, :i32_const, 0)
+    emit!(fc.b, :local_get, arr)
+    emit!(fc.b, :struct_new, memory_struct_type!(ts, memory_eltype(M)))
     return pop_val!(fc, M)
+end
+
+"Push the array of the `Memory` object `mem`."
+function push_memory_array!(fc::FnCtx, mem::CGVal)
+    push_val!(fc, mem)
+    emit!(fc.b, :struct_get, layout(fc, mem.typ).wtype, DATA_FIELD)
 end
 
 """
@@ -51,7 +70,10 @@ function emit_memoryrefnew!(fc::FnCtx, args::Vector{Any})
         M = x.typ
         is_memory_type(M) || unsupported("memoryrefnew of ", M)
         R = GenericMemoryRef{M.parameters[1],M.parameters[2],M.parameters[3]}
-        return CGVal(R, Inline, LeafVal[only(x.leaves), Inst(:i32_const, 0)])
+        push_memory_array!(fc, x)
+        arr = new_local!(fc, layout(fc, R).leaves[2].type)
+        emit!(fc.b, :local_set, arr)
+        return CGVal(R, Inline, LeafVal[only(x.leaves), arr, Inst(:i32_const, 0)])
     end
     R = x.typ
     is_memoryref_type(R) || unsupported("memoryrefnew of ", R)
@@ -60,7 +82,7 @@ function emit_memoryrefnew!(fc::FnCtx, args::Vector{Any})
     ml = memory_layout(fc.cgm.types, ref_eltype(R))
     # the new index: ref.index + i - 1, as an i64 to check it
     idx = new_local!(fc, I64)
-    push_leaf!(fc, x.leaves[2])
+    push_leaf!(fc, x.leaves[3])
     emit!(fc.b, :i64_extend_i32_u)
     push_val!(fc, i)
     emit!(fc.b, :i64_add)
@@ -70,7 +92,7 @@ function emit_memoryrefnew!(fc::FnCtx, args::Vector{Any})
     if !(isconstant(bc) && constant_value(bc) === false)
         # 0 <= idx < length (unsigned compare covers both)
         emit!(fc.b, :local_get, idx)
-        push_leaf!(fc, x.leaves[1])
+        push_leaf!(fc, x.leaves[2])
         emit_memory_length!(fc, ml)
         emit!(fc.b, :i64_extend_i32_u)
         emit!(fc.b, :i64_ge_u)
@@ -86,13 +108,13 @@ function emit_memoryrefnew!(fc::FnCtx, args::Vector{Any})
     emit!(fc.b, :local_get, idx)
     emit!(fc.b, :i32_wrap_i64)
     emit!(fc.b, :local_set, i32)
-    return CGVal(R, Inline, LeafVal[x.leaves[1], i32])
+    return CGVal(R, Inline, LeafVal[x.leaves[1], x.leaves[2], i32])
 end
 
 # push the array and the index of the first array element of the referenced element
 function push_element_address!(fc::FnCtx, r::CGVal, ml::MemoryLayout, k::Int=0)
-    push_leaf!(fc, r.leaves[1])
     push_leaf!(fc, r.leaves[2])
+    push_leaf!(fc, r.leaves[3])
     if ml.stride != 1
         emit!(fc.b, :i32_const, ml.stride)
         emit!(fc.b, :i32_mul)
@@ -128,6 +150,7 @@ function emit_memoryrefget!(fc::FnCtx, r::CGVal, bc, @nospecialize(typ))
     for k in 0:length(el.leaves)-1
         push_element_address!(fc, r, ml, k)
         emit!(fc.b, array_get_op(ml.storage), ml.array)
+        ml.widened && narrow_leaf!(fc, el.leaves[k+1].type)
     end
     v = pop_val!(fc, E)
     if el.kind === Boxed
@@ -163,9 +186,33 @@ function emit_memoryrefset!(fc::FnCtx, r::CGVal, v::CGVal, bc)
     for (k, leaf) in enumerate(v.leaves)
         push_element_address!(fc, r, ml, k - 1)
         push_leaf!(fc, leaf)
+        ml.widened && widen_leaf!(fc, el.leaves[k].type)
         emit!(fc.b, :array_set, ml.array)
     end
     return v
+end
+
+# a leaf of type `t` on the stack, to its widened (i64) storage and back
+function widen_leaf!(fc::FnCtx, t::ValType)
+    if t === I32
+        emit!(fc.b, :i64_extend_i32_u)
+    elseif t === F32
+        emit!(fc.b, :i32_reinterpret_f32)
+        emit!(fc.b, :i64_extend_i32_u)
+    elseif t === F64
+        emit!(fc.b, :i64_reinterpret_f64)
+    end
+end
+
+function narrow_leaf!(fc::FnCtx, t::ValType)
+    if t === I32
+        emit!(fc.b, :i32_wrap_i64)
+    elseif t === F32
+        emit!(fc.b, :i32_wrap_i64)
+        emit!(fc.b, :f32_reinterpret_i32)
+    elseif t === F64
+        emit!(fc.b, :f64_reinterpret_i64)
+    end
 end
 
 function emit_memoryref_isassigned!(fc::FnCtx, r::CGVal, bc)

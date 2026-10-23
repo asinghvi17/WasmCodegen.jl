@@ -40,7 +40,10 @@ mutable struct Layout
     leaves::Vector{Leaf}
     fields::Vector{UnitRange{Int}}
     wtype::Union{Nothing,TypeRef}
+    "For a large homogeneous tuple (an object holding an array): how its elements are stored."
+    elements::Any
 end
+Layout(T, kind, leaves, fields, wtype) = Layout(T, kind, leaves, fields, wtype, nothing)
 
 "The maximum number of leaves of an inline type; larger immutable types are boxed."
 const MAX_INLINE_LEAVES = 64
@@ -128,6 +131,41 @@ function ghost_value(@nospecialize T)
     return nothing
 end
 
+"""
+    tuple_array_layout(ts, T, E) -> Layout
+
+The layout of tuples of type `T` as objects holding an array of their elements (stored
+as those of a `Memory{E}`): large tuples of one element type, and tuples whose length is
+not known at compile time (`Tuple{Vararg{E}}`).
+"""
+function tuple_array_layout(ts::Types, @nospecialize(T), @nospecialize(E))
+    ml = memory_layout(ts, E)
+    wtype = get!(ts.boxes, (:tuplearray, ml.array)) do
+        add_type!(ts.mod, StructType([FieldType(I32, false), FieldType(I32, true),
+                                       FieldType(RefType(ml.array, true), false)]);
+                  final=true, super=ts.jlvalue)
+    end
+    l = boxed_layout(ts, T, wtype)
+    l.elements = ml
+    return l
+end
+
+"Whether `T` is a tuple type whose length is not known (`Tuple{A, Vararg{B}}`)."
+is_vararg_tuple(@nospecialize T) = T isa DataType && T.name === Tuple.name && Base.isvatuple(T)
+
+"The type of the elements of a vararg tuple type: their join."
+function vararg_eltype(@nospecialize T)
+    E = Union{}
+    for P in T.parameters
+        P isa Core.TypeofVararg && (P = isdefined(P, :T) ? P.T : Any)
+        E = typejoin(E, P)
+    end
+    return E
+end
+
+is_homogeneous_tuple(@nospecialize T) = T isa DataType && T <: Tuple && isconcretetype(T) &&
+    fieldcount(T) > 0 && all(i -> fieldtype(T, i) === fieldtype(T, 1), 1:fieldcount(T))
+
 function is_inline_tuple(@nospecialize T)
     (T isa DataType && T.name === Tuple.name && !isconcretetype(T) && !Base.isvatuple(T)) ||
         return false
@@ -187,6 +225,7 @@ function compute_layout(ts::Types, @nospecialize(T))
     # a tuple with singleton `Type{X}` elements (varargs packed by the IR) is not a
     # concrete type, but its values are inline all the same
     is_inline_tuple(T) && return immutable_layout(ts, T)
+    is_vararg_tuple(T) && return tuple_array_layout(ts, T, vararg_eltype(T))
     if !(T isa DataType) || !isconcretetype(T) || any(R -> T === R, RUNTIME_TYPES)
         # abstract types, unions, type objects: any object
         return Layout(T, Boxed, [Leaf(jlvalue_ref(ts))], UnitRange{Int}[], ts.jlvalue)
@@ -194,15 +233,15 @@ function compute_layout(ts::Types, @nospecialize(T))
     if isprimitivetype(T)
         return Layout(T, Inline, primitive_leaves(T), UnitRange{Int}[], nothing)
     elseif is_memory_type(T)
-        return boxed_layout(ts, T, memory_array_type!(ts, memory_eltype(T)))
-    elseif T === String
-        return boxed_layout(ts, T, array_type!(ts, I8))
-    elseif T === Symbol
-        return boxed_layout(ts, T, symbol_type!(ts))
+        return boxed_layout(ts, T, memory_struct_type!(ts, memory_eltype(T)))
+    elseif T === String || T === Symbol
+        return boxed_layout(ts, T, bytes_object_type!(ts, T))
     elseif is_memoryref_type(T)
-        # the array and the index of the element (0-based)
+        # the Memory object, its array, and the index of the element (0-based)
+        mem = memory_struct_type!(ts, memory_eltype(T))
         arr = memory_array_type!(ts, memory_eltype(T))
-        return Layout(T, Inline, [Leaf(RefType(arr, true)), Leaf(I32)], UnitRange{Int}[], nothing)
+        return Layout(T, Inline, [Leaf(RefType(mem, true)), Leaf(RefType(arr, true)), Leaf(I32)],
+                      UnitRange{Int}[], nothing)
     elseif ismutabletype(T)
         return mutable_struct_layout(ts, T)
     else
@@ -238,6 +277,11 @@ end
 
 function immutable_layout(ts::Types, @nospecialize(T))
     leaves, ranges = struct_field_ranges(ts, T, 0)
+    if length(leaves) > MAX_INLINE_LEAVES && is_homogeneous_tuple(T)
+        # a large tuple of one element type: an immutable object holding an array, which
+        # (unlike a struct) can be indexed at run time
+        return tuple_array_layout(ts, T, fieldtype(T, 1))
+    end
     if length(leaves) > MAX_INLINE_LEAVES
         # a large immutable value: an immutable object
         l = boxed_layout(ts, T, box_type!(ts, T, leaves))
@@ -285,9 +329,11 @@ end
 """
     MemoryLayout
 
-How the elements of a `Memory{T}` are stored: in an array of `storage`, `stride` array
-elements per Julia element (the leaves of an inline element whose leaves are stored
-alike), or `boxed` (a reference per element to a box of an inline element).
+How the elements of a `Memory{T}` are stored in its array: as `storage`, `stride` array
+elements per Julia element. Inline elements whose leaves are stored alike are stored as
+their leaves (as Julia lays them out); other isbits elements have their leaves `widened`
+to `i64`s (so that elements never are undefined); other inline elements are `boxed` (a
+reference per element to a box).
 """
 struct MemoryLayout
     elem::Layout
@@ -295,25 +341,26 @@ struct MemoryLayout
     storage::StorageType
     stride::Int
     boxed::Bool
+    widened::Bool
 end
 
 function memory_layout(ts::Types, @nospecialize(E))
     el = layout(ts, E)
     if el.kind === Ghost || el.kind === Bottom
-        return MemoryLayout(el, array_type!(ts, I8), I8, 1, false)
+        return MemoryLayout(el, array_type!(ts, I8), I8, 1, false, false)
     end
     leaves = el.leaves
-    s = leaves[1].storage
-    if el.kind === Boxed
-        return MemoryLayout(el, array_type!(ts, nullable_storage(s)), nullable_storage(s), 1, false)
+    s = nullable_storage(leaves[1].storage)
+    el.kind === Boxed && return MemoryLayout(el, array_type!(ts, s), s, 1, false, false)
+    if all(l -> nullable_storage(l.storage) == s, leaves)
+        return MemoryLayout(el, array_type!(ts, s), s, length(leaves), false, false)
     end
-    if all(l -> l.storage == s, leaves)
-        st = nullable_storage(s)
-        return MemoryLayout(el, array_type!(ts, st), st, length(leaves), false)
+    if all(l -> l.type isa NumType, leaves)
+        return MemoryLayout(el, array_type!(ts, I64), I64, length(leaves), false, true)
     end
     box = box_type!(ts, E)
     st = RefType(box, true)
-    return MemoryLayout(el, array_type!(ts, st), st, 1, true)
+    return MemoryLayout(el, array_type!(ts, st), st, 1, true, false)
 end
 
 memory_array_type!(ts::Types, @nospecialize(E)) = memory_layout(ts, E).array
@@ -324,10 +371,10 @@ memory_array_type!(ts::Types, @nospecialize(E)) = memory_layout(ts, E).array
     box_type!(ts, T) -> TypeRef
 
 The Wasm struct type of boxes of values of the inline (or ghost) type `T`: the header
-and its leaves, immutable. For `Memory` and `String`, the box holds the array.
+and its leaves, immutable.
 """
 function box_type!(ts::Types, @nospecialize(T), leaves::Vector{Leaf}=Leaf[])
-    get!(ts.boxes, T) do
+    get!(ts.boxes, (:box, T)) do
         if isempty(leaves)
             l = layout(ts, T)
             leaves = l.kind === Ghost ? Leaf[] : l.leaves
@@ -340,9 +387,28 @@ function box_type!(ts::Types, @nospecialize(T), leaves::Vector{Leaf}=Leaf[])
     end
 end
 
-"The Wasm struct type of `Symbol`s: the header and the name (bytes)."
-function symbol_type!(ts::Types)
-    get!(ts.boxes, Symbol) do
+"""
+    memory_struct_type!(ts, E) -> TypeRef
+
+The Wasm struct type of `Memory{E}` objects: the header and the array of the elements.
+"""
+function memory_struct_type!(ts::Types, @nospecialize(E))
+    get!(ts.boxes, (:memory, memory_array_type!(ts, E))) do
+        arr = memory_array_type!(ts, E)
+        add_type!(ts.mod, StructType([FieldType(I32, false), FieldType(I32, true),
+                                       FieldType(RefType(arr, true), false)]);
+                  final=true, super=ts.jlvalue)
+    end
+end
+
+"""
+    bytes_object_type!(ts, T) -> TypeRef
+
+The Wasm struct type of `String`s or `Symbol`s: the header and the bytes (the array type
+of `Memory{UInt8}`, which the conversions between strings and memory share).
+"""
+function bytes_object_type!(ts::Types, @nospecialize(T))
+    get!(ts.boxes, T) do
         bytes = array_type!(ts, I8)
         add_type!(ts.mod, StructType([FieldType(I32, false), FieldType(I32, true),
                                        FieldType(RefType(bytes, true), false)]);
@@ -350,8 +416,26 @@ function symbol_type!(ts::Types)
     end
 end
 
-"Whether the objects of the boxed type `T` are `\$JlValue`s (as opposed to Wasm arrays)."
-is_jlvalue_type(ts::Types, @nospecialize(T)) = !(is_memory_type(T) || T === String)
+"""
+    type_object_type!(ts) -> TypeRef
+
+The Wasm struct type of type objects (`DataType`s, `UnionAll`s, `Union`s used as values):
+the header and the id of the type they are (each type object is one global, so `===` is
+reference equality).
+"""
+function type_object_type!(ts::Types)
+    get!(ts.boxes, :typeobject) do
+        add_type!(ts.mod, StructType([FieldType(I32, false), FieldType(I32, true),
+                                       FieldType(I32, false)]);
+                  final=true, super=ts.jlvalue)
+    end
+end
+
+"The field of the array of the objects of `Memory`, `String` and `Symbol`."
+const DATA_FIELD = HEADER_FIELDS
+
+"Whether the objects of the boxed type `T` are `\$JlValue`s (they all are)."
+is_jlvalue_type(ts::Types, @nospecialize(T)) = true
 
 """
     valtypes(ts, T) -> Vector{ValType}

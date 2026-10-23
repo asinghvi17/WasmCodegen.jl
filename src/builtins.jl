@@ -27,6 +27,7 @@ function emit_new!(fc::FnCtx, @nospecialize(T), args::Vector{CGVal})
         return CGVal(T, Inline, leaves)
     end
     is_memory_type(T) && unsupported("`new` of ", T)
+    l.elements !== nothing && return new_tuple_array!(fc, T, args)
     # an object: the header, then the fields
     ts = fc.cgm.types
     emit!(fc.b, :i32_const, typeid!(ts, T))
@@ -53,6 +54,8 @@ end
 The tuple of type `T` (concrete or not) of the values `vals`.
 """
 function make_tuple(fc::FnCtx, @nospecialize(T), vals::Vector{CGVal})
+    l = layout(fc, T)
+    l.kind === Boxed && l.elements !== nothing && return new_tuple_array!(fc, T, vals)
     if !isconcretetype(T) && !is_inline_tuple(T)
         # the concrete tuple type of the values
         T = Tuple{(v.typ for v in vals)...}
@@ -96,11 +99,13 @@ function get_field(fc::FnCtx, x::CGVal, i::Int)
     if l.kind === Inline
         if is_memoryref_type(T)
             i == 2 && return CGVal(FT, Boxed, LeafVal[x.leaves[1]])
-            unsupported("the pointer of a MemoryRef")
+            return memoryref_ptr!(fc, x)
         end
         fl = layout(fc, FT)
         fl.kind === Ghost && return ghost(FT, something(ghost_value(FT)))
         return CGVal(FT, fl.kind, x.leaves[l.fields[i]])
+    elseif l.kind === Boxed && l.elements !== nothing
+        return tuple_array_get!(fc, x, const_value(fc, i))
     elseif l.kind === Boxed && !isempty(l.fields)
         fl = layout(fc, FT)
         fl.kind === Ghost && return ghost(FT, something(ghost_value(FT)))
@@ -113,9 +118,13 @@ function get_field(fc::FnCtx, x::CGVal, i::Int)
         return pop_val!(fc, FT)
     elseif is_memory_type(T)
         name = fieldname(T, i)
+        if name === :ptr
+            push_memory_base!(fc, x)
+            return pop_val!(fc, FT)
+        end
         name === :length || unsupported("the field ", name, " of ", T)
         ml = memory_layout(fc.cgm.types, memory_eltype(T))
-        push_val!(fc, x)
+        push_memory_array!(fc, x)
         emit!(fc.b, :array_len)
         if ml.stride != 1
             emit!(fc.b, :i32_const, ml.stride)
@@ -213,6 +222,14 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
     elseif f === Core.nfields
         x = args[1]::CGVal
         isconcretetype(x.typ) && return const_value(fc, fieldcount(x.typ))
+        lx = layout(fc, x.typ)
+        if lx.kind === Boxed && lx.elements !== nothing
+            push_val!(fc, x)
+            emit!(fc.b, :struct_get, lx.wtype, DATA_FIELD)
+            emit_memory_length!(fc, lx.elements)
+            emit!(fc.b, :i64_extend_i32_u)
+            return pop_val!(fc, Int)
+        end
         unsupported("nfields of a value of abstract type ", x.typ)
     elseif f === Core.sizeof
         x = args[1]::CGVal
@@ -242,13 +259,15 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
         return emit_memoryref_isassigned!(fc, args[1], args[3])
     elseif f === Core.memoryrefoffset
         r = args[1]::CGVal
-        push_leaf!(fc, r.leaves[2])
+        push_leaf!(fc, r.leaves[3])
         emit!(fc.b, :i32_const, 1)
         emit!(fc.b, :i32_add)
         emit!(fc.b, :i64_extend_i32_u)
         return pop_val!(fc, Int)
     elseif isdefined(Core, :memorynew) && f === getfield(Core, :memorynew)
         return emit_memorynew!(fc, constant_value(args[1]), args[2])
+    elseif f === Core._apply_iterate
+        return emit_apply_iterate!(fc, args, typ)
     elseif f === Core.apply_type
         all(a -> a isa CGVal && isconstant(a), args) &&
             return const_value(fc, Core.apply_type(map(constant_value, args)...))
@@ -278,17 +297,31 @@ end
 """
     get_field_dynamic(fc, x, i, typ) -> CGVal
 
-The field of the tuple `x` at the run-time index `i` (1-based): a select among the
-fields.
+The field of the tuple `x` at the run-time index `i` (1-based; Julia checks it): an
+element of the array of a large tuple; for an inline tuple of one element type, an
+element of a temporary array of its elements; otherwise a chain of tests of the index.
 """
 function get_field_dynamic(fc::FnCtx, x::CGVal, i::CGVal, @nospecialize(typ))
     T = x.typ
-    (T isa DataType && T <: Tuple && layout(fc, T).kind === Inline) ||
+    l = layout(fc, T)
+    l.kind === Boxed && l.elements !== nothing && return tuple_array_get!(fc, x, i)
+    (T isa DataType && T <: Tuple && l.kind === Inline) ||
         unsupported("a field of ", T, " at an index not known at compile time")
     n = fieldcount(T)
-    res = new_val!(fc, typ)
     idx = convert_repr(fc, i, Int)
-    # a chain of ifs on the index, the last field otherwise (indices are checked by Julia)
+    if is_homogeneous_tuple(T) && n > 4
+        E = fieldtype(T, 1)
+        ml = memory_layout(fc.cgm.types, E)
+        if !ml.boxed && !ml.widened && layout(fc, E).kind !== Ghost
+            push_val!(fc, x)
+            emit!(fc.b, :array_new_fixed, ml.array, length(x.leaves))
+            arr = new_local!(fc, RefType(ml.array, true))
+            emit!(fc.b, :local_set, arr)
+            return array_element_get!(fc, arr, ml, idx)
+        end
+    end
+    res = new_val!(fc, typ)
+    # a chain of ifs on the index, the last field otherwise
     for k in 1:n
         if k < n
             push_val!(fc, idx)
@@ -303,6 +336,72 @@ function get_field_dynamic(fc::FnCtx, x::CGVal, i::CGVal, @nospecialize(typ))
         end!(fc.b); close_label!(fc)
     end
     return res
+end
+
+# the element at the (1-based, Int) index `idx` of the array in local `arr`, stored as `ml`
+function array_element_get!(fc::FnCtx, arr::Int, ml::MemoryLayout, idx::CGVal)
+    E = ml.elem.T
+    pos = new_local!(fc, I32)
+    push_val!(fc, idx)
+    emit!(fc.b, :i32_wrap_i64)
+    emit!(fc.b, :i32_const, 1)
+    emit!(fc.b, :i32_sub)
+    if ml.stride != 1
+        emit!(fc.b, :i32_const, ml.stride)
+        emit!(fc.b, :i32_mul)
+    end
+    emit!(fc.b, :local_set, pos)
+    for k in 0:ml.stride-1
+        emit!(fc.b, :local_get, arr)
+        emit!(fc.b, :local_get, pos)
+        if k != 0
+            emit!(fc.b, :i32_const, k)
+            emit!(fc.b, :i32_add)
+        end
+        emit!(fc.b, array_get_op(ml.storage), ml.array)
+        ml.widened && narrow_leaf!(fc, ml.elem.leaves[k+1].type)
+    end
+    if ml.boxed
+        box = pop_val!(fc, Any)
+        return unbox!(fc, box, E)
+    end
+    return pop_val!(fc, E)
+end
+
+"The element `i` (a value of type Int) of the large tuple `x`."
+function tuple_array_get!(fc::FnCtx, x::CGVal, i::CGVal)
+    l = layout(fc, x.typ)
+    ml = l.elements::MemoryLayout
+    push_val!(fc, x)
+    emit!(fc.b, :struct_get, l.wtype, DATA_FIELD)
+    arr = new_local!(fc, RefType(ml.array, true))
+    emit!(fc.b, :local_set, arr)
+    return array_element_get!(fc, arr, ml, convert_repr(fc, i, Int))
+end
+
+"A large tuple of type `T` of the elements `args`."
+function new_tuple_array!(fc::FnCtx, @nospecialize(T), args::Vector{CGVal})
+    l = layout(fc, T)
+    ml = l.elements::MemoryLayout
+    E = ml.elem.T
+    ts = fc.cgm.types
+    emit!(fc.b, :i32_const, typeid!(ts, T))
+    emit!(fc.b, :i32_const, 0)
+    for a in args
+        v = convert_repr(fc, a, E)
+        if ml.boxed
+            push_val!(fc, box!(fc, v, Any))
+            emit!(fc.b, :ref_cast_null, box_type!(ts, E))
+        else
+            for (k, leaf) in enumerate(v.leaves)
+                push_leaf!(fc, leaf)
+                ml.widened && widen_leaf!(fc, ml.elem.leaves[k].type)
+            end
+        end
+    end
+    emit!(fc.b, :array_new_fixed, ml.array, length(args) * ml.stride)
+    emit!(fc.b, :struct_new, l.wtype)
+    return pop_val!(fc, T)
 end
 
 ## identity
@@ -411,9 +510,19 @@ function emit_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
     S <: T && return const_value(fc, true)
     typeintersect(S, T) === Union{} && return const_value(fc, false)
     lx = layout(fc, S)
+    ts = fc.cgm.types
+    if lx.kind === Boxed && lx.elements !== nothing && T isa DataType && T <: Tuple &&
+       !Base.isvatuple(T) && all(i -> eltype_intersects(lx.elements.elem.T, fieldtype(T, i)) && lx.elements.elem.T <: fieldtype(T, i), 1:fieldcount(T))
+        # a tuple of unknown length: its length
+        push_val!(fc, x)
+        emit!(fc.b, :struct_get, lx.wtype, DATA_FIELD)
+        emit_memory_length!(fc, lx.elements)
+        emit!(fc.b, :i32_const, fieldcount(T))
+        emit!(fc.b, :i32_eq)
+        return pop_val!(fc, Bool)
+    end
     (lx.kind === Boxed && lx.wtype == fc.cgm.types.jlvalue) ||
         unsupported("isa(::", S, ", ", T, ")")
-    ts = fc.cgm.types
     if T isa DataType && isconcretetype(T)
         push_val!(fc, x)
         emit!(fc.b, :struct_get, ts.jlvalue, 0)
@@ -450,5 +559,85 @@ function emit_ifelse!(fc::FnCtx, c::CGVal, a::CGVal, b::CGVal, @nospecialize(typ
             emit!(fc.b, :select)
         end
     end
+    return pop_val!(fc, typ)
+end
+
+"""
+    memoryref_ptr!(fc, r) -> CGVal
+
+The `ptr_or_offset` of the MemoryRef `r`: the index for elements of zero size or unions
+(as natively), else the virtual address of the element (see `push_memory_base!`).
+"""
+function memoryref_ptr!(fc::FnCtx, r::CGVal)
+    E = ref_eltype(r.typ)
+    push_leaf!(fc, r.leaves[3])
+    emit!(fc.b, :i64_extend_i32_u)
+    if !(E isa Union || Base.aligned_sizeof(E) == 0)
+        emit!(fc.b, :i64_const, Base.aligned_sizeof(E))
+        emit!(fc.b, :i64_mul)
+        push_memory_base!(fc, CGVal(memory_type(r.typ), Boxed, LeafVal[r.leaves[1]]))
+        emit!(fc.b, :i64_add)
+    end
+    return pop_val!(fc, Ptr{Cvoid})
+end
+
+memory_type(@nospecialize(R)) = GenericMemory{R.parameters[1],R.parameters[2],R.parameters[3]}
+
+eltype_intersects(@nospecialize(A), @nospecialize(B)) = typeintersect(A, B) !== Union{}
+
+"""
+    emit_apply_iterate!(fc, args, typ) -> CGVal
+
+`Core._apply_iterate(iterate, f, xs...)`, the call of `f` with the elements of the `xs`
+(splatting). Supported for `f = Core.tuple` (building a tuple) with tuples and vectors.
+"""
+function emit_apply_iterate!(fc::FnCtx, args::Vector{Any}, @nospecialize(typ))
+    f = args[2]::CGVal
+    (isconstant(f) && constant_value(f) === Core.tuple) ||
+        unsupported("splatting into a call of ", isconstant(f) ? constant_value(f) : f.typ)
+    xs = CGVal[a for a in args[3:end]]
+    # elements known at compile time
+    if all(x -> x.typ isa DataType && x.typ <: Tuple && !Base.isvatuple(x.typ), xs)
+        elems = CGVal[]
+        for x in xs
+            append!(elems, tuple_elements(fc, x))
+        end
+        return make_tuple(fc, typ, elems)
+    end
+    # a tuple of unknown length, from one vector
+    l = layout(fc, typ)
+    (length(xs) == 1 && l.kind === Boxed && l.elements !== nothing) ||
+        unsupported("splatting ", join([x.typ for x in xs], ", "), " into a tuple")
+    v = xs[1]
+    V = v.typ
+    (V isa DataType && V <: Array && ndims(V) == 1 && eltype(V) <: l.elements.elem.T &&
+     memory_layout(fc.cgm.types, eltype(V)).array == l.elements.array) ||
+        unsupported("splatting a ", V, " into a tuple")
+    ml = l.elements::MemoryLayout
+    # copy the elements: a new array of the vector's length, from its first element
+    ref = get_field(fc, v, 1)
+    n = get_field(fc, get_field(fc, v, 2), 1)
+    arr = new_local!(fc, RefType(ml.array, true))
+    push_val!(fc, n)
+    emit!(fc.b, :i32_wrap_i64)
+    if ml.stride != 1
+        emit!(fc.b, :i32_const, ml.stride); emit!(fc.b, :i32_mul)
+    end
+    emit!(fc.b, :array_new_default, ml.array)
+    emit!(fc.b, :local_set, arr)
+    emit!(fc.b, :local_get, arr)
+    emit!(fc.b, :i32_const, 0)
+    push_element_address!(fc, ref, ml)
+    push_val!(fc, n)
+    emit!(fc.b, :i32_wrap_i64)
+    if ml.stride != 1
+        emit!(fc.b, :i32_const, ml.stride); emit!(fc.b, :i32_mul)
+    end
+    emit!(fc.b, :array_copy, ml.array, ml.array)
+    ts = fc.cgm.types
+    emit!(fc.b, :i32_const, typeid!(ts, typ))
+    emit!(fc.b, :i32_const, 0)
+    emit!(fc.b, :local_get, arr)
+    emit!(fc.b, :struct_new, l.wtype)
     return pop_val!(fc, typ)
 end

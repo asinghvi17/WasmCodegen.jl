@@ -76,17 +76,9 @@ end
 Emit the body of the function `info` from the structured IR of its method instance.
 """
 function emit_function!(cgm::CGModule, info::FuncInfo)
-    if layout(cgm, info.rettype).kind === Bottom
-        # a function that always throws: throwing traps, so its body is a trap (its error
-        # message is never built)
-        b = Builder(cgm.mod, info.func)
-        unreachable!(b)
-        finish!(b)
-        return info
-    end
     ir = prepare_ir(cgm.world, info.mi)
     sci = try
-        StructuredIRCode(ir)
+        structurize(ir)
     catch err
         err isa Unsupported && rethrow()
         unsupported("structurizing the IR: ", sprint(showerror, err))
@@ -99,6 +91,16 @@ function emit_function!(cgm::CGModule, info::FuncInfo)
     is_unreachable(b) || unreachable!(b)
     finish!(b)
     return info
+end
+
+# Julia's IR does not require the values of a phi on an edge to be of the phi's type (a
+# branch on a type test narrows them), which IRStructurizer's terminator validation
+# requires of the yields replacing phis: validate everything else.
+function structurize(ir::CC.IRCode)
+    sci = StructuredIRCode(ir; validate=false)
+    IRStructurizer.validate_scf(sci.entry)
+    IRStructurizer.validate_no_phis(sci.entry)
+    return sci
 end
 
 function bind_arguments!(fc::FnCtx)

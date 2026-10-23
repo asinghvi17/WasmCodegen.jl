@@ -33,3 +33,52 @@ function finish_types!(cgm::CGModule)
         finish!(b)
     end
 end
+
+"""
+    object_hash_func!(cgm) -> Func
+
+The function `(obj::\$JlValue) -> i32` returning the identity hash of an object, assigned
+on first use from a counter (the `hash` field of the header; 0 means unassigned).
+"""
+function object_hash_func!(cgm::CGModule)
+    get!(cgm.helpers, :object_hash) do
+        ts = cgm.types
+        counter = add_global!(cgm.mod, "jl_hash_counter", I32, true, Inst[Inst(:i32_const, 0)])
+        f = add_func!(cgm.mod, "jl_object_hash", ValType[jlvalue_ref(ts)], ValType[I32])
+        b = Builder(cgm.mod, f)
+        emit!(b, :local_get, 0)
+        emit!(b, :struct_get, ts.jlvalue, 1)
+        emit!(b, :i32_eqz)
+        if!(b)
+        emit!(b, :local_get, 0)
+        emit!(b, :global_get, counter)
+        emit!(b, :i32_const, 1)
+        emit!(b, :i32_add)
+        emit!(b, :global_set, counter)
+        emit!(b, :global_get, counter)
+        emit!(b, :struct_set, ts.jlvalue, 1)
+        end!(b)
+        emit!(b, :local_get, 0)
+        emit!(b, :struct_get, ts.jlvalue, 1)
+        finish!(b)
+        f
+    end
+end
+
+"Push the identity hash (an i32) of the object `x`."
+function push_object_hash!(fc::FnCtx, x::CGVal)
+    push_val!(fc, x)
+    call!(fc.b, object_hash_func!(fc.cgm))
+end
+
+"""
+Memory has no address on Wasm: each Memory object gets a virtual range of addresses, from
+its identity hash shifted by 32 bits, so that the pointer comparisons Base makes (alias
+checks, `dataids`) work. Pointers cannot be dereferenced.
+"""
+function push_memory_base!(fc::FnCtx, mem::CGVal)
+    push_object_hash!(fc, mem)
+    emit!(fc.b, :i64_extend_i32_u)
+    emit!(fc.b, :i64_const, 32)
+    emit!(fc.b, :i64_shl)
+end

@@ -57,6 +57,11 @@ const FLOAT_BINOPS = Dict(II.add_float => "add", II.sub_float => "sub",
                           II.add_float_fast => "add", II.sub_float_fast => "sub",
                           II.mul_float_fast => "mul", II.div_float_fast => "div",
                           II.copysign_float => "copysign")
+# IEEE minimum/maximum (NaN if either is, -0.0 < 0.0): Wasm's min/max
+if isdefined(II, :min_float)
+    FLOAT_BINOPS[II.min_float] = "min"
+    FLOAT_BINOPS[II.max_float] = "max"
+end
 const FLOAT_CMPS = Dict(II.eq_float => "eq", II.ne_float => "ne", II.lt_float => "lt",
                         II.le_float => "le", II.eq_float_fast => "eq",
                         II.ne_float_fast => "ne", II.lt_float_fast => "lt",

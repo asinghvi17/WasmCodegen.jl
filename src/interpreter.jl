@@ -9,6 +9,43 @@ compiled to Wasm (pointer arithmetic, calls into the C runtime). See `overlays.j
 """
 Base.Experimental.@MethodTable WASM_MT
 
+"The owner of the CodeInstances inferred for Wasm in Julia's code cache."
+struct WasmCacheOwner end
+
+"""
+    CodegenSources
+
+The optimized sources of CodeInstances that `CC.compile!` reads (`interp.codegen`): those
+stashed by inference, and, for CodeInstances of the Wasm cache inferred by an earlier
+interpreter, their cached source, uncompressed on demand. (For an owner other than
+native code, `CC.ci_has_source` accepts a cached CodeInstance by its `inferred` field
+without putting its source here, which `CC.compile!` requires.)
+"""
+struct CodegenSources <: AbstractDict{Core.CodeInstance,Core.CodeInfo}
+    dict::IdDict{Core.CodeInstance,Core.CodeInfo}
+end
+CodegenSources() = CodegenSources(IdDict{Core.CodeInstance,Core.CodeInfo}())
+
+function cached_source(d::CodegenSources, ci::Core.CodeInstance)
+    src = get(d.dict, ci, nothing)
+    src === nothing || return src
+    ci.owner === WasmCacheOwner() || return nothing
+    inf = @atomic :monotonic ci.inferred
+    inf isa String && (inf = CC._uncompressed_ir(ci, inf))
+    inf isa Core.CodeInfo || return nothing
+    d.dict[ci] = inf
+    return inf
+end
+
+Base.get(d::CodegenSources, ci::Core.CodeInstance, default) =
+    something(cached_source(d, ci), Some(default))
+Base.haskey(d::CodegenSources, ci::Core.CodeInstance) = cached_source(d, ci) !== nothing
+Base.getindex(d::CodegenSources, ci::Core.CodeInstance) =
+    something(cached_source(d, ci), Some(nothing))::Core.CodeInfo
+Base.setindex!(d::CodegenSources, src::Core.CodeInfo, ci::Core.CodeInstance) = (d.dict[ci] = src; d)
+Base.length(d::CodegenSources) = length(d.dict)
+Base.iterate(d::CodegenSources, s...) = iterate(d.dict, s...)
+
 """
     WasmInterpreter(; world, method_table=WASM_MT)
 
@@ -24,7 +61,7 @@ struct WasmInterpreter <: CC.AbstractInterpreter
     inf_params::CC.InferenceParams
     opt_params::CC.OptimizationParams
     "The uncompressed source of the CodeInstances inferred, for `CC.compile!`."
-    codegen::IdDict{Core.CodeInstance,Core.CodeInfo}
+    codegen::CodegenSources
 end
 
 function WasmInterpreter(; world::UInt=Base.get_world_counter(),
@@ -33,10 +70,8 @@ function WasmInterpreter(; world::UInt=Base.get_world_counter(),
     inf_params = CC.InferenceParams(; force_enable_inference=true)
     opt_params = CC.OptimizationParams()
     return WasmInterpreter(world, mt, CC.InferenceResult[], inf_params, opt_params,
-                           IdDict{Core.CodeInstance,Core.CodeInfo}())
+                           CodegenSources())
 end
-
-struct WasmCacheOwner end
 
 CC.InferenceParams(interp::WasmInterpreter) = interp.inf_params
 CC.OptimizationParams(interp::WasmInterpreter) = interp.opt_params

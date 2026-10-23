@@ -24,16 +24,19 @@ mutable struct Image
     inprogress::IdSet{Any}
     "Instructions of the start function: stores of the references of cycles, array fills."
     init::Vector{Inst}
-    "The objects whose global is being built, with the stores to make once it exists."
-    pending::IdDict{Any,Vector{Any}}
+    "References to set by the start function, once every global exists: (global of the
+    object, Wasm type, field or element index, value, declared type)."
+    patches::Vector{Any}
     "Global variables: (module, name) => the globals of the leaves of its value."
     vars::Dict{Tuple{Module,Symbol},Tuple{Any,Vector{Global}}}
+    "The globals of the arrays of `Memory`, `String` and `Symbol` objects."
+    arrays::IdDict{Any,Global}
     counter::Int
 end
 
 Image(cgm) = Image(cgm, IdDict{Any,Global}(), IdDict{Any,Global}(), IdDict{Any,Global}(),
-                   IdSet{Any}(), Inst[], IdDict{Any,Vector{Any}}(),
-                   Dict{Tuple{Module,Symbol},Tuple{Any,Vector{Global}}}(), 0)
+                   IdSet{Any}(), Inst[], Any[],
+                   Dict{Tuple{Module,Symbol},Tuple{Any,Vector{Global}}}(), IdDict{Any,Global}(), 0)
 
 types(img::Image) = img.cgm.types
 
@@ -105,7 +108,12 @@ function const_leaves(img::Image, @nospecialize(x), @nospecialize(FT))
     if lf.kind === Inline
         T = typeof(x)
         isprimitivetype(T) && return primitive_const(x, lf.leaves)
-        is_memoryref_type(T) && unsupported("a constant MemoryRef")
+        if is_memoryref_type(T)
+            mem = x.mem
+            g = object_global!(img, mem)
+            return Inst[Inst(:global_get, g), Inst(:global_get, img.arrays[mem]),
+                        Inst(:i32_const, Int32(Base.memoryrefoffset(x) - 1))]
+        end
         leaves = Inst[]
         for i in 1:fieldcount(T)
             FTi = fieldtype(T, i)
@@ -145,11 +153,7 @@ function boxed_object_global!(img::Image, @nospecialize(x))
     get!(img.boxes, x) do
         box = box_type!(ts, T)
         init = Inst[Inst(:i32_const, typeid!(ts, T)), Inst(:i32_const, 0)]
-        if l.kind === Inline
-            append!(init, const_leaves(img, x, T))
-        else
-            push!(init, Inst(:global_get, object_global!(img, x)))
-        end
+        append!(init, const_leaves(img, x, T))
         push!(init, Inst(:struct_new, box))
         add_global!(img.cgm.mod, global_name(img, x), RefType(box, false), false, init)
     end
@@ -180,39 +184,83 @@ to) on first use.
 function object_global!(img::Image, @nospecialize(x))
     g = get(img.globals, x, nothing)
     g === nothing || return g
+    x in img.inprogress && unsupported("serializing a cycle of objects through ", typeof(x))
     ts = types(img)
     T = typeof(x)
     l = layout(ts, T)
     l.kind === Boxed || unsupported("an object of the inline type ", T)
-    if T === String
-        return array_global!(img, x, codeunits(x), UInt8)
+    if T === String || T === Symbol
+        return bytes_object_global!(img, x)
     elseif is_memory_type(T)
         return memory_global!(img, x)
-    elseif T === Symbol
-        g = object_global_symbol!(img, x)
-    elseif any(R -> T === R, RUNTIME_TYPES) || T isa DataType && T <: Type
+    elseif x isa Type
+        return type_object_global!(img, x)
+    elseif any(R -> T === R, RUNTIME_TYPES)
         unsupported("serializing the runtime object ", x, " of type ", T)
     elseif T <: Ptr || T === Ptr
         unsupported("serializing a pointer")
+    elseif l.elements !== nothing
+        g = tuple_array_global!(img, x, l)
     else
         g = struct_global!(img, x, l)
     end
     return g
 end
 
-function object_global_symbol!(img::Image, s::Symbol)
+# a large tuple: its elements in an array (as a Memory's), in an object
+function tuple_array_global!(img::Image, @nospecialize(x), l::Layout)
     ts = types(img)
-    bytes = Vector{UInt8}(codeunits(String(s)))
-    arr = array_type!(ts, I8)
-    init = Inst[Inst(:i32_const, typeid!(ts, Symbol)), Inst(:i32_const, 0)]
-    for b in bytes
-        push!(init, Inst(:i32_const, Int32(b)))
+    T = typeof(x)
+    mem = Memory{fieldtype(T, 1)}(undef, fieldcount(T))
+    for i in 1:fieldcount(T)
+        mem[i] = x[i]
     end
-    push!(init, Inst(:array_new_fixed, arr, length(bytes)))
-    push!(init, Inst(:struct_new, symbol_type!(ts)))
-    g = add_global!(img.cgm.mod, "jl_sym_" * replace(String(s), r"[^A-Za-z0-9_]" => "_"),
-                    RefType(symbol_type!(ts), false), false, init)
-    img.globals[s] = g
+    memory_global!(img, mem)
+    arr = img.arrays[mem]
+    init = Inst[Inst(:i32_const, typeid!(ts, T)), Inst(:i32_const, 0), Inst(:global_get, arr),
+                Inst(:struct_new, l.wtype)]
+    g = add_global!(img.cgm.mod, global_name(img, x), RefType(l.wtype, false), false, init)
+    img.globals[x] = g
+    return g
+end
+
+# a type object: its header and the id of the type it is
+function type_object_global!(img::Image, @nospecialize(x::Type))
+    ts = types(img)
+    st = type_object_type!(ts)
+    init = Inst[Inst(:i32_const, typeid!(ts, typeof(x))), Inst(:i32_const, 0),
+                Inst(:i32_const, typeid!(ts, x)), Inst(:struct_new, st)]
+    name = "jl_type_" * replace(string(x), r"[^A-Za-z0-9_]" => "_")
+    g = add_global!(img.cgm.mod, name, RefType(st, false), false, init)
+    img.globals[x] = g
+    return g
+end
+
+# a String or Symbol: its bytes, in an object
+function bytes_object_global!(img::Image, @nospecialize(x))
+    ts = types(img)
+    T = typeof(x)
+    bytes = Vector{UInt8}(codeunits(x isa Symbol ? String(x) : x))
+    arr = array_global!(img, bytes, bytes, UInt8)
+    img.arrays[x] = arr
+    init = Inst[Inst(:i32_const, typeid!(ts, T)), Inst(:i32_const, 0), Inst(:global_get, arr),
+                Inst(:struct_new, bytes_object_type!(ts, T))]
+    name = x isa Symbol ? "jl_sym_" * replace(String(x), r"[^A-Za-z0-9_]" => "_") : global_name(img, x)
+    g = add_global!(img.cgm.mod, name, RefType(bytes_object_type!(ts, T), false), false, init)
+    img.globals[x] = g
+    return g
+end
+
+# the object of a Memory whose array is the global `arr`
+function memory_object_global!(img::Image, mem, arr::Global)
+    ts = types(img)
+    T = typeof(mem)
+    img.arrays[mem] = arr
+    st = memory_struct_type!(ts, memory_eltype(T))
+    init = Inst[Inst(:i32_const, typeid!(ts, T)), Inst(:i32_const, 0), Inst(:global_get, arr),
+                Inst(:struct_new, st)]
+    g = add_global!(img.cgm.mod, global_name(img, mem), RefType(st, false), false, init)
+    img.globals[mem] = g
     return g
 end
 
@@ -256,10 +304,7 @@ function struct_global!(img::Image, @nospecialize(x), l::Layout)
     if !isempty(back)
         ismutabletype(T) || unsupported("a cycle of objects through the immutable ", T)
         for (wfield, v, FT) in back
-            # set by the start function, once every global exists
-            push!(img.init, Inst(:global_get, g))
-            append!(img.init, const_leaves(img, v, FT))
-            push!(img.init, Inst(:struct_set, l.wtype, wfield))
+            push!(img.patches, (g, :struct, l.wtype, wfield, v, FT))
         end
     end
     return g
@@ -271,11 +316,12 @@ function memory_global!(img::Image, mem)
     ml = memory_layout(types(img), E)
     el = ml.elem
     if el.kind === Ghost || el.kind === Bottom
-        return add_array_global!(img, mem, ml.array, length(mem), Inst[], true)
+        arr = add_array_global!(img, nothing, ml.array, length(mem), Inst[], true)
+        return memory_object_global!(img, mem, arr)
     end
     if el.kind === Inline && !ml.boxed && !(ml.storage isa RefType)
         # numbers: the bytes of the leaves
-        return numeric_memory_global!(img, mem, ml)
+        return memory_object_global!(img, mem, numeric_memory_global!(img, mem, ml))
     end
     # references (to objects, or boxes of inline elements)
     n = length(mem) * ml.stride
@@ -299,7 +345,8 @@ function memory_global!(img::Image, mem)
         delete!(img.inprogress, mem)
     end
     fixed = n <= MAX_FIXED_ELEMENTS
-    g = add_array_global!(img, mem, ml.array, n, fixed ? elems : Inst[], !fixed)
+    g = add_array_global!(img, nothing, ml.array, n, fixed ? elems : Inst[], !fixed)
+    obj = memory_object_global!(img, mem, g)
     if !fixed
         # set by the start function, element by element
         for (i, e) in enumerate(elems)
@@ -308,11 +355,9 @@ function memory_global!(img::Image, mem)
         end
     end
     for (i, v, FT) in back
-        push!(img.init, Inst(:global_get, g), Inst(:i32_const, i * ml.stride))
-        append!(img.init, const_leaves(img, v, FT))
-        push!(img.init, Inst(:array_set, ml.array))
+        push!(img.patches, (g, :array, ml.array, i * ml.stride, v, FT))
     end
-    return g
+    return obj
 end
 
 # a global of the array type `arr` with `n` elements: `elems` (array.new_fixed), or
@@ -324,8 +369,8 @@ function add_array_global!(img::Image, @nospecialize(x), arr::TypeRef, n::Int,
     else
         Inst[elems..., Inst(:array_new_fixed, arr, n)]
     end
-    g = add_global!(img.cgm.mod, global_name(img, x), RefType(arr, false), false, init)
-    img.globals[x] = g
+    g = add_global!(img.cgm.mod, x === nothing ? string("jl_array#", img.counter += 1) : global_name(img, x),
+                    RefType(arr, false), false, init)
     return g
 end
 
@@ -335,7 +380,7 @@ function leaf_bytes(mem, ml::MemoryLayout)
     for i in 1:length(mem)
         insts = const_leaves_bits(mem[i])
         for x in insts
-            write_storage_bytes(io, x, ml.storage)
+            write_storage_bytes(io, x, ml.storage, ml.widened)
         end
     end
     return take!(io)
@@ -352,9 +397,15 @@ function const_leaves_bits(@nospecialize(x))
     return out
 end
 
-function write_storage_bytes(io::IO, @nospecialize(x), st::StorageType)
+function write_storage_bytes(io::IO, @nospecialize(x), st::StorageType, widened::Bool=false)
     T = typeof(x)
-    if st === I8
+    if widened
+        # zero-extended bits
+        sz = sizeof(T)
+        u = sz == 8 ? Core.bitcast(UInt64, x) : sz == 4 ? UInt64(Core.bitcast(UInt32, x)) :
+            sz == 2 ? UInt64(Core.bitcast(UInt16, x)) : UInt64(Core.bitcast(UInt8, x))
+        write(io, htol(u))
+    elseif st === I8
         write(io, Core.bitcast(UInt8, x))
     elseif st === I16
         write(io, Core.bitcast(UInt16, x))
@@ -374,7 +425,12 @@ function numeric_memory_global!(img::Image, mem, ml::MemoryLayout)
         elems = Inst[]
         for i in 1:length(mem), x in const_leaves_bits(mem[i])
             st = ml.storage
-            if st === F64
+            if ml.widened
+                sz = sizeof(x)
+                u = sz == 8 ? Core.bitcast(UInt64, x) : sz == 4 ? UInt64(Core.bitcast(UInt32, x)) :
+                    sz == 2 ? UInt64(Core.bitcast(UInt16, x)) : UInt64(Core.bitcast(UInt8, x))
+                push!(elems, Inst(:i64_const, reinterpret(Int64, u)))
+            elseif st === F64
                 push!(elems, Inst(:f64_const, Float64(x)))
             elseif st === F32
                 push!(elems, Inst(:f32_const, Float32(x)))
@@ -384,9 +440,9 @@ function numeric_memory_global!(img::Image, mem, ml::MemoryLayout)
                 push!(elems, primitive_const(x, Leaf[])[1])
             end
         end
-        return add_array_global!(img, mem, ml.array, n, elems, false)
+        return add_array_global!(img, nothing, ml.array, n, elems, false)
     end
-    return data_array_global!(img, mem, ml.array, n, bytes)
+    return data_array_global!(img, nothing, ml.array, n, bytes)
 end
 
 # an array global filled by the start function from a data segment
@@ -471,6 +527,18 @@ large arrays).
 """
 function finish_image!(cgm::CGModule)
     img = cgm.image
+    for (g, kind, wtype, idx, v, FT) in img.patches
+        if kind === :struct
+            push!(img.init, Inst(:global_get, g))
+            append!(img.init, const_leaves(img, v, FT))
+            push!(img.init, Inst(:struct_set, wtype, idx))
+        else
+            push!(img.init, Inst(:global_get, g), Inst(:i32_const, idx))
+            append!(img.init, const_leaves(img, v, FT))
+            push!(img.init, Inst(:array_set, wtype))
+        end
+    end
+    empty!(img.patches)
     isempty(img.init) && return
     f = add_func!(cgm.mod, "jl_init_image", ValType[], ValType[])
     b = Builder(cgm.mod, f)
