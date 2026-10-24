@@ -73,7 +73,10 @@ intrinsic look effect-free, and it was deleted). What overlays would do is done 
   calls `Runtime.reinterpret_bits` (which the code generator compiles to a rearrangement of
   leaves) instead of copying bytes between `Ref`s. Random's bulk generator's vector
   operations (`llvmcall`s on `NTuple{N,VecElement{UInt64}}`) are the same operations on
-  each element, so its streams are the native ones;
+  each element, so its streams are the native ones. Paths are split by their bytes
+  (`splitdir`, `basename`, `splitext`, `isdirpath`: Base matches them with PCRE regular
+  expressions, a C library), checked against Base on every path of up to 7 characters
+  over `a`, `.`, `/`, `é`;
 - **lowering in the code generator** of what Base does with pointers and C calls
   (`memmove`, `memset`, `jl_genericmemory_copyto`, `jl_alloc_genericmemory`, string
   conversions), from the IR (section 5);
@@ -303,11 +306,31 @@ a check, as natively: Julia's optimizer sometimes places one where it does not h
 value forwarded with a flag saying whether it is `nothing`, read only where it is not), so
 a boxed value is converted only if it is of the narrower type. A value of a type
 where one of a type it shares no value with is expected (in code inference put after a
-test that cannot pass) is a trap, not an error.
+test that cannot pass) is a trap, not an error; so is a field a type does not have
+(`FieldError`, as natively). `typeof` of a value of a union of concrete types, and `isa`
+or `typeassert` against such a type (`x::typeof(y)`), are chains of tests of its members;
+`isdefined(x, i)` and `getfield(x, i)` of an index known only at run time, chains over
+the fields.
+
+Atomic operations on fields (`swapfield!`, `modifyfield!`, `replacefield!`,
+`setfieldonce!`) and `Threads.Atomic`'s (intrinsics, or on Julia 1.12 the `llvmcall`s of
+LLVM's atomic instructions it is written with) are the loads and stores they are: a
+program runs as one task on one thread. So locks are taken without contention; waiting
+(`wait()`, a contended lock) can only wait forever and scheduling another task has none to
+schedule, so both throw a `ConcurrencyViolationError` in place of the scheduler. The C
+runtime's finalizer and CPU hints are no-ops, and its thread queries say the main thread
+(thread 1, in the pool of id 0, as natively). LLVM intrinsics that code calls with `ccall("llvm.<name>.<type>", llvmcall,
+...)` (`fmuladd`, `fma`, `sqrt`, `fabs`, `copysign`, rounding), on floats or on vectors of
+them (`NTuple{N,VecElement{T}}`, element by element), are the matching Julia intrinsics:
+LinearSolve's blocked LU kernel is written with `llvm.fmuladd.v4f64` on vectors loaded
+through pointers. Other `llvmcall` IR (VectorizationBase's, LoopVectorization's) is not
+supported.
 
 Operations whose code grows with the value they move are **outlined**: a helper function
 per operation and type, called where they are used (`outline.jl`): `memoryrefget`,
-`memoryrefset!`, `memoryrefnew`, `memoryref_isassigned`, `memorynew`, boxing and unboxing.
+`memoryrefset!`, `memoryrefnew`, `memoryref_isassigned`, `memorynew`, boxing and unboxing,
+and `objectid` of immutable objects (which may refer to others of their type: the helper
+calls itself at run time instead of the emission recursing).
 A helper's body is the operation's inline emission, run in the helper's own context, so
 there is one implementation; Binaryen inlines the helpers where it pays, and keeps others
 shared (10% smaller modules for the parser).
@@ -330,14 +353,18 @@ shared (10% smaller modules for the parser).
   from Parsers.jl, which is correctly rounded without C or big floats) and `errno`;
   `memmove`/`memset`/`memcmp`/`memchr`/`strlen` through pointers without origins (a C
   string ends at its owner's end: Julia's strings and symbols are NUL-terminated);
-  `jl_symbol_name` (a pointer into the symbol's bytes; `Cstring`s are pointers too).
+  `jl_symbol_name` (a pointer into the symbol's bytes; `Cstring`s are pointers too);
+  identity hash tables (`IdDict`: `jl_eqtable_*`, `iddict.c`'s open addressing by
+  `objectid` and `===`, so that a table built natively and serialized is found the same
+  way); `deepcopy`'s `jl_new_structv` (a new immutable from an array of its fields).
 - **BLAS and LAPACK** (`runtime/blas.jl`, `lapack.jl`): what LinearAlgebra calls in
   libblastrampoline, on Float64 and Float32: levels 1 to 3 (`dot`, norms, `gemv`, `gemm`,
   triangular and symmetric products and solves, rank updates), LU (`getrf`, `getrs`,
   `getri`), Cholesky (`potrf`, `potrs`), triangular solves, QR (`geqrt`/`gemqrt`, pivoted
   `geqp3`/`ormqr`) and the rank-deficient least squares behind `\` (`laic1`, `tzrzf`,
-  `ormrz`), symmetric eigenvalues (`syevr`) and singular values (`gesdd`) by Jacobi's
-  methods: reference algorithms, unblocked. An array argument is a `MemoryRef` where the
+  `ormrz`), symmetric indefinite factorizations (Bunch-Kaufman's `sytrf`/`sytrs` and their
+  rook variants: LAPACK's `dsytf2` ported), symmetric eigenvalues (`syevr`) and singular
+  values (`gesdd`, `gesvd`) by Jacobi's methods: reference algorithms, unblocked. An array argument is a `MemoryRef` where the
   pointer's memory is known, else the pointer; outputs are written through. Results agree
   with an optimized BLAS's within rounding (the order of sums differs). Vectors of eigen- and
   singular values agree up to their signs. Not yet: nonsymmetric eigenvalues.
@@ -350,7 +377,8 @@ shared (10% smaller modules for the parser).
   symbols are `===` by their bytes, so symbols made at run time need no interning. A
   mutable object's `objectid` is natively a hash of its address: an object of the image
   keeps the one it had natively (its header's hash refers to a table of them), so that
-  dictionaries keyed by such objects find them; others hash their identity hash.
+  dictionaries keyed by such objects find them; others hash their identity hash. Modules
+  are objects of the image carrying their name (`nameof`), compared by identity.
 - **Types at run time** (`reflection.jl`). Types are not made at run time: those a
   program can hold are the ones with objects in its image, all known when the module is
   finished. So what code asks of a type at run time is computed natively for each of them
@@ -361,23 +389,30 @@ shared (10% smaller modules for the parser).
   type object's header only says which kind of type it is. `===` of values whose types
   are known only at run time is `jl_egal`, generated over the module's types: identity for
   mutable ones, contents for the others (strings, boxes, immutable objects, tuples,
-  SimpleVectors). These tables are built after the image and the type maps, which add
-  types. Printing a type (juliac's `show`,
+  SimpleVectors). Their `objectid` is `jl_object_id`, by type too: of each type whose
+  values may be objects, the code of `objectid` for that type, compiled once the program's
+  code is (until it adds no types; a type whose `objectid` cannot be compiled traps there,
+  not an error of the program). These tables are built after the image and the type maps,
+  which add types. Printing a type (juliac's `show`,
   which reflects on it) is a foldable function returning its name as a Symbol, so that
   inference computes it for a type known at compile time (a `Union` or `UnionAll` is not
   a constant for inference: printing one at run time needs reflection, not supported).
 - **Primitives**: runtime functions whose calls the code generator compiles to host
   imports (module `julia`): `write_byte(fd, byte)`, `entropy()` (the seed of the task's
-  random number generator).
+  random number generator), `hrtime()` (`time_ns()`: a monotonic clock in nanoseconds).
+  The C runtime's globals code reads through `cglobal`: none so far but
+  `jl_gc_have_pending_finalizers` (an image object holding 0). The thread counts behind
+  `Threads.nthreads()` (`jl_n_threads_per_pool`, a pointer to an array) are not yet
+  supported.
 - **The pseudo-runtime's patches** (section 1): Base/Core methods over the primitives
   (IO for `Core.stdout`/`Core.stderr`).
 - **The host**: a loader instantiating the module with the `julia` imports (the test
   runner's is in `test/runner.mjs`): it buffers bytes per descriptor and decodes them as
   UTF-8.
 
-Next: `IdDict` (the C runtime's identity hash table, also behind task-local storage and so
-`Random.seed!` of the global generator) and `objectid` of mutable objects; BLAS and LAPACK
-(LinearAlgebra's calls into libblastrampoline); time; a WASI-style host interface.
+Next: `IdSet` (`smallintset.c`); `deepcopy` of mutable structs (`jl_set_nth_field` of an
+object whose type is known only at run time); pointers stored in memory (the C runtime's
+thread counts); a WASI-style host interface.
 
 ## 9. Output, performance
 

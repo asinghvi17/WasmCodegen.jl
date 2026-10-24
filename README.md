@@ -20,7 +20,9 @@ dynamic dispatch. Julia 1.13 is the main target, and 1.12 also works. Programs t
 today include OrdinaryDiffEq's `Tsit5` on an `ODEProblem` built at compile time, a
 ModelingToolkit model, JuliaSyntax (Julia's parser), Random (bit-identical streams),
 dictionaries, exceptions (`try`/`catch`/`finally`, with Wasm's exception handling),
-LinearAlgebra (BLAS and LAPACK in the runtime), printing to `stdout` (`show` of arrays and
+LinearAlgebra (BLAS and LAPACK in the runtime), LinearSolve's pure-Julia solvers (its
+default algorithm, the blocked `GenericLUFactorization`, `SimpleLUFactorization`, PureKLU on
+sparse matrices, Krylov.jl's and its own GMRES), printing to `stdout` (`show` of arrays and
 tuples too), and the programs of JuliaC.jl's tests (dispatch over concrete types,
 reductions, sorting, concatenation).
 
@@ -47,6 +49,7 @@ let out = [];
 const julia = {
   write_byte: (fd, b) => out.push(b),     // Core.stdout / Core.stderr, as bytes
   entropy: () => BigInt.asIntN(64, crypto.getRandomValues(new BigUint64Array(1))[0]),
+  hrtime: () => BigInt(Math.round(performance.now() * 1e6)),  // time_ns()
 };
 const { instance } = await WebAssembly.instantiate(bytes, { julia });
 console.log(instance.exports.f(100n));      // Int is an i64: a BigInt
