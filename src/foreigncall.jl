@@ -252,11 +252,26 @@ function immut_id!(fc::FnCtx, x::CGVal, @nospecialize(T), h::CGVal)
     for i in 1:fieldcount(T)
         FT = fieldtype(T, i)
         v = get_field(fc, x, i)
-        u = Base.allocatedinline(FT) ? immut_id!(fc, convert_repr(fc, v, FT), FT, const_value(fc, UInt64(0))) :
-            emit_objectid!(fc, v)
+        u = !Base.allocatedinline(FT) ? emit_objectid!(fc, v) :
+            FT isa Union ? union_immut_id!(fc, v, FT) :
+            immut_id!(fc, convert_repr(fc, v, FT), FT, const_value(fc, UInt64(0)))
         h = call_runtime!(fc, Runtime.bitmix, CGVal[h, u])
     end
     return h
+end
+
+# `immut_id_` of a field stored inline of a union of types (isbits): of the member it holds
+function union_immut_id!(fc::FnCtx, v::CGVal, @nospecialize(U))
+    r = new_local!(fc, I64)
+    for C in Base.uniontypes(U)
+        push_val!(fc, emit_isa!(fc, v, C))
+        if!(fc.b)
+        push_val!(fc, immut_id!(fc, convert_repr(fc, v, C), C, const_value(fc, UInt64(0))))
+        emit!(fc.b, :local_set, r)
+        end!(fc.b)
+    end
+    emit!(fc.b, :local_get, r)
+    return pop_val!(fc, UInt64)
 end
 
 "A `String` or `Symbol` (`T`) of a copy of the `n` bytes at the pointer `p`."

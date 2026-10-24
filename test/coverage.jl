@@ -64,6 +64,14 @@ const PATHS = ("/home/user/file.jl", "a/b/", "//x", "name.tar.gz", ".bashrc", "d
 paths(i::Int) = (p = PATHS[i]; checksum(join((basename(p), dirname(p), splitext(p)..., splitdir(p)...), "|")) + isdirpath(p))
 clock(i::Int) = (t = time_ns(); s = sum(1:i); time_ns() >= t && s >= 0)
 
+# objectid of an immutable with a field stored inline of a union (the member it holds)
+struct WithUnion
+    a::Int
+    b::Union{Nothing,Bool}
+end
+union_field_ids(i::Int) = (objectid(WithUnion(i, nothing)), objectid(WithUnion(i, i > 0)),
+                           objectid(Any[WithUnion(i, true)][1]))
+
 # IdDict: identity hash tables (the C runtime's), built at run time and at compile time (laid
 # out natively by the same hash)
 const IDD = IdDict{Any,Int}(:a => 1, "s" => 2, 3 => 3, 2.5 => 4, (1, 2) => 5)
@@ -134,6 +142,9 @@ function atomics(i::Int)
 end
 
 @testset "coverage" begin
+    for i in 0:1
+        @wtest union_field_ids(i)
+    end
     for i in 0:2
         @wtest atomics(i)
     end
