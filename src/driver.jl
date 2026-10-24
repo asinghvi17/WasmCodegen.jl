@@ -50,12 +50,21 @@ end
 function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool, world::UInt)
     mis = Core.MethodInstance[entry_instance(e.f, e.argtypes; world) for e in entries]
     w = collect_world(mis; world, verify=config.verify)
-    cgm = CGModule(w, config)
-    for (e, mi) in zip(entries, mis)
-        info = get_function!(cgm, mi)
-        add_export!(cgm.mod, e.name, info.func)
+    mode = exception_mode(w)
+    local cgm
+    while true
+        cgm = CGModule(w, config, mode)
+        for (e, mi) in zip(entries, mis)
+            info = get_function!(cgm, mi)
+            add_export!(cgm.mod, e.name, info.func)
+        end
+        process_worklist!(cgm)
+        # the runtime functions the code needed (added to the world as it was emitted) may
+        # use exceptions more than the program did: then again, as they need
+        m = exception_mode(w)
+        EXCEPTION_MODES[m] > EXCEPTION_MODES[mode] || break
+        mode = m
     end
-    process_worklist!(cgm)
     if cgm.config.trim === :safe && !isempty(cgm.diagnostics)
         throw(UnsupportedConstructs(cgm.diagnostics))
     end
@@ -88,8 +97,14 @@ function wasm_opt(bytes::Vector{UInt8}, options::Cmd)
     end
 end
 
+# (the image first, then the type maps, which add types: the tables over types after them)
 function finish_module!(cgm::CGModule)
+    finish_image!(cgm)
+    finish_type_maps!(cgm)
+    finish_type_isa!(cgm)
+    finish_egal!(cgm)
+    finish_objectid!(cgm)
     finish_pointers!(cgm)
     finish_types!(cgm)
-    finish_image!(cgm)
+    finish_subtype!(cgm)
 end

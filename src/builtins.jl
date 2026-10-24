@@ -92,7 +92,8 @@ The field `i` (constant) of the value `x`.
 function get_field(fc::FnCtx, x::CGVal, i::Int)
     T = x.typ
     l = layout(fc, T)
-    if isconstant(x) && !ismutable(constant_value(x))
+    if isconstant(x) && (!ismutable(constant_value(x)) || constant_value(x) isa Type)
+        # (a type's fields are fixed once it is made)
         return const_value(fc, getfield(constant_value(x), i))
     end
     FT = fieldtype(T, i)
@@ -115,7 +116,17 @@ function get_field(fc::FnCtx, x::CGVal, i::Int)
             push_leaf!(fc, tmp)
             emit!(fc.b, fields[w].storage isa PackedType ? :struct_get_u : :struct_get, l.wtype, w - 1)
         end
-        return pop_val!(fc, FT)
+        v = pop_val!(fc, FT)
+        if fl.kind === Boxed && i > fieldcount(T) - T.name.n_uninitialized
+            # a field constructors may leave undefined: reading it undefined is an error
+            push_val!(fc, v); emit!(fc.b, :ref_is_null)
+            if!(fc.b); throw_error!(fc, Runtime.throw_undefref_error); end!(fc.b)
+        end
+        return v
+    elseif T === Core.TypeName && fieldname(T, i) === :name
+        push_val!(fc, x)
+        emit!(fc.b, :struct_get, l.wtype, HEADER_FIELDS)
+        return pop_val!(fc, Symbol)
     elseif is_memory_type(T)
         name = fieldname(T, i)
         name === :ptr && return memory_ptr!(fc, x, FT)
@@ -177,6 +188,10 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
             return x.vals[constant_value(idx)]
         end
         x = x::CGVal
+        if isconstant(x) && isconstant(idx) && constant_value(x) isa Type
+            # a field of a type (fixed once the type is made; a value of type Type{X})
+            return const_value(fc, getfield(constant_value(x), constant_value(idx)))
+        end
         if isconstant(idx)
             return get_field(fc, x, field_index(x.typ, constant_value(idx)))
         end
@@ -191,6 +206,23 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
         return emit_isdefined!(fc, x, field_index(x.typ, constant_value(idx)))
     elseif f === Core.:(===)
         return emit_egal!(fc, args[1], args[2])
+    elseif f === Core.:(<:)
+        return emit_subtype!(fc, args[1]::CGVal, args[2]::CGVal)
+    elseif f === Core._svec_len
+        x = args[1]::CGVal
+        isconstant(x) && return const_value(fc, length(constant_value(x)))
+        l = layout(fc, Core.SimpleVector)
+        push_val!(fc, x)
+        emit!(fc.b, :struct_get, l.wtype, DATA_FIELD)
+        emit!(fc.b, :array_len)
+        emit!(fc.b, :i64_extend_i32_u)
+        return pop_val!(fc, Int)
+    elseif f === Core._svec_ref
+        x, i = args[1]::CGVal, args[2]::CGVal
+        isconstant(x) && isconstant(i) && return const_value(fc, constant_value(x)[constant_value(i)])
+        return tuple_array_get!(fc, x, i)
+    elseif f === Core.svec
+        return new_tuple_array!(fc, Core.SimpleVector, CGVal[a for a in args])
     elseif f === Core.isa
         T = args[2]
         isconstant(T) || unsupported("isa with a type not known at compile time")
@@ -202,7 +234,10 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
         if !(isconstant(t) && constant_value(t))
             push_val!(fc, t)
             emit!(fc.b, :i32_eqz)
-            if!(fc.b); unreachable!(fc.b); end!(fc.b)
+            if!(fc.b)
+            throw_error!(fc, Runtime.throw_type_error, () -> convert_repr(fc, T, Any),
+                         () -> convert_repr(fc, args[1], Any))
+            end!(fc.b)
         end
         return convert_repr(fc, args[1], typ)
     elseif f === Core.typeof
@@ -214,8 +249,11 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
     elseif f === Core.ifelse
         return emit_ifelse!(fc, args[1], args[2], args[3], typ)
     elseif f === Core.throw
-        unreachable!(fc.b)
-        return bottom()
+        return emit_throw!(fc, args[1])
+    elseif f === Core.throw_methoderror
+        vals = CGVal[a for a in args[2:end]]
+        return throw_error!(fc, Runtime.throw_method_error, () -> convert_repr(fc, args[1], Any),
+                            () -> convert_repr(fc, make_tuple(fc, Tuple{Any[v.typ for v in vals]...}, vals), Any))
     elseif f === Core.nfields
         x = args[1]::CGVal
         isconcretetype(x.typ) && return const_value(fc, fieldcount(x.typ))
@@ -324,12 +362,18 @@ function get_field_dynamic(fc::FnCtx, x::CGVal, i::CGVal, @nospecialize(typ))
     (T isa DataType && isconcretetype(T) && l.elements === nothing) ||
         unsupported("a field of ", T, " at an index not known at compile time")
     n = fieldcount(T)
-    i.typ === Symbol && (i = field_index_of!(fc, T, i))
+    if i.typ === Symbol
+        # a name that is not a field's: a FieldError
+        name = i
+        i = field_index_of!(fc, T, i)
+        push_val!(fc, i); emit!(fc.b, :i64_eqz)
+        if!(fc.b); throw_error!(fc, Runtime.throw_field_error, () -> convert_repr(fc, const_value(fc, T), Any), name); end!(fc.b)
+    end
     idx = convert_repr(fc, i, Int)
     # out of bounds: a BoundsError
     push_val!(fc, idx); emit!(fc.b, :i64_const, 1); emit!(fc.b, :i64_sub)
     emit!(fc.b, :i64_const, n); emit!(fc.b, :i64_ge_u)
-    if!(fc.b); unreachable!(fc.b); end!(fc.b)
+    if!(fc.b); throw_error!(fc, Runtime.throw_bounds_error, () -> convert_repr(fc, x, Any), idx); end!(fc.b)
     if T <: Tuple && l.kind === Inline && is_homogeneous_tuple(T) && n > 4
         E = fieldtype(T, 1)
         ml = memory_layout(fc.cgm.types, E)
@@ -409,7 +453,16 @@ function tuple_array_get!(fc::FnCtx, x::CGVal, i::CGVal)
     emit!(fc.b, :struct_get, l.wtype, DATA_FIELD)
     arr = new_local!(fc, RefType(ml.array, true))
     emit!(fc.b, :local_set, arr)
-    return array_element_get!(fc, arr, ml, convert_repr(fc, i, Int))
+    i = convert_repr(fc, i, Int)
+    n = x.typ isa DataType && x.typ <: Tuple && !Base.isvatuple(x.typ) ? fieldcount(x.typ) : nothing
+    if !(isconstant(i) && n !== nothing && 1 <= constant_value(i) <= n)
+        # out of bounds (checked on the 64-bit index): a BoundsError
+        push_val!(fc, i); emit!(fc.b, :i64_const, 1); emit!(fc.b, :i64_sub)
+        emit!(fc.b, :local_get, arr); emit_memory_length!(fc, ml); emit!(fc.b, :i64_extend_i32_u)
+        emit!(fc.b, :i64_ge_u)
+        if!(fc.b); throw_error!(fc, Runtime.throw_bounds_error, () -> convert_repr(fc, x, Any), i); end!(fc.b)
+    end
+    return array_element_get!(fc, arr, ml, i)
 end
 
 "A large tuple of type `T` of the elements `args`."
@@ -474,6 +527,10 @@ function emit_egal!(fc::FnCtx, a::CGVal, b::CGVal)
             return egal_bytes!(fc, a, b, S)
         end
     end
+    if Ta === Core.SimpleVector || Tb === Core.SimpleVector
+        # (a SimpleVector is === another of the same elements)
+        return egal_any!(fc, a, b)
+    end
     if la.kind === Boxed && lb.kind === Boxed
         if (Ta === Tb && ismutabletype(Ta)) || (is_memory_type(Ta) && Ta === Tb)
             push_val!(fc, a); push_val!(fc, b)
@@ -487,7 +544,14 @@ function emit_egal!(fc::FnCtx, a::CGVal, b::CGVal)
             return pop_val!(fc, Bool)
         end
     end
-    unsupported("=== of values of types ", Ta, " and ", Tb)
+    # values whose types are known only at run time: compared by the module's own `jl_egal`
+    return egal_any!(fc, a, b)
+end
+
+function egal_any!(fc::FnCtx, a::CGVal, b::CGVal)
+    push_val!(fc, convert_repr(fc, a, Any)); push_val!(fc, convert_repr(fc, b, Any))
+    call!(fc.b, egal_any_func!(fc.cgm))
+    return pop_val!(fc, Bool)
 end
 
 # `a === b` where one of them is a `S` (a String or Symbol): of two of them, the same bytes
@@ -616,6 +680,13 @@ function emit_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
         emit!(fc.b, :i32_eq)
         return pop_val!(fc, Bool)
     end
+    if tests_type_objects(T)
+        # some types but not all of their kind (`Type{<:Real}`): a type object by the type it
+        # is (see `reflection.jl`)
+        push_val!(fc, x)
+        call!(fc.b, type_isa_func!(fc.cgm, T))
+        return pop_val!(fc, Bool)
+    end
     # an abstract type or a union: the concrete types of the closed world that are its
     # subtypes (known when the module is complete)
     push_val!(fc, x)
@@ -623,6 +694,10 @@ function emit_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
     call!(fc.b, isa_predicate!(fc.cgm, T))
     return pop_val!(fc, Bool)
 end
+
+# whether `x isa T` of a type `x` depends on more than the kind of type it is
+tests_type_objects(@nospecialize(T)) =
+    any(K -> typeintersect(K, T) !== Union{} && !(K <: T), (DataType, UnionAll, Union, Core.TypeofBottom))
 
 ## ifelse
 

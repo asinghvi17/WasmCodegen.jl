@@ -51,3 +51,18 @@ function ptr_memchr(p::Ptr{UInt8}, c::Int32, n::UInt)
     end
     return Ptr{UInt8}(0)
 end
+
+"`strlen(p)`: the number of bytes at `p` before a NUL."
+function ptr_strlen(p::Ptr{UInt8})
+    n = UInt(0)
+    while unsafe_load(p, n + 1) != 0x00
+        n += 1
+    end
+    return n
+end
+
+ptr_strlen(p::Cstring) = ptr_strlen(convert(Ptr{UInt8}, p))
+
+"`jl_cstr_to_string(p)`: a String of the bytes at `p` before a NUL."
+cstr_to_string(p::Ptr{UInt8}) = unsafe_string(p, ptr_strlen(p))
+cstr_to_string(p::Cstring) = cstr_to_string(convert(Ptr{UInt8}, p))

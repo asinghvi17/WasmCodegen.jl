@@ -10,14 +10,17 @@ Where a pointer points, when it is known statically: the byte `index` (an i32 le
 the array (a leaf) of the object `mem` (a Memory or a String, a leaf) of elements of type
 `eltype`; or, with `array === nothing`, into the object `mem` itself (`jl_value_ptr` of a
 `Ref`). Loads, stores and copies through a pointer with an origin are compiled to accesses
-of its array (see pointers.jl).
+of its array (see pointers.jl). `terminated`: the bytes of a String or Symbol, whose byte
+past the end is a NUL (as natively).
 """
 struct PtrOrigin
     mem::Any
     array::Any
     index::Any
     eltype::Any
+    terminated::Bool
 end
+PtrOrigin(mem, array, index, eltype) = PtrOrigin(mem, array, index, eltype, false)
 PtrOrigin(array, index, eltype) = PtrOrigin(nothing, array, index, eltype)
 
 is_object_origin(o::PtrOrigin) = o.array === nothing

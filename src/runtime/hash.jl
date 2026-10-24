@@ -109,3 +109,9 @@ bits_hash(x::Int8) = UInt64(int32hash(reinterpret(UInt32, Int32(x))))
 bits_hash(x::Int16) = UInt64(int32hash(UInt32(reinterpret(UInt16, x))))
 bits_hash(x::Int32) = UInt64(int32hash(reinterpret(UInt32, x)))
 bits_hash(x::UInt64) = int64hash(x)
+
+"`bitmix(a, b)`: how `objectid` mixes the ids of a value's fields."
+bitmix(a::UInt64, b::UInt64) = int64hash(a ⊻ bswap(b))
+
+"The hash of the bits of a value of another size (`memhash` of its bytes)."
+bits_hash(x::NTuple{N,UInt8}) where {N} = murmur3_h2(i -> x[i + 1], N, 0xcafe8881)

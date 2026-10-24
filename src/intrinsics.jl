@@ -104,6 +104,9 @@ function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}
         r = emit_intrinsic128!(fc, f, args, typ)
         r === nothing || return r
     end
+    if f !== II.bitcast && !(f in NO_FOLD) && (any(a -> a.typ === Float16, args) || typ === Float16)
+        return emit_float16!(fc, f, args, typ)
+    end
     if haskey(INT_BINOPS, f)
         a, b = args
         T = a.typ
@@ -499,7 +502,7 @@ function emit_checked_div!(fc::FnCtx, f, a::CGVal, b::CGVal)
         end
         emit!(fc.b, :i32_or)
     end
-    if!(fc.b); unreachable!(fc.b); end!(fc.b)
+    if!(fc.b); throw_error!(fc, Runtime.throw_divide_error); end!(fc.b)
     signed ? push_signed!(fc, a) : push_val!(fc, a)
     signed ? push_signed!(fc, b) : push_val!(fc, b)
     op = f === II.checked_sdiv_int ? "div_s" : f === II.checked_udiv_int ? "div_u" :
@@ -509,3 +512,55 @@ function emit_checked_div!(fc::FnCtx, f, a::CGVal, b::CGVal)
     return pop_val!(fc, T)
 end
 
+
+## Float16
+
+"The Float32 of the Float16 `x` (exact)."
+float16_to_32!(fc::FnCtx, x::CGVal) =
+    call_runtime!(fc, Runtime.f16_to_f32, CGVal[emit_bitcast!(fc, UInt16, x)])
+
+"The Float16 nearest to the Float32 or Float64 `x`."
+function float16_from!(fc::FnCtx, x::CGVal)
+    f = x.typ === Float64 ? Runtime.f64_to_f16 : Runtime.f32_to_f16
+    return emit_bitcast!(fc, Float16, call_runtime!(fc, f, CGVal[x]))
+end
+
+"""
+    emit_float16!(fc, f, args, typ) -> CGVal
+
+The intrinsic `f` on Float16 values (Wasm has no half-precision arithmetic): computed in
+Float32 and rounded back to Float16, as LLVM legalizes it, which is exact for the basic
+operations (Float32 has more than twice the bits). Conversions round once.
+"""
+function emit_float16!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{CGVal}, @nospecialize(typ))
+    if f === II.fptrunc
+        return float16_from!(fc, args[2])
+    elseif f === II.fpext
+        x = float16_to_32!(fc, args[2])
+        typ === Float64 || return x
+        push_val!(fc, x); emit!(fc.b, :f64_promote_f32)
+        return pop_val!(fc, Float64)
+    elseif f === II.sitofp || f === II.uitofp
+        # exact in Float64 below 2^53; above, Float16's infinity either way
+        return float16_from!(fc, emit_intrinsic!(fc, f, Any[const_value(fc, Float64), args[2]], Float64))
+    elseif f === II.neg_float || f === II.abs_float || f === II.copysign_float
+        # sign operations: on the bits (a NaN is not made quiet)
+        x = emit_bitcast!(fc, UInt16, args[1])
+        push_val!(fc, x)
+        if f === II.neg_float
+            emit!(fc.b, :i32_const, 0x8000); emit!(fc.b, :i32_xor)
+        elseif f === II.abs_float
+            emit!(fc.b, :i32_const, 0x7fff); emit!(fc.b, :i32_and)
+        else
+            emit!(fc.b, :i32_const, 0x7fff); emit!(fc.b, :i32_and)
+            push_val!(fc, emit_bitcast!(fc, UInt16, args[2]))
+            emit!(fc.b, :i32_const, 0x8000); emit!(fc.b, :i32_and)
+            emit!(fc.b, :i32_or)
+        end
+        return emit_bitcast!(fc, Float16, pop_val!(fc, UInt16))
+    end
+    xs = Any[a.typ === Float16 ? float16_to_32!(fc, a) : (isconstant(a) && constant_value(a) === Float16 ? const_value(fc, Float32) : a)
+             for a in args]
+    r = emit_intrinsic!(fc, f, xs, typ === Float16 ? Float32 : typ)
+    return typ === Float16 ? float16_from!(fc, r) : r
+end

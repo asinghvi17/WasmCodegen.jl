@@ -76,7 +76,7 @@ end
 Emit the body of the function `info` from the structured IR of its method instance.
 """
 function emit_function!(cgm::CGModule, info::FuncInfo)
-    ir = prepare_ir(cgm.world, info.mi)
+    ir = prepare_ir(cgm.world, info.mi, cgm.exceptions)
     sci = try
         structurize(ir)
     catch err
@@ -84,11 +84,11 @@ function emit_function!(cgm::CGModule, info::FuncInfo)
         unsupported("structurizing the IR: ", sprint(showerror, err))
     end
     b = Builder(cgm.mod, info.func)
-    fc = FnCtx(cgm, info, sci, b, CGVal[], Dict{Int,Any}(), Dict{Int,CGVal}(),
-               LoopTarget[], 0, Vector{CGVal}[], Dict{Int,Any}(), Set{Int}(), Uses(), Bool[], 0)
+    fc = FnCtx(cgm, info, sci, b)
     collect_ssatypes!(fc.ssatypes, sci.entry)
     analyze_uses!(fc, sci.entry)
     bind_arguments!(fc)
+    bind_handler_args!(fc, sci.entry)
     emit_block!(fc, sci.entry)
     is_unreachable(b) || unreachable!(b)
     finish!(b)
@@ -179,6 +179,8 @@ function emit_block!(fc::FnCtx, block)
         if stmt isa IRStructurizer.ControlFlowOp
             fc.opidx = idx
             fc.ssavals[idx] = emit_cfop!(fc, stmt, typ)
+        elseif stmt isa Core.UpsilonNode
+            emit_upsilon!(fc, idx, stmt)
         else
             res = emit_stmt_or_trap!(fc, stmt, typ)
             if res !== nothing
@@ -232,6 +234,11 @@ function emit_terminator!(fc::FnCtx, @nospecialize(term))
         lt = fc.loops[end]
         assign_all!(fc, lt.results, term.values)
         br!(fc.b, br_depth(fc, lt.exit))
+    elseif term isa IRStructurizer.LeaveOp
+        # out of the innermost enclosing try body, with its results
+        t = fc.tries[end]
+        assign_all!(fc, t.results, term.values)
+        br!(fc.b, br_depth(fc, t.exit))
     elseif term === nothing
         # a block that does not end (its last statement never returns)
     else
@@ -624,17 +631,39 @@ function emit_stmt!(fc::FnCtx, @nospecialize(stmt), @nospecialize(typ))
     if stmt isa Expr
         return emit_expr!(fc, stmt, typ)
     elseif stmt isa Core.PiNode
-        v = operand(fc, stmt.val)
-        return convert_repr(fc, v, typ)
+        return emit_pi!(fc, operand(fc, stmt.val), typ)
     elseif stmt === nothing
         return nothing
     elseif stmt isa Core.GotoNode || stmt isa Core.GotoIfNot || stmt isa Core.PhiNode
         unsupported("unstructured control flow (", typeof(stmt), ")")
-    elseif stmt isa Core.EnterNode || stmt isa Core.UpsilonNode || stmt isa Core.PhiCNode
+    elseif stmt isa Core.EnterNode || stmt isa Core.PhiCNode
         unsupported("exception handling (", typeof(stmt), ")")
     else
         return operand(fc, stmt)
     end
+end
+
+"""
+    emit_pi!(fc, v, T) -> CGVal
+
+A `PiNode`: `v` narrowed to `T`. Julia's optimizer places narrowing as an assumption, not a
+check, sometimes where it does not hold (a value forwarded with a flag saying whether it is
+`nothing`, read only where it is not): a boxed value is converted only if it is a `T`, and
+is otherwise left undefined (not read).
+"""
+function emit_pi!(fc::FnCtx, v::CGVal, @nospecialize(T))
+    S = v.typ
+    (v.kind === Boxed && !(S <: T) && layout(fc, S).wtype == fc.cgm.types.jlvalue) ||
+        return convert_repr(fc, v, T)
+    layout(fc, T).kind === Ghost && return convert_repr(fc, v, T)
+    t = emit_isa!(fc, v, T)
+    isconstant(t) && return constant_value(t) ? convert_repr(fc, v, T) : undef_val(fc, T)
+    res = new_val!(fc, T)
+    push_val!(fc, t)
+    if!(fc.b)
+    assign!(fc, res, v)
+    end!(fc.b)
+    return res
 end
 
 function emit_expr!(fc::FnCtx, ex::Expr, @nospecialize(typ))
@@ -671,15 +700,16 @@ function emit_expr!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         isconstant(c) && constant_value(c) && return nothing
         push_val!(fc, c)
         emit!(fc.b, :i32_eqz)
-        if!(fc.b); unreachable!(fc.b); end!(fc.b)
+        if!(fc.b); throw_error!(fc, Runtime.throw_undefvar_error, const_value(fc, ex.args[1]::Symbol)); end!(fc.b)
         return nothing
     elseif head === :isdefined
         x = ex.args[1]
         x isa GlobalRef && return isdefined_global!(fc, x)
         unsupported("isdefined of ", x)
     elseif head === :the_exception
-        unreachable!(fc.b)
-        return bottom()
+        return emit_the_exception!(fc)
+    elseif head === :pop_exception
+        return emit_pop_exception!(fc, ex.args[1])
     else
         unsupported("the expression head ", head)
     end

@@ -49,12 +49,13 @@ end
 """
     trap_throws!(ir) -> IRCode
 
-Where throwing traps, the exception a `throw` throws is never observed: `throw(x)` becomes
-`throw(nothing)`, and the computations of values used only to be thrown are removed when
-they have no effects (they may throw: on this path that traps too), or when they are
-Base's own construction of an exception or its message (`print_to_string` of the
-arguments of an error: effects on the buffer it allocates, which inference cannot prove
-effect-free). Error paths then do not compile the code that formats error messages.
+Where the exception a `throw` throws is never observed (nothing catches, or nothing reads
+what it catches), `throw(x)` becomes `throw(nothing)`, and the computations of values used
+only to be thrown are removed when they have no effects and cannot throw (a computation
+that may throw, as a division, stays: its exception happens before what follows it), or
+when they are Base's own construction of an exception or its message (`print_to_string`
+of the arguments of an error: effects on the buffer it allocates, which inference cannot
+prove effect-free). Error paths then do not compile the code that formats error messages.
 Calls of the program's functions stay even when they build exceptions, and calls of
 functions that never return: their effects before they throw still happen.
 """
@@ -78,8 +79,8 @@ function trap_throws!(ir::CC.IRCode)
     end
     for idx in 1:n
         stmt = stmts[idx][:stmt]
-        stmt isa Expr && is_throw_call(stmt) && length(stmt.args) == 2 || continue
-        stmt.args[2] === nothing && continue
+        stmt isa Expr && is_throw_call(stmt) && length(stmt.args) >= 2 || continue
+        length(stmt.args) == 2 && stmt.args[2] === nothing && continue
         release!(stmt)
         stmts[idx][:stmt] = Expr(:call, GlobalRef(Core, :throw), nothing)
     end
@@ -87,9 +88,10 @@ function trap_throws!(ir::CC.IRCode)
         id = pop!(work)
         stmt = stmts[id][:stmt]
         stmt isa Expr && stmt.head in (:call, :invoke, :new, :foreigncall, :splatnew) || continue
-        removable = (stmts[id][:flag] & CC.IR_FLAG_EFFECT_FREE) != 0 ||
-                    stmt.head === :new || stmt.head === :splatnew ||
-                    is_pure_builtin_call(stmt) || is_pure_foreigncall(stmt) ||
+        flag = stmts[id][:flag]
+        nothrow = (flag & CC.IR_FLAG_NOTHROW) != 0
+        removable = (nothrow && ((flag & CC.IR_FLAG_EFFECT_FREE) != 0 || is_pure_builtin_call(stmt))) ||
+                    stmt.head === :new || stmt.head === :splatnew || is_pure_foreigncall(stmt) ||
                     is_base_message(stmt, stmts[id][:type])
         removable || continue
         release!(stmt)
@@ -133,7 +135,7 @@ function is_throw_call(stmt::Expr)
     stmt.head === :call || return false
     f = stmt.args[1]
     f isa GlobalRef && isdefined(f.mod, f.name) && isconst(f.mod, f.name) && (f = getglobal(f.mod, f.name))
-    return f === Core.throw
+    return f === Core.throw || f === Core.throw_methoderror
 end
 
 """
@@ -198,14 +200,16 @@ function is_type_computation(stmt::Expr, flag)
 end
 
 """
-    prepare_ir(world, mi) -> IRCode
+    prepare_ir(world, mi, exceptions) -> IRCode
 
-The IR of `mi`, ready for structurizing: exception handling removed, throws trapping.
+The IR of `mi`, ready for structurizing (exceptions as the program uses them).
 """
-function prepare_ir(w::ClosedWorld, mi::Core.MethodInstance)
+function prepare_ir(w::ClosedWorld, mi::Core.MethodInstance, exceptions::Symbol=:none)
     ir = get_ircode(w, mi)
-    ir = strip_exception_handling!(ir)
-    ir = trap_throws!(ir)
+    # (where nothing catches, handlers are dropped; where nothing reads what is caught, the
+    # exceptions are not built: see `exceptions.jl`)
+    exceptions === :none && (ir = strip_exception_handling!(ir))
+    exceptions === :values || (ir = trap_throws!(ir))
     ir = drop_unused!(ir)
     return ir
 end

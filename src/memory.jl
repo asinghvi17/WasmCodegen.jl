@@ -66,6 +66,7 @@ boundscheck)` (to the element `i` from `ref`, 1-based).
 """
 function emit_memoryrefnew!(fc::FnCtx, args::Vector{Any})
     x = args[1]::CGVal
+    orig = x
     if is_memory_type(x.typ) && length(args) > 1
         # memoryrefnew(mem, i, boundscheck) (Julia 1.13): from the first element
         x = emit_memoryrefnew!(fc, Any[x])
@@ -100,13 +101,11 @@ function emit_memoryrefnew!(fc::FnCtx, args::Vector{Any})
         emit_memory_length!(fc, ml)
         emit!(fc.b, :i64_extend_i32_u)
         emit!(fc.b, :i64_ge_u)
-        if isconstant(bc)
-            if!(fc.b); unreachable!(fc.b); end!(fc.b)
-        else
-            push_val!(fc, convert_repr(fc, bc, Bool))
-            emit!(fc.b, :i32_and)
-            if!(fc.b); unreachable!(fc.b); end!(fc.b)
-        end
+        isconstant(bc) || (push_val!(fc, convert_repr(fc, bc, Bool)); emit!(fc.b, :i32_and))
+        if!(fc.b)
+        # (as natively: the reference or memory given, and the index given)
+        throw_error!(fc, Runtime.throw_bounds_error, () -> convert_repr(fc, orig, Any), i)
+        end!(fc.b)
     end
     i32 = new_local!(fc, I32)
     emit!(fc.b, :local_get, idx)
@@ -154,15 +153,8 @@ function emit_memoryrefget!(fc::FnCtx, r::CGVal, bc, @nospecialize(typ))
     E = ref_eltype(R)
     ml = memory_layout(fc.cgm.types, E)
     el = ml.elem
-    if el.kind === Ghost
-        # no storage to access: check the bounds (a BoundsError)
-        if !(bc isa CGVal && isconstant(bc) && constant_value(bc) === false)
-            push_in_bounds!(fc, r, ml)
-            emit!(fc.b, :i32_eqz)
-            if!(fc.b); unreachable!(fc.b); end!(fc.b)
-        end
-        return ghost(E, something(ghost_value(E)))
-    end
+    check_ref_bounds!(fc, r, ml, bc)
+    el.kind === Ghost && return ghost(E, something(ghost_value(E)))
     if ml.boxed
         push_element_address!(fc, r, ml)
         emit!(fc.b, :array_get, ml.array)
@@ -179,7 +171,7 @@ function emit_memoryrefget!(fc::FnCtx, r::CGVal, bc, @nospecialize(typ))
         # an undefined element is an error (UndefRefError)
         push_val!(fc, v)
         emit!(fc.b, :ref_is_null)
-        if!(fc.b); unreachable!(fc.b); end!(fc.b)
+        if!(fc.b); throw_error!(fc, Runtime.throw_undefref_error); end!(fc.b)
     end
     return v
 end
@@ -195,6 +187,7 @@ function emit_memoryrefset!(fc::FnCtx, r::CGVal, v::CGVal, bc)
     ml = memory_layout(fc.cgm.types, E)
     v = convert_repr(fc, v, E)
     v.kind === Bottom && return v
+    check_ref_bounds!(fc, r, ml, bc)
     el = ml.elem
     el.kind === Ghost && return v
     if ml.boxed
@@ -254,4 +247,28 @@ function emit_memoryref_isassigned!(fc::FnCtx, r::CGVal, bc)
         end!(fc.b)
     end
     return pop_val!(fc, Bool)
+end
+
+# a BoundsError for the element at the 0-based index `idx()` (an Int) of the memory the
+# reference `r` refers into
+function throw_bounds!(fc::FnCtx, r::CGVal, idx)
+    R = r.typ
+    M = GenericMemory{R.parameters[1],R.parameters[2],R.parameters[3]}
+    mem = () -> convert_repr(fc, CGVal(M, Boxed, LeafVal[r.leaves[1]]), Any)
+    i = () -> (push_val!(fc, idx()); emit!(fc.b, :i64_const, 1); emit!(fc.b, :i64_add); pop_val!(fc, Int))
+    throw_error!(fc, Runtime.throw_bounds_error, mem, i)
+end
+
+# with `boundscheck`, that the reference `r` is to an element of its memory (a reference to
+# the first element of an empty memory is not): a BoundsError otherwise
+function check_ref_bounds!(fc::FnCtx, r::CGVal, ml::MemoryLayout, bc)
+    bc isa CGVal && isconstant(bc) && constant_value(bc) === false && return
+    push_in_bounds!(fc, r, ml)
+    emit!(fc.b, :i32_eqz)
+    if bc isa CGVal && !isconstant(bc)
+        push_val!(fc, convert_repr(fc, bc, Bool)); emit!(fc.b, :i32_and)
+    end
+    if!(fc.b)
+    throw_bounds!(fc, r, () -> (push_leaf!(fc, r.leaves[3]); emit!(fc.b, :i64_extend_i32_u); pop_val!(fc, Int)))
+    end!(fc.b)
 end

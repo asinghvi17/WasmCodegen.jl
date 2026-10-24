@@ -1,0 +1,13 @@
+# The exceptions of the code generator's own checks, where a program reads the exceptions
+# it catches (see `exceptions.jl`): those Julia's C runtime throws for the same errors.
+
+@noinline throw_bounds_error(@nospecialize(a), i::Int) = throw(BoundsError(a, i))
+@noinline throw_divide_error() = throw(DivideError())
+@noinline throw_undefref_error() = throw(UndefRefError())
+@noinline throw_undefvar_error(s::Symbol) = throw(UndefVarError(s))
+@noinline throw_type_error(@nospecialize(expected), @nospecialize(got)) =
+    throw(TypeError(:typeassert, "", expected::Type, got))
+@noinline throw_method_error(@nospecialize(f), @nospecialize(args)) = throw(MethodError(f, args))
+@noinline throw_field_error(@nospecialize(T), s::Symbol) = throw(FieldError(T::DataType, s))
+@noinline throw_rethrow_error() = error("rethrow() not allowed outside a catch block")
+@noinline throw_rethrow_other_error() = error("rethrow(exc) not allowed outside a catch block")

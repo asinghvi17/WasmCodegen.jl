@@ -130,7 +130,7 @@ function emit_intrinsic128!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{C
         # division by zero traps (Julia throws DivideError); typemin ÷ -1 too, for div
         push_leaf!(fc, b.leaves[1]); push_leaf!(fc, b.leaves[2]); emit!(fc.b, :i64_or)
         emit!(fc.b, :i64_eqz)
-        if!(fc.b); unreachable!(fc.b); end!(fc.b)
+        if!(fc.b); throw_error!(fc, Runtime.throw_divide_error); end!(fc.b)
         if f === II.checked_sdiv_int
             push_leaf!(fc, b.leaves[1]); emit!(fc.b, :i64_const, -1); emit!(fc.b, :i64_eq)
             push_leaf!(fc, b.leaves[2]); emit!(fc.b, :i64_const, -1); emit!(fc.b, :i64_eq)
@@ -138,7 +138,7 @@ function emit_intrinsic128!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{C
             push_leaf!(fc, a.leaves[1]); emit!(fc.b, :i64_eqz); emit!(fc.b, :i32_and)
             push_leaf!(fc, a.leaves[2]); emit!(fc.b, :i64_const, typemin(Int64)); emit!(fc.b, :i64_eq)
             emit!(fc.b, :i32_and)
-            if!(fc.b); unreachable!(fc.b); end!(fc.b)
+            if!(fc.b); throw_error!(fc, Runtime.throw_divide_error); end!(fc.b)
         end
         fn = f === II.checked_sdiv_int ? R.sdiv128 : f === II.checked_udiv_int ? R.udiv128 :
              f === II.checked_srem_int ? R.srem128 : R.urem128

@@ -1,0 +1,45 @@
+# LinearAlgebra: BLAS and LAPACK implemented in the runtime (src/runtime/blas.jl, lapack.jl)
+
+using LinearAlgebra
+
+# a well-conditioned matrix (results within rounding of an optimized BLAS's)
+wmat(m, n, s) = [1.0 / (a + b - 1) + (a == b ? 2.0 : 0.0) + 0.1 * sin(a * 3.7 + b * 1.3 + s) for a in 1:m, b in 1:n]
+vec4(x) = (x[1], x[2], x[3], x[4])
+
+la_dot(n::Int) = (v = [sin(k + 0.5n) for k in 1:10n]; w = [cos(1.5k) for k in 1:10n];
+                  (dot(v, w), norm(v), norm(v, 1), Float64(LinearAlgebra.BLAS.iamax(v))))
+la_gemm(n::Int) = (A = wmat(n + 3, 5, 0.1); B = wmat(5, 4, 0.7); C = A * B; D = A' * A; E = A * A';
+                   (C[1, 1], C[end, end], D[2, 3], E[end, 1], sum(A * ones(5)), sum(A' * ones(n + 3))))
+la_gemm32(n::Int) = (A = Float32.(wmat(n + 3, 5, 0.1)); B = Float32.(wmat(5, 4, 0.7)); C = A * B;
+                     (Float64(C[1, 1]), Float64(C[end, end]), Float64(sum(A' * A))))
+la_mul!(n::Int) = (A = wmat(5, 4, 0.3); B = wmat(4, 6, 0.2); C = ones(5, 6); mul!(C, A, B, 2.0, 0.5);
+                   x = ones(5); mul!(x, A, ones(4), 1.0, 3.0); (C[1, 1], C[5, 6], x[1], x[5]))
+la_tri(n::Int) = (A = wmat(5, 5, 0.1); b = [1.0 * k for k in 1:5]; B = wmat(5, 3, 0.4);
+                  (sum(UpperTriangular(A) \ b), sum(LowerTriangular(A) \ B), sum(UpperTriangular(A)' \ b),
+                   sum(UpperTriangular(A) * b), sum(B' / UpperTriangular(A)), sum(Symmetric(A) * b), sum(inv(UpperTriangular(A)))))
+la_lu(n::Int) = (A = wmat(n + 3, n + 3, 0.3); b = [1.0 * k for k in 1:n+3]; F = lu(A);
+                 (det(A), sum(A \ b), sum(inv(A)), sum(F.L), sum(F.U), Float64(sum(F.p)), logabsdet(A)[1]))
+la_chol(n::Int) = (A = wmat(n + 3, n + 3, 0.2); A = A' * A; b = [1.0 * k for k in 1:n+3]; C = cholesky(A);
+                   (sum(C.U), sum(C \ b), det(C), Float64(isposdef(A)), Float64(isposdef(-A))))
+la_qr(n::Int) = (A = wmat(n + 4, 4, 0.3); b = [1.0 * k for k in 1:n+4]; F = qr(A);
+                 (vec4(F \ b)..., abs(F.R[1, 1]), abs(F.R[4, 4]), sum(abs.(F.Q' * b))))
+la_qrp(n::Int) = (A = wmat(n + 4, 4, 0.3); b = [1.0 * k for k in 1:n+4]; F = qr(A, ColumnNorm());
+                  (vec4(F \ b)..., Float64(F.p[1]), abs(F.R[1, 1])))
+la_lsq(n::Int) = (A = wmat(3, 5 + n, 0.2); x = A \ [1.0, 2.0, 3.0]; (x[1], x[2], x[end], sum(x)))
+la_rankdef(n::Int) = (A = wmat(6, 3, 0.1); A = hcat(A, A[:, 1] + A[:, 2]); x = A \ [1.0 * k for k in 1:6]; vec4(x))
+
+@testset "linear algebra" begin
+    for n in 1:3
+        @wtest_approx la_dot(n)
+        @wtest_approx la_gemm(n)
+        @wtest_approx la_lu(n)
+        @wtest_approx la_chol(n)
+        @wtest_approx la_qr(n - 1)
+        @wtest_approx la_qrp(n - 1)
+        @wtest_approx la_lsq(n - 1)
+    end
+    @wtest la_gemm32(1)
+    @wtest_approx la_mul!(1)
+    @wtest_approx la_tri(1)
+    @wtest_approx la_rankdef(1)
+end

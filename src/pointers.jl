@@ -12,7 +12,8 @@
 # known). The memory is addressed by bytes as Julia lays it out, so a pointer may
 # reinterpret it (`Ptr{UInt64}` into bytes, bytes of `UInt32`s).
 
-is_ptr_type(@nospecialize(T)) = T isa DataType && T.name === Ptr.body.name
+# `Ptr`s, and C strings (pointers by another type)
+is_ptr_type(@nospecialize(T)) = T isa DataType && (T.name === Ptr.body.name || T === Cstring || T === Cwstring)
 
 "The address of the pointer `p`, as a UInt64."
 ptr_address(p::CGVal) = CGVal(UInt64, Inline, LeafVal[p.leaves[1]], nothing)
@@ -73,16 +74,17 @@ end
 # of no size, whose "pointers" are their indices (as natively)
 elem_unit(@nospecialize(E)) = E isa Union || Base.aligned_sizeof(E) == 0 ? 1 : Base.aligned_sizeof(E)
 
-"The pointer to the bytes of the String `s` (`jl_string_ptr`)."
-function string_ptr!(fc::FnCtx, s::CGVal, @nospecialize(T))
-    s = convert_repr(fc, s, String)
+"""The pointer to the bytes of the String `s` (`jl_string_ptr`), or of the name of the
+Symbol `s` (`jl_symbol_name`, with `S = Symbol`)."""
+function string_ptr!(fc::FnCtx, s::CGVal, @nospecialize(T), @nospecialize(S=String))
+    s = convert_repr(fc, s, S)
     owner = materialize!(fc, s)
     push_memory_base!(fc, s)
     push_val!(fc, s)
-    emit!(fc.b, :struct_get, layout(fc, String).wtype, DATA_FIELD)
+    emit!(fc.b, :struct_get, layout(fc, S).wtype, DATA_FIELD)
     arr = new_local!(fc, RefType(array_type!(fc.cgm.types, I8), true))
     emit!(fc.b, :local_set, arr)
-    return new_ptr!(fc, T, owner, PtrOrigin(owner, arr, Inst(:i32_const, 0), UInt8))
+    return new_ptr!(fc, T, owner, PtrOrigin(owner, arr, Inst(:i32_const, 0), UInt8, true))
 end
 
 "The pointer to the mutable object `x` (`jl_value_ptr`): to its first field."
@@ -109,7 +111,7 @@ function ptr_offset!(fc::FnCtx, p::CGVal, off::CGVal, add::Bool)
         prim_wtype(fc, off.typ) === I64 && emit!(fc.b, :i32_wrap_i64)
         emit!(fc.b, add ? :i32_add : :i32_sub)
         emit!(fc.b, :local_set, b)
-        o = PtrOrigin(o.mem, o.array, b, o.eltype)
+        o = PtrOrigin(o.mem, o.array, b, o.eltype, o.terminated)
     else
         o = nothing
     end
@@ -476,12 +478,24 @@ end
 # push the bits of an array element, zero-extended to i64
 function push_array_elem_bits!(fc::FnCtx, o::PtrOrigin, b::Int, off::Int, s::Int)
     ml = memory_layout(fc.cgm.types, o.eltype)
+    if o.terminated
+        # the byte past a string's end: its NUL
+        emit!(fc.b, :local_get, b)
+        off != 0 && (emit!(fc.b, :i32_const, off); emit!(fc.b, :i32_add))
+        emit!(fc.b, :i32_const, s); emit!(fc.b, :i32_div_u)
+        push_leaf!(fc, o.array); emit!(fc.b, :array_len)
+        emit!(fc.b, :i32_eq)
+        if!(fc.b, I64)
+        emit!(fc.b, :i64_const, 0)
+        else!(fc.b)
+    end
     push_elem_address!(fc, o, b, off, s)
     st = ml.storage
     emit!(fc.b, st isa PackedType ? :array_get_u : :array_get, ml.array)
     st === F64 && emit!(fc.b, :i64_reinterpret_f64)
     st === F32 && emit!(fc.b, :i32_reinterpret_f32)
     (st === I32 || st === F32 || st isa PackedType) && emit!(fc.b, :i64_extend_i32_u)
+    o.terminated && end!(fc.b)
 end
 
 # set an array element from the bits of the i64 local `bits`
@@ -730,6 +744,13 @@ function finish_pointers!(cgm::CGModule)
             emit!(b, :struct_get, st, DATA_FIELD)
             emit!(b, :local_set, a)
             if kind === :load
+                if any(id -> cgm.types.typelist[id] === String || cgm.types.typelist[id] === Symbol, ids)
+                    # the byte past the end of a string or symbol: its NUL terminator
+                    emit!(b, :local_get, off)
+                    emit!(b, :local_get, a); emit!(b, :array_len); emit!(b, :i64_extend_i32_u)
+                    emit!(b, :i64_eq)
+                    if!(b); emit!(b, :i32_const, 0); return!(b); end!(b)
+                end
                 push_byte_elem!(b, a, off, s)
                 get_elem_bits!(b, at, stg)
                 push_byte_shift!(b, off, s); emit!(b, :i64_shr_u)

@@ -60,14 +60,16 @@ mutable struct CGModule
     diagnostics::Vector{Pair{Core.MethodInstance,Unsupported}}
     "Instructions of the start function (initializing objects of the image)."
     start::Vector{Inst}
+    "How the program uses exceptions (`:none`, `:control`, `:values`: see `exceptions.jl`)."
+    exceptions::Symbol
 end
 
-function CGModule(world::ClosedWorld, config::Config)
+function CGModule(world::ClosedWorld, config::Config, exceptions::Symbol=exception_mode(world))
     m = WModule()
     types = Types(m)
     cgm = CGModule(world, m, types, config, IdDict{Core.MethodInstance,FuncInfo}(),
                    FuncInfo[], nothing, Dict{Any,Any}(), Pair{Core.MethodInstance,Unsupported}[],
-                   Inst[])
+                   Inst[], exceptions)
     cgm.image = Image(cgm)
     return cgm
 end
@@ -89,6 +91,17 @@ struct LoopTarget
     results::Vector{CGVal}
     iv::Union{Nothing,CGVal}
     step::Any
+end
+
+"""
+    TryTarget
+
+An enclosing `try` body: the depth of the label after the `try`, and the locals of its
+results (which a `LeaveOp` assigns before branching there).
+"""
+struct TryTarget
+    exit::Int
+    results::Vector{CGVal}
 end
 
 """
@@ -120,7 +133,18 @@ mutable struct FnCtx
     yields_if::Vector{Bool}
     "The SSA index of the control flow operation being emitted."
     opidx::Int
+    "The enclosing `try` bodies."
+    tries::Vector{TryTarget}
+    "The handler arguments upsilon statements assign, by statement."
+    upsilons::Dict{Int,CGVal}
+    "The local holding the current exception at each `try` (for `pop_exception`)."
+    excsaved::Dict{Int,Int}
 end
+
+FnCtx(cgm::CGModule, info::FuncInfo, sci, b::Builder, args::Vector{CGVal}=CGVal[]) =
+    FnCtx(cgm, info, sci, b, args, Dict{Int,Any}(), Dict{Int,CGVal}(), LoopTarget[], 0,
+          Vector{CGVal}[], Dict{Int,Any}(), Set{Int}(), Uses(), Bool[], 0, TryTarget[],
+          Dict{Int,CGVal}(), Dict{Int,Int}())
 
 layout(fc::FnCtx, @nospecialize(T)) = layout(fc.cgm.types, T)
 valtypes(fc::FnCtx, @nospecialize(T)) = valtypes(fc.cgm.types, T)

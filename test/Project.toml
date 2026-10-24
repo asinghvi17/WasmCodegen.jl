@@ -1,4 +1,5 @@
 [deps]
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 IRStructurizer = "93e32bba-5bb8-402b-805d-ffb066edee93"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"

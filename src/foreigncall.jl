@@ -81,6 +81,8 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return convert_repr(fc, args[1]::CGVal, typ)
     elseif name === :jl_string_ptr
         return string_ptr!(fc, args[1]::CGVal, typ)
+    elseif name === :jl_symbol_name
+        return string_ptr!(fc, args[1]::CGVal, typ, Symbol)
     elseif name === :jl_value_ptr
         return object_ptr!(fc, args[1]::CGVal, typ)
     elseif (r = runtime_ccall(name)) !== nothing
@@ -88,6 +90,12 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     elseif name === :jl_get_world_counter || name === :jl_get_tls_world_age
         # the world the code was compiled in: there is one
         return const_value(fc, convert(typ, fc.cgm.world.world))
+    elseif name === :jl_rethrow
+        return emit_rethrow!(fc)
+    elseif name === :jl_rethrow_other
+        return emit_rethrow!(fc, args[1])
+    elseif name === :jl_current_exception
+        return emit_the_exception!(fc)
     elseif typ === Union{}
         unreachable!(fc.b)
         return bottom()
@@ -99,9 +107,10 @@ end
     emit_objectid!(fc, x) -> CGVal
 
 `objectid(x)` as Julia's C runtime computes it, where it does not depend on addresses: of a
-symbol, its hash; of an isbits value without padding of 1, 2, 4 or 8 bytes, the hash of its
-bits mixed with its type's hash (`immut_id_`); of a singleton, from its type's hash. Hashes
-of `Dict`s built at compile time depend on these values.
+symbol, its hash; of a string, the hash of its bytes; of an isbits value without padding of
+1, 2, 4 or 8 bytes, the hash of its bits mixed with its type's hash (`immut_id_`); of a
+singleton, from its type's hash. Hashes of `Dict`s built at compile time depend on these
+values. Of another mutable object, a hash of its identity hash (natively of its address).
 """
 function emit_objectid!(fc::FnCtx, x::CGVal)
     T = x.typ
@@ -113,21 +122,47 @@ function emit_objectid!(fc::FnCtx, x::CGVal)
         push_val!(fc, x)
         emit!(fc.b, :struct_get, layout(fc, Symbol).wtype, SYMBOL_HASH_FIELD)
         return pop_val!(fc, UInt64)
+    elseif T === String
+        # of its bytes, as natively
+        return call_runtime!(fc, Runtime.memhash, CGVal[x, const_value(fc, 0xedc3b677)])
+    elseif T isa DataType && isconcretetype(T) && ismutabletype(T) && layout(fc, T).kind === Boxed
+        # natively a hash of its address: of an object of the image, the one it had natively;
+        # of others, a hash of their identity hash (see `objectid_mutable_func!`)
+        push_val!(fc, convert_repr(fc, x, Any))
+        call!(fc.b, objectid_mutable_func!(fc.cgm))
+        return pop_val!(fc, UInt64)
     end
-    (T isa DataType && isbitstype(T)) || unsupported("objectid of a value of type ", T)
-    h = UInt64(reinterpret(UInt32, getfield(T, :hash)))
-    sz = sizeof(T)
-    sz == 0 && return const_value(fc, ~h)
-    I = sz == 1 ? Int8 : sz == 2 ? Int16 : sz == 4 ? Int32 : sz == 8 ? UInt64 : nothing
-    (I !== nothing && !Base.datatype_haspadding(T) &&
-     (isprimitivetype(T) || (Base.datatype_isbitsegal(T) && Base.datatype_pointerfree(T)))) ||
+    (T isa DataType && isconcretetype(T) && !ismutabletype(T)) ||
         unsupported("objectid of a value of type ", T)
-    bits = emit_reinterpret_bits!(fc, I, x, T)
-    r = call_runtime!(fc, Runtime.bits_hash, CGVal[bits])
-    push_val!(fc, r)
-    emit!(fc.b, :i64_const, reinterpret(Int64, h))
-    emit!(fc.b, :i64_xor)
-    return pop_val!(fc, UInt64)
+    return immut_id!(fc, x, T, const_value(fc, UInt64(reinterpret(UInt32, getfield(T, :hash)))))
+end
+
+# `immut_id_(T, x, h)`: the id of the immutable value `x`, from `h`: of its bits where it has
+# no padding and no references, else of its fields' ids, mixed in order (a field stored as
+# a reference: the id of its value; stored inline: its own `immut_id_` from 0)
+function immut_id!(fc::FnCtx, x::CGVal, @nospecialize(T), h::CGVal)
+    sz = sizeof(T)
+    if sz == 0
+        push_val!(fc, h); emit!(fc.b, :i64_const, -1); emit!(fc.b, :i64_xor)
+        return pop_val!(fc, UInt64)
+    end
+    if !Base.datatype_haspadding(T) && Base.datatype_pointerfree(T) &&
+       (isprimitivetype(T) || Base.datatype_isbitsegal(T))
+        I = sz == 1 ? Int8 : sz == 2 ? Int16 : sz == 4 ? Int32 : sz == 8 ? UInt64 : NTuple{sz,UInt8}
+        # (other sizes: memhash of the bytes)
+        bits = emit_reinterpret_bits!(fc, I, x, T)
+        r = call_runtime!(fc, Runtime.bits_hash, CGVal[bits])
+        push_val!(fc, r); push_val!(fc, h); emit!(fc.b, :i64_xor)
+        return pop_val!(fc, UInt64)
+    end
+    for i in 1:fieldcount(T)
+        FT = fieldtype(T, i)
+        v = get_field(fc, x, i)
+        u = Base.allocatedinline(FT) ? immut_id!(fc, convert_repr(fc, v, FT), FT, const_value(fc, UInt64(0))) :
+            emit_objectid!(fc, v)
+        h = call_runtime!(fc, Runtime.bitmix, CGVal[h, u])
+    end
+    return h
 end
 
 "A `String` or `Symbol` (`T`) of a copy of the `n` bytes at the pointer `p`."
@@ -313,6 +348,12 @@ end
 const RUNTIME_CCALLS = Dict{Symbol,RuntimeCcall}(
     # Unicode properties (libutf8proc, libjulia): tables of the native libraries
     :utf8proc_category => RuntimeCcall(Runtime.UnicodeData.category, [:val]),
+    :utf8proc_isupper => RuntimeCcall(Runtime.UnicodeData.isupper, [:val]),
+    :utf8proc_charwidth => RuntimeCcall(Runtime.UnicodeData.charwidth, [:val]),
+    :utf8proc_islower => RuntimeCcall(Runtime.UnicodeData.islower, [:val]),
+    :utf8proc_toupper => RuntimeCcall(Runtime.UnicodeData.toupper, [:val]),
+    :utf8proc_tolower => RuntimeCcall(Runtime.UnicodeData.tolower, [:val]),
+    :utf8proc_totitle => RuntimeCcall(Runtime.UnicodeData.totitle, [:val]),
     :jl_id_char => RuntimeCcall(Runtime.UnicodeData.id_char, [:val]),
     :jl_id_start_char => RuntimeCcall(Runtime.UnicodeData.id_start_char, [:val]),
     :utf8proc_grapheme_break_stateful =>
@@ -320,11 +361,64 @@ const RUNTIME_CCALLS = Dict{Symbol,RuntimeCcall}(
     # the C library's float parsing and errno
     :jl_strtod_c => RuntimeCcall(Runtime.Floats.strtod, [:val, :val]),
     :jl_strtof_c => RuntimeCcall(Runtime.Floats.strtof, [:val, :val]),
+    :jl_try_substrtod => RuntimeCcall(Runtime.Floats.try_substrtod, [:val, :val, :val]),
+    :jl_try_substrtof => RuntimeCcall(Runtime.Floats.try_substrtof, [:val, :val, :val]),
     :jl_set_errno => RuntimeCcall(Runtime.Floats.set_errno, [:val]),
     :jl_errno => RuntimeCcall(Runtime.Floats.get_errno, Symbol[]),
+    # C strings: the bytes before a NUL (a string's or symbol's end)
+    :strlen => RuntimeCcall(Runtime.ptr_strlen, [:val]),
+    :jl_cstr_to_string => RuntimeCcall(Runtime.cstr_to_string, [:val]),
     # hashing of strings before Julia 1.13
     :memhash_seed => RuntimeCcall(Runtime.memhash_seed, [:val, :val, :val]),
 )
+
+# BLAS (libblastrampoline's ILP64 names, `dgemm_64_`): an argument by reference is loaded
+# (`:ref`), an array is passed as a reference to its first element where possible
+# (`:array`), the lengths of character arguments Fortran adds are dropped (`:ignore`)
+for (p, T) in (("d", Float64), ("s", Float32))
+    B = Runtime.BLAS
+    r, a, v, x = :ref, :array, :val, :ignore
+    for (name, f, kinds) in (
+            ("$(p)copy_", B.copy!, [r, a, r, a, r]),
+            ("$(p)scal_", B.scal!, [r, r, a, r]),
+            ("cblas_$(p)dot", B.dot, [v, a, v, a, v]),
+            ("$(p)nrm2_", B.nrm2, [r, a, r]),
+            ("$(p)asum_", B.asum, [r, a, r]),
+            ("$(p)axpy_", B.axpy!, [r, r, a, r, a, r]),
+            ("$(p)axpby_", B.axpby!, [r, r, a, r, r, a, r]),
+            ("i$(p)amax_", B.iamax, [r, a, r]),
+            ("$(p)gemv_", B.gemv!, [r, r, r, r, a, r, a, r, r, a, r, x]),
+            ("$(p)symv_", B.symv!, [r, r, r, a, r, a, r, r, a, r, x]),
+            ("$(p)trmv_", B.trmv!, [r, r, r, r, a, r, a, r, x, x, x]),
+            ("$(p)trsv_", B.trsv!, [r, r, r, r, a, r, a, r, x, x, x]),
+            ("$(p)ger_", B.ger!, [r, r, r, a, r, a, r, a, r]),
+            ("$(p)gemm_", B.gemm!, [r, r, r, r, r, r, a, r, a, r, r, a, r, x, x]),
+            ("$(p)syrk_", B.syrk!, [r, r, r, r, r, a, r, r, a, r, x, x]),
+            ("$(p)symm_", B.symm!, [r, r, r, r, r, a, r, a, r, r, a, r, x, x]),
+            ("$(p)trmm_", B.trmm!, [r, r, r, r, r, r, r, a, r, a, r, x, x, x, x]),
+            ("$(p)trsm_", B.trsm!, [r, r, r, r, r, r, r, a, r, a, r, x, x, x, x]))
+        RUNTIME_CCALLS[Symbol(name, "64_")] = RuntimeCcall(f, kinds)
+    end
+    # LAPACK (outputs, `info` and pivots, are arrays written through)
+    P = Runtime.LAPACK
+    for (name, f, kinds) in (
+            ("$(p)getrf_", P.getrf!, [r, r, a, r, a, a]),
+            ("$(p)getrs_", P.getrs!, [r, r, r, a, r, a, a, r, a, x]),
+            ("$(p)getri_", P.getri!, [r, a, r, a, a, r, a]),
+            ("$(p)potrf_", P.potrf!, [r, r, a, r, a, x]),
+            ("$(p)potrs_", P.potrs!, [r, r, r, a, r, a, r, a, x]),
+            ("$(p)trtrs_", P.trtrs!, [r, r, r, r, r, a, r, a, r, a, x, x, x]),
+            ("$(p)lacpy_", P.lacpy!, [r, r, r, a, r, a, r, x]),
+            ("$(p)geqp3_", P.geqp3!, [r, r, a, r, a, a, a, r, a]),
+            ("$(p)ormqr_", P.ormqr!, [r, r, r, r, r, a, r, a, a, r, a, r, a, x, x]),
+            ("$(p)tzrzf_", P.tzrzf!, [r, r, a, r, a, a, r, a]),
+            ("$(p)ormrz_", P.ormrz!, [r, r, r, r, r, r, a, r, a, a, r, a, r, a, x, x]),
+            ("$(p)laic1_", P.laic1!, [r, r, a, r, a, r, a, a, a]),
+            ("$(p)geqrt_", P.geqrt!, [r, r, r, a, r, a, r, a, a]),
+            ("$(p)gemqrt_", P.gemqrt!, [r, r, r, r, r, r, a, r, a, r, a, r, a, a, x, x]))
+        RUNTIME_CCALLS[Symbol(name, "64_")] = RuntimeCcall(f, kinds)
+    end
+end
 
 runtime_ccall(name) = name === nothing ? nothing : get(RUNTIME_CCALLS, name, nothing)
 
@@ -339,9 +433,11 @@ function emit_runtime_ccall!(fc::FnCtx, r::RuntimeCcall, args::Vector{Any}, @nos
         elseif kind === :ref
             push!(vals, ptr_load!(fc, a, const_value(fc, 1), eltype(a.typ)))
         elseif kind === :array
+            # a reference to the element, where the pointer is known to point into a memory
+            # of its element type; else the pointer
             o = array_origin(a)
-            o === nothing && unsupported("an array argument that does not point into a Memory")
-            push!(vals, element_ref!(fc, o, const_value(fc, 1), o.eltype))
+            push!(vals, o !== nothing && is_ptr_type(a.typ) && o.eltype === eltype(a.typ) ?
+                        element_ref!(fc, o, const_value(fc, 1), o.eltype) : a)
         end
     end
     res = call_runtime!(fc, r.f, vals)

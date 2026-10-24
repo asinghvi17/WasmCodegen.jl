@@ -146,3 +146,63 @@ function current_task_global!(cgm::CGModule)
     end
     return g
 end
+
+"""
+    objectid_mutable_func!(cgm) -> Func
+
+`(x::\$JlValue) -> i64`: the `objectid` of the mutable object `x`. An object of the image has
+the one it had natively (its header's hash is -k for the k-th of the image's native ids),
+so that hash tables built at compile time find their keys; another one, a hash of its
+identity hash (natively of its address). Generated when the image is complete.
+"""
+objectid_mutable_func!(cgm::CGModule) = get!(cgm.helpers, :objectid_mutable) do
+    add_func!(cgm.mod, "jl_objectid_mutable", ValType[jlvalue_ref(cgm.types)], ValType[I64])
+end
+
+function finish_objectid!(cgm::CGModule)
+    f = get(cgm.helpers, :objectid_mutable, nothing)
+    f === nothing && return
+    ids = cgm.image.native_ids
+    ts = cgm.types
+    i64s = array_type!(ts, I64)
+    seg = add_data!(cgm.mod, isempty(ids) ? zeros(UInt8, 8) : collect(reinterpret(UInt8, ids)))
+    g = add_global!(cgm.mod, "jl_native_ids", RefType(i64s, true), true, Inst[Inst(:ref_null, i64s)])
+    b = Builder(cgm.mod, f)
+    h = add_local!(f, I32)
+    k = add_local!(f, I64)
+    emit!(b, :local_get, 0); call!(b, object_hash_func!(cgm)); emit!(b, :local_tee, h)
+    emit!(b, :i32_const, 0); emit!(b, :i32_lt_s)
+    if!(b)
+    emit!(b, :global_get, g); emit!(b, :ref_is_null)
+    if!(b)
+    emit!(b, :i32_const, 0); emit!(b, :i32_const, max(1, length(ids))); emit!(b, :array_new_data, i64s, seg)
+    emit!(b, :global_set, g)
+    end!(b)
+    emit!(b, :global_get, g)
+    emit!(b, :i32_const, -1); emit!(b, :local_get, h); emit!(b, :i32_sub)   # -h - 1
+    emit!(b, :array_get, i64s)
+    return!(b)
+    end!(b)
+    # int64hash(h) (Thomas Wang's, as `objectid`'s)
+    emit!(b, :local_get, h); emit!(b, :i64_extend_i32_u); emit!(b, :local_set, k)
+    step!(op1, sh, op2) = begin
+        emit!(b, :local_get, k)
+        emit!(b, :local_get, k); emit!(b, :i64_const, sh); emit!(b, op1)
+        emit!(b, op2); emit!(b, :local_set, k)
+    end
+    # key = (~key) + (key << 21)
+    emit!(b, :local_get, k); emit!(b, :i64_const, -1); emit!(b, :i64_xor)
+    emit!(b, :local_get, k); emit!(b, :i64_const, 21); emit!(b, :i64_shl); emit!(b, :i64_add); emit!(b, :local_set, k)
+    step!(:i64_shr_u, 24, :i64_xor)                        # key ^ (key >> 24)
+    # key = (key + (key << 3)) + (key << 8)
+    emit!(b, :local_get, k); emit!(b, :local_get, k); emit!(b, :i64_const, 3); emit!(b, :i64_shl); emit!(b, :i64_add)
+    emit!(b, :local_get, k); emit!(b, :i64_const, 8); emit!(b, :i64_shl); emit!(b, :i64_add); emit!(b, :local_set, k)
+    step!(:i64_shr_u, 14, :i64_xor)                        # key ^ (key >> 14)
+    # key = (key + (key << 2)) + (key << 4)
+    emit!(b, :local_get, k); emit!(b, :local_get, k); emit!(b, :i64_const, 2); emit!(b, :i64_shl); emit!(b, :i64_add)
+    emit!(b, :local_get, k); emit!(b, :i64_const, 4); emit!(b, :i64_shl); emit!(b, :i64_add); emit!(b, :local_set, k)
+    step!(:i64_shr_u, 28, :i64_xor)                        # key ^ (key >> 28)
+    step!(:i64_shl, 31, :i64_add)                          # key + (key << 31)
+    emit!(b, :local_get, k)
+    finish!(b)
+end

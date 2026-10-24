@@ -8,5 +8,8 @@ WasmCodegen.with_trim_patches() do _, _
     include("random.jl")
     include("dicts.jl")
     include("globals.jl")
+    include("exceptions.jl")
+    include("coverage.jl")
+    include("linalg.jl")
     include("juliac/runtests.jl")
 end

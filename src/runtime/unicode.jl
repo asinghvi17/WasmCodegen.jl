@@ -1,5 +1,5 @@
 # Unicode properties of characters, for what Base and the parser ask libutf8proc and libjulia
-# (`utf8proc_category`, `jl_id_char`, `jl_id_start_char`, grapheme breaks). The tables are
+# (`utf8proc_category`, case, `jl_id_char`, `jl_id_start_char`, grapheme breaks). The tables are
 # computed from the native libraries when WasmCodegen is compiled, as runs of code points
 # with one value, so they are the ones of the Julia that compiles the program; a module
 # that uses one carries it as data.
@@ -7,9 +7,9 @@
 module UnicodeData
 
 # the runs of `f` over all code points: (first code point of each run, value of the run)
-function runs(f)
+function runs(f, ::Type{T}=Int8) where {T}
     starts = UInt32[]
-    values = Int8[]
+    values = T[]
     prev = typemin(Int)
     for c in UInt32(0):UInt32(0x10ffff)
         v = Int(f(c))
@@ -23,13 +23,19 @@ function runs(f)
 end
 
 # the value of the run holding `c`, or `invalid` past the last code point
-function lookup(table::Tuple{Vector{UInt32},Vector{Int8}}, c::UInt32, invalid::Int8)
+function lookup(table::Tuple{Vector{UInt32},Vector{T}}, c::UInt32, invalid::T) where {T}
     c > 0x10ffff && return invalid
     starts, values = table
     return @inbounds values[searchsortedlast(starts, c)]
 end
 
 native_category(c) = ccall(:utf8proc_category, Cint, (UInt32,), c)
+native_isupper(c) = ccall(:utf8proc_isupper, Cint, (UInt32,), c)
+native_charwidth(c) = ccall(:utf8proc_charwidth, Cint, (UInt32,), c)
+native_islower(c) = ccall(:utf8proc_islower, Cint, (UInt32,), c)
+native_toupper(c) = ccall(:utf8proc_toupper, UInt32, (UInt32,), c)
+native_tolower(c) = ccall(:utf8proc_tolower, UInt32, (UInt32,), c)
+native_totitle(c) = ccall(:utf8proc_totitle, UInt32, (UInt32,), c)
 native_id_char(c) = ccall(:jl_id_char, Cint, (UInt32,), c)
 native_id_start_char(c) = ccall(:jl_id_start_char, Cint, (UInt32,), c)
 
@@ -47,7 +53,15 @@ const ID_CHAR = runs(native_id_char)
 const ID_START_CHAR = runs(native_id_start_char)
 const BOUNDCLASS = runs(c -> native_break_classes(c) & 0xff)
 const INDIC_CONJUNCT = runs(c -> native_break_classes(c) >> 8)
+const IS_UPPER = runs(native_isupper)
+const CHARWIDTH = runs(native_charwidth)
+const IS_LOWER = runs(native_islower)
+# case mappings as runs of the offset to the mapped code point
+const TO_UPPER = runs(c -> Int32(native_toupper(c)) - Int32(c), Int32)
+const TO_LOWER = runs(c -> Int32(native_tolower(c)) - Int32(c), Int32)
+const TO_TITLE = runs(c -> Int32(native_totitle(c)) - Int32(c), Int32)
 const CATEGORY_INVALID = Int8(native_category(0x110000))
+const CHARWIDTH_INVALID = Int8(native_charwidth(0x110000))
 const ID_CHAR_INVALID = Int8(native_id_char(0x110000))
 const ID_START_CHAR_INVALID = Int8(native_id_start_char(0x110000))
 const BOUNDCLASS_INVALID = Int8(native_break_classes(0x110000) & 0xff)
@@ -55,6 +69,18 @@ const INDIC_CONJUNCT_INVALID = Int8(native_break_classes(0x110000) >> 8)
 
 "`utf8proc_category(c)`."
 category(c::UInt32) = Int32(lookup(CATEGORY, c, CATEGORY_INVALID))
+"`utf8proc_charwidth(c)`: the columns `c` takes in a terminal."
+charwidth(c::UInt32) = Int32(lookup(CHARWIDTH, c, CHARWIDTH_INVALID))
+"`utf8proc_isupper(c)`."
+isupper(c::UInt32) = Int32(lookup(IS_UPPER, c, Int8(0)))
+"`utf8proc_islower(c)`."
+islower(c::UInt32) = Int32(lookup(IS_LOWER, c, Int8(0)))
+"`utf8proc_toupper(c)`."
+toupper(c::UInt32) = (c + lookup(TO_UPPER, c, Int32(0))) % UInt32
+"`utf8proc_tolower(c)`."
+tolower(c::UInt32) = (c + lookup(TO_LOWER, c, Int32(0))) % UInt32
+"`utf8proc_totitle(c)`."
+totitle(c::UInt32) = (c + lookup(TO_TITLE, c, Int32(0))) % UInt32
 "`jl_id_char(c)`: whether `c` may continue an identifier."
 id_char(c::UInt32) = Int32(lookup(ID_CHAR, c, ID_CHAR_INVALID))
 "`jl_id_start_char(c)`: whether `c` may start an identifier."

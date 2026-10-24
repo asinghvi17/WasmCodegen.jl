@@ -226,6 +226,9 @@ function compute_layout(ts::Types, @nospecialize(T))
     # concrete type, but its values are inline all the same
     is_inline_tuple(T) && return immutable_layout(ts, T)
     is_vararg_tuple(T) && return tuple_array_layout(ts, T, vararg_eltype(T))
+    T === Core.TypeName && return boxed_layout(ts, T, typename_object_type!(ts))
+    # a SimpleVector (a type's parameters): its elements in an array, as a large tuple's
+    T === Core.SimpleVector && return tuple_array_layout(ts, T, Any)
     if !(T isa DataType) || !isconcretetype(T) || any(R -> T === R, RUNTIME_TYPES)
         # abstract types, unions, type objects: any object
         return Layout(T, Boxed, [Leaf(jlvalue_ref(ts))], UnitRange{Int}[], ts.jlvalue)
@@ -247,6 +250,10 @@ function compute_layout(ts::Types, @nospecialize(T))
                       UnitRange{Int}[], nothing)
     elseif ismutabletype(T)
         return mutable_struct_layout(ts, T)
+    elseif !Base.allocatedinline(T)
+        # an immutable type Julia does not store inline: one that contains itself
+        # (`Base.ImmutableDict`), an immutable object
+        return struct_object_layout(ts, T, false)
     else
         return immutable_layout(ts, T)
     end
@@ -294,18 +301,22 @@ function immutable_layout(ts::Types, @nospecialize(T))
     return Layout(T, Inline, leaves, ranges, nothing)
 end
 
-function mutable_struct_layout(ts::Types, @nospecialize(T))
-    # declare the type first: fields may refer to it
+mutable_struct_layout(ts::Types, @nospecialize(T)) = struct_object_layout(ts, T, true)
+
+# the layout of a struct whose values are objects with a Wasm field per leaf (mutable or
+# not); the type is declared first, as fields may refer to it
+function struct_object_layout(ts::Types, @nospecialize(T), mutable::Bool)
     m = ts.mod
     idx = length(m.types)
     wtype = TypeRef(idx)
     push!(m.types, SubType(StructType(FieldType[]); final=true, super=ts.jlvalue))
     l = boxed_layout(ts, T, wtype)
     ts.layouts[T] = l
+    mutable || (ts.boxes[(:box, T)] = wtype)
     leaves, ranges = struct_field_ranges(ts, T, HEADER_FIELDS)
     fields = FieldType[FieldType(I32, false), FieldType(I32, true)]
     for leaf in leaves
-        push!(fields, FieldType(nullable_storage(leaf.storage), true))
+        push!(fields, FieldType(nullable_storage(leaf.storage), mutable))
     end
     m.types[idx+1] = SubType(StructType(fields); final=true, super=ts.jlvalue)
     l.fields = ranges
@@ -431,6 +442,20 @@ function type_object_type!(ts::Types)
     get!(ts.boxes, :typeobject) do
         add_type!(ts.mod, StructType([FieldType(I32, false), FieldType(I32, true),
                                        FieldType(I32, false)]);
+                  final=true, super=ts.jlvalue)
+    end
+end
+
+"""
+    typename_object_type!(ts) -> TypeRef
+
+The Wasm struct type of `Core.TypeName` objects: the header and the name (a Symbol), the
+one field of theirs code reads at run time (to print a type's name).
+"""
+function typename_object_type!(ts::Types)
+    get!(ts.boxes, :typename) do
+        add_type!(ts.mod, StructType([FieldType(I32, false), FieldType(I32, true),
+                                       FieldType(layout(ts, Symbol).leaves[1].type, false)]);
                   final=true, super=ts.jlvalue)
     end
 end

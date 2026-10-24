@@ -32,11 +32,27 @@ mutable struct Image
     "The globals of the arrays of `Memory`, `String` and `Symbol` objects."
     arrays::IdDict{Any,Global}
     counter::Int
+    "The native `objectid`s of the mutable objects, which their headers' hash refers to."
+    native_ids::Vector{UInt64}
 end
 
 Image(cgm) = Image(cgm, IdDict{Any,Global}(), IdDict{Any,Global}(), IdDict{Any,Global}(),
                    IdSet{Any}(), Inst[], Any[],
-                   Dict{Tuple{Module,Symbol},Tuple{Any,Vector{Global},Union{Nothing,Global}}}(), IdDict{Any,Global}(), 0)
+                   Dict{Tuple{Module,Symbol},Tuple{Any,Vector{Global},Union{Nothing,Global}}}(), IdDict{Any,Global}(), 0,
+                   UInt64[])
+
+"""
+    header_hash(img, x) -> Inst
+
+The hash field of the header of the object `x`: of a mutable object, -k for its native
+`objectid`, the k-th of `img.native_ids` (so that hash tables built natively find it, see
+`objectid_mutable_func!`); of others, 0 (none assigned yet).
+"""
+function header_hash(img::Image, @nospecialize(x))
+    ismutable(x) && !(x isa String) || return Inst(:i32_const, 0)
+    push!(img.native_ids, objectid(x))
+    return Inst(:i32_const, -Int32(length(img.native_ids)))
+end
 
 types(img::Image) = img.cgm.types
 
@@ -213,6 +229,16 @@ function object_global!(img::Image, @nospecialize(x))
         return bytes_object_global!(img, x)
     elseif is_memory_type(T)
         return memory_global!(img, x)
+    elseif T === Core.TypeName
+        st = typename_object_type!(ts)
+        init = Inst[Inst(:i32_const, typeid!(ts, T)), Inst(:i32_const, 0),
+                    Inst(:global_get, object_global!(img, x.name)), Inst(:struct_new, st)]
+        g = add_global!(img.cgm.mod, "jl_typename_" * replace(string(x.name), r"[^A-Za-z0-9_]" => "_"),
+                        RefType(st, false), false, init)
+        img.globals[x] = g
+        return g
+    elseif T === Core.SimpleVector
+        return tuple_array_global!(img, x, l)
     elseif any(R -> T === R, RUNTIME_TYPES)
         unsupported("serializing the runtime object ", x, " of type ", T)
     elseif T <: Ptr || T === Ptr
@@ -231,8 +257,9 @@ end
 function tuple_array_global!(img::Image, @nospecialize(x), l::Layout; register::Bool=true)
     ts = types(img)
     T = typeof(x)
-    mem = Memory{(l.elements::MemoryLayout).elem.T}(undef, fieldcount(T))
-    for i in 1:fieldcount(T)
+    n = x isa Core.SimpleVector ? length(x) : fieldcount(T)
+    mem = Memory{(l.elements::MemoryLayout).elem.T}(undef, n)
+    for i in 1:n
         mem[i] = x[i]
     end
     memory_global!(img, mem)
@@ -279,7 +306,7 @@ function memory_object_global!(img::Image, mem, arr::Global)
     T = typeof(mem)
     img.arrays[mem] = arr
     st = memory_struct_type!(ts, memory_eltype(T))
-    init = Inst[Inst(:i32_const, typeid!(ts, T)), Inst(:i32_const, 0), Inst(:global_get, arr),
+    init = Inst[Inst(:i32_const, typeid!(ts, T)), header_hash(img, mem), Inst(:global_get, arr),
                 Inst(:struct_new, st)]
     g = add_global!(img.cgm.mod, global_name(img, mem), RefType(st, false), false, init)
     img.globals[mem] = g
@@ -307,7 +334,7 @@ function struct_global!(img::Image, @nospecialize(x), l::Layout)
     T = typeof(x)
     push!(img.inprogress, x)
     back = Any[]
-    init = Inst[Inst(:i32_const, typeid!(ts, T)), Inst(:i32_const, 0)]
+    init = Inst[Inst(:i32_const, typeid!(ts, T)), header_hash(img, x)]
     try
         for i in 1:fieldcount(T)
             FT = fieldtype(T, i)
@@ -505,7 +532,7 @@ function nonconst_global(fc::FnCtx, ref::GlobalRef)
     if def !== nothing
         # not assigned yet: an UndefVarError
         emit!(fc.b, :global_get, def); emit!(fc.b, :i32_eqz)
-        if!(fc.b); unreachable!(fc.b); end!(fc.b)
+        if!(fc.b); throw_error!(fc, Runtime.throw_undefvar_error, () -> const_value(fc, ref.name)); end!(fc.b)
     end
     l = layout(fc, T)
     l.kind === Ghost && return ghost(T, something(ghost_value(T)))

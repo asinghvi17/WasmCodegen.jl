@@ -25,9 +25,7 @@ function call_outlined!(fc::FnCtx, key, name::AbstractString, args::Vector{CGVal
         results = lt.kind === Ghost || lt.kind === Bottom ? ValType[] : valtypes(cgm, T)
         f = add_func!(cgm.mod, helper_name(cgm, name), params, results)
         cgm.helpers[key] = f
-        hfc = FnCtx(cgm, fc.info, nothing, Builder(cgm.mod, f), CGVal[], Dict{Int,Any}(),
-                    Dict{Int,CGVal}(), LoopTarget[], 0, Vector{CGVal}[], Dict{Int,Any}(), Set{Int}(),
-                    Uses(), Bool[], 0)
+        hfc = FnCtx(cgm, fc.info, nothing, Builder(cgm.mod, f))
         hargs = CGVal[]
         k = 0
         for a in args

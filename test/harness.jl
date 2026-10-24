@@ -135,3 +135,27 @@ macro wtest(ex)
         end
     end
 end
+
+"""
+    @wtest_approx f(args...)
+
+As `@wtest`, for results of floating-point computations whose order of operations may
+differ (BLAS, LAPACK): equal within `rtol = 1e-10` (and `atol = 1e-12`), element by element
+for tuples.
+"""
+macro wtest_approx(ex)
+    Meta.isexpr(ex, :call) || error("@wtest_approx expects a call")
+    f = esc(ex.args[1])
+    args = map(esc, ex.args[2:end])
+    quote
+        local f = $f
+        local args = ($(args...),)
+        local expected = Base.invokelatest(f, args...)
+        local c = wcompile(f, map(Core.Typeof, args))
+        local got = wasm_run(c, string(nameof(f)), args...; rettype=Base.return_types(f, map(Core.Typeof, args))[1])
+        local close = typeof(got) === typeof(expected) &&
+            all(isapprox.(got isa Tuple ? got : (got,), expected isa Tuple ? expected : (expected,); rtol=1e-10, atol=1e-12))
+        @test close
+        close || @info "mismatch" expected got
+    end
+end
