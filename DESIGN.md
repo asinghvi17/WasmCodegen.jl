@@ -187,7 +187,9 @@ As in JuliaCodegen (and Julia's code generator), a value's representation follow
   most 64 leaves: a flat list of Wasm values, its *leaves* (`SVector{3,Float64}` is three
   `f64`s). Never allocated: `getfield` selects leaves, `new` gathers them, calls take and
   return them as multiple values. Tuples whose fields are unique `Type{X}`s (packed varargs)
-  are inline too;
+  are inline too, and so are tuples with elements of small unions of concrete types
+  (`Tuple{Bool, Union{Nothing, Int}}`, the union element boxed): boxed, such a tuple is of
+  one of its few concrete types, which boxing and unboxing test;
 - **boxed**: everything else, one reference.
 
 Primitives: 8/16/32-bit integers, `Bool`, `Char` (its bits) are `i32`, kept zero-extended
@@ -299,7 +301,9 @@ inline, with Julia's semantics where Wasm's differ: over-shifts, saturating floa
 checked arithmetic, `fpiseq`, IEEE `min`/`max`, division traps. A `PiNode` narrows without
 a check, as natively: Julia's optimizer sometimes places one where it does not hold (a
 value forwarded with a flag saying whether it is `nothing`, read only where it is not), so
-a boxed value is converted only if it is of the narrower type.
+a boxed value is converted only if it is of the narrower type. A value of a type
+where one of a type it shares no value with is expected (in code inference put after a
+test that cannot pass) is a trap, not an error.
 
 Operations whose code grows with the value they move are **outlined**: a helper function
 per operation and type, called where they are used (`outline.jl`): `memoryrefget`,
@@ -332,10 +336,11 @@ shared (10% smaller modules for the parser).
   triangular and symmetric products and solves, rank updates), LU (`getrf`, `getrs`,
   `getri`), Cholesky (`potrf`, `potrs`), triangular solves, QR (`geqrt`/`gemqrt`, pivoted
   `geqp3`/`ormqr`) and the rank-deficient least squares behind `\` (`laic1`, `tzrzf`,
-  `ormrz`): reference algorithms, unblocked. An array argument is a `MemoryRef` where the
+  `ormrz`), symmetric eigenvalues (`syevr`) and singular values (`gesdd`) by Jacobi's
+  methods: reference algorithms, unblocked. An array argument is a `MemoryRef` where the
   pointer's memory is known, else the pointer; outputs are written through. Results agree
-  with an optimized BLAS's within rounding (the order of sums differs). Not yet: SVD and
-  eigenvalues.
+  with an optimized BLAS's within rounding (the order of sums differs). Vectors of eigen- and
+  singular values agree up to their signs. Not yet: nonsymmetric eigenvalues.
 - **Hashes as the C runtime computes them**, so that dictionaries built at compile time are
   found at run time: `objectid` of symbols (their hash: MurmurHash3 of the name, mixed;
   symbols in the image carry it, computed natively), of isbits values of 1, 2, 4 or 8
