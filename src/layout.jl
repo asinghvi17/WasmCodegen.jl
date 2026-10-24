@@ -169,9 +169,40 @@ is_homogeneous_tuple(@nospecialize T) = T isa DataType && T <: Tuple && isconcre
 function is_inline_tuple(@nospecialize T)
     (T isa DataType && T.name === Tuple.name && !isconcretetype(T) && !Base.isvatuple(T)) ||
         return false
+    is_union_tuple(T) && return true
     return all(P -> (P isa DataType && isconcretetype(P)) || unique_type_parameter(P) !== nothing ||
                     is_inline_tuple(P), T.parameters)
 end
+
+"The most concrete tuple types an inline tuple with union elements may have."
+const MAX_TUPLE_COMBINATIONS = 16
+
+"""
+    is_union_tuple(T) -> Bool
+
+Whether `T` is a tuple type of known length with an element of a small union of concrete
+types (`Tuple{Bool, Union{Nothing, Int}}`): inline like a concrete tuple (the union element
+boxed), and of one of a few concrete tuple types (`tuple_combinations`) when boxed.
+"""
+function is_union_tuple(@nospecialize T)
+    (T isa DataType && T.name === Tuple.name && !isconcretetype(T) && !Base.isvatuple(T)) || return false
+    for P in T.parameters
+        if P isa Union
+            all(U -> U isa DataType && isconcretetype(U), Base.uniontypes(P)) || return false
+        else
+            ((P isa DataType && isconcretetype(P)) || is_union_tuple(P)) || return false
+        end
+    end
+    return length(tuple_combinations(T)) <= MAX_TUPLE_COMBINATIONS
+end
+
+# the types an element of declared type `P` of a union tuple may have
+element_variants(@nospecialize P) =
+    P isa Union ? Base.uniontypes(P) : isconcretetype(P) ? Any[P] : tuple_combinations(P)
+
+"The concrete tuple types a value of the union tuple type `T` may have."
+tuple_combinations(@nospecialize T) =
+    Any[Tuple{c...} for c in Iterators.product((element_variants(P) for P in T.parameters)...)]
 
 is_memory_type(@nospecialize T) = T isa DataType && T.name === GenericMemory.body.body.body.name
 is_memoryref_type(@nospecialize T) =
@@ -372,7 +403,8 @@ function memory_layout(ts::Types, @nospecialize(E))
     if all(l -> l.type isa NumType, leaves)
         return MemoryLayout(el, array_type!(ts, I64), I64, length(leaves), false, true)
     end
-    box = box_type!(ts, E)
+    # (a tuple with union elements is boxed as one of several concrete tuple types: any object)
+    box = is_union_tuple(E) ? ts.jlvalue : box_type!(ts, E)
     st = RefType(box, true)
     return MemoryLayout(el, array_type!(ts, st), st, 1, true, false)
 end

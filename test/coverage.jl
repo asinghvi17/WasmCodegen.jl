@@ -21,7 +21,31 @@ symbol_string(i::Int) = checksum(string(Symbol("sym", i)) * string(:abc, i, 'c',
 type_string(i::Int) = checksum(string(i > 0 ? Int64 : Float64) * string(typeof((i, 2.5))))
 shown(i::Int) = checksum(sprint(show, [i, 2]) * repr((i, 1.5, "s")) * repr([1.5, 2.0 * i]) * repr(Float16[i]))
 
+# tuples with union elements: inline, boxed as one of their concrete types
+function union_tuples(i::Int)
+    t = (i > 1, findfirst(==(i), [1, 3, 5]), i * 1.5)
+    v = Any[t, 1]
+    u = v[1]::Tuple{Bool,Union{Nothing,Int},Float64}
+    w = Tuple{Bool,Union{Nothing,Int},Float64}[t, (true, nothing, 0.5)]
+    (t[2] === nothing ? -1 : t[2]::Int, u === t, u[3], w[1][2] === t[2], t isa Tuple{Bool,Int,Float64},
+     w[2][2] === nothing, any(>(i), 1:5), all(<(i), 1:5))
+end
+
+# an if yielding `nothing` itself on one side and a value of a union on the other
+@noinline maybe_vec(i::Int) = i > 2 ? [1.0, 2.0 * i] : nothing
+function nothing_merge(i::Int)
+    x = i > 0 ? maybe_vec(i) : nothing
+    y = i > 1 ? nothing : maybe_vec(i + 3)
+    (x === nothing ? -1.0 : sum(x), y === nothing ? -2.0 : sum(y))
+end
+
 @testset "coverage" begin
+    for i in 0:4
+        @wtest nothing_merge(i)
+    end
+    for i in 0:5
+        @wtest union_tuples(i)
+    end
     for i in 1:4
         @wtest case_upper(i)
         @wtest padded(i)

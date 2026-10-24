@@ -359,7 +359,7 @@ function get_field_dynamic(fc::FnCtx, x::CGVal, i::CGVal, @nospecialize(typ))
     l = layout(fc, T)
     l.kind === Boxed && l.elements !== nothing && i.typ !== Symbol &&
         return tuple_array_get!(fc, x, i)
-    (T isa DataType && isconcretetype(T) && l.elements === nothing) ||
+    (T isa DataType && (isconcretetype(T) || (l.kind === Inline && is_inline_tuple(T))) && l.elements === nothing) ||
         unsupported("a field of ", T, " at an index not known at compile time")
     n = fieldcount(T)
     if i.typ === Symbol
@@ -477,7 +477,7 @@ function new_tuple_array!(fc::FnCtx, @nospecialize(T), args::Vector{CGVal})
         v = convert_repr(fc, a, E)
         if ml.boxed
             push_val!(fc, box!(fc, v, Any))
-            emit!(fc.b, :ref_cast_null, box_type!(ts, E))
+            is_union_tuple(E) || emit!(fc.b, :ref_cast_null, box_type!(ts, E))
         else
             for (k, leaf) in enumerate(v.leaves)
                 push_leaf!(fc, leaf)
@@ -650,6 +650,16 @@ function emit_isa!(fc::FnCtx, x::CGVal, @nospecialize(T))
         emit!(fc.b, :i32_const, fieldcount(T))
         emit!(fc.b, :i32_eq)
         return pop_val!(fc, Bool)
+    end
+    if is_union_tuple(S)
+        # of the concrete types of its union elements
+        res = const_value(fc, false)
+        for C in tuple_combinations(S)
+            C <: T || continue
+            t = union_tuple_isa!(fc, x, C)
+            isconstant(res) ? (res = t) : (push_val!(fc, res); push_val!(fc, t); emit!(fc.b, :i32_or); res = pop_val!(fc, Bool))
+        end
+        return res
     end
     (lx.kind === Boxed && lx.wtype == fc.cgm.types.jlvalue) ||
         unsupported("isa(::", S, ", ", T, ")")

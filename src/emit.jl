@@ -339,19 +339,21 @@ end
 # the value the result `i` of an if is, when every arm that yields it yields that one
 # value or undefined, and the value has the representation of the result's type
 function if_alias(fc::FnCtx, op::IRStructurizer.IfOp, i::Int, @nospecialize(T))
+    # (a yielded value may be `nothing` itself: whether one was found is a flag)
+    found = false
     v = nothing
     for r in (op.then_region, op.else_region)
         t = r.terminator
         t isa IRStructurizer.YieldOp || continue
         x = t.values[i]
         x isa IRStructurizer.Undef && continue
-        if v === nothing
-            v = x
+        if !found
+            v, found = x, true
         elseif !(v === x)
             return nothing
         end
     end
-    v === nothing && return nothing
+    found || return nothing
     S = static_type(fc, v)
     S === nothing && return nothing
     return same_repr(fc, S, T) ? v : nothing
@@ -653,7 +655,7 @@ is otherwise left undefined (not read).
 """
 function emit_pi!(fc::FnCtx, v::CGVal, @nospecialize(T))
     S = v.typ
-    (v.kind === Boxed && !(S <: T) && layout(fc, S).wtype == fc.cgm.types.jlvalue) ||
+    ((v.kind === Boxed && layout(fc, S).wtype == fc.cgm.types.jlvalue) || is_union_tuple(S)) && !(S <: T) ||
         return convert_repr(fc, v, T)
     layout(fc, T).kind === Ghost && return convert_repr(fc, v, T)
     t = emit_isa!(fc, v, T)
@@ -799,9 +801,20 @@ function convert_repr(fc::FnCtx, v, @nospecialize(T))
         return ghost(T, something(ghost_value(T)))
     elseif lt.kind === Inline
         if lv.kind === Inline
-            length(lv.leaves) == length(lt.leaves) &&
-                all(i -> lv.leaves[i].type == lt.leaves[i].type, eachindex(lt.leaves)) ||
-                unsupported("a conversion from ", v.typ, " to ", T)
+            if !(length(lv.leaves) == length(lt.leaves) &&
+                 all(i -> lv.leaves[i].type == lt.leaves[i].type, eachindex(lt.leaves)))
+                # tuples of different representations of their elements (an element of a
+                # union and one of its types): element by element
+                (v.typ <: Tuple && T <: Tuple && !Base.isvatuple(v.typ) && !Base.isvatuple(T) &&
+                 fieldcount(v.typ) == fieldcount(T)) || return no_conversion!(fc, v.typ, T)
+                leaves = LeafVal[]
+                for i in 1:fieldcount(T)
+                    e = convert_repr(fc, get_field(fc, v, i), fieldtype(T, i))
+                    e.kind === Bottom && return e
+                    append!(leaves, e.leaves)
+                end
+                return CGVal(T, Inline, leaves)
+            end
             return CGVal(T, Inline, v.leaves, v.constant, v.origin)
         elseif lv.kind === Boxed && lv.elements !== nothing
             # a tuple of unknown length (an array) as a tuple of known length: its elements
@@ -811,10 +824,12 @@ function convert_repr(fc::FnCtx, v, @nospecialize(T))
                 append!(leaves, e.leaves)
             end
             return CGVal(T, Inline, leaves)
+        elseif lv.kind === Boxed && is_union_tuple(T)
+            return unbox_union_tuple!(fc, v, T)
         elseif lv.kind === Boxed
             return unbox!(fc, v, T)
         else
-            unsupported("a conversion from ", v.typ, " to ", T)
+            return no_conversion!(fc, v.typ, T)
         end
     else # Boxed
         if lt.wtype == fc.cgm.types.jlvalue
@@ -831,7 +846,7 @@ function convert_repr(fc::FnCtx, v, @nospecialize(T))
         elseif lv.kind === Boxed && lv.wtype == fc.cgm.types.jlvalue
             return unbox!(fc, v, T)
         else
-            unsupported("a conversion from ", v.typ, " to ", T)
+            return no_conversion!(fc, v.typ, T)
         end
     end
 end
@@ -850,6 +865,7 @@ function box!(fc::FnCtx, v::CGVal, @nospecialize(T))
         return CGVal(T, Boxed, LeafVal[Inst(:global_get, g)], v.constant)
     end
     lv.kind === Ghost && unsupported("boxing the ghost ", S, " without its value")
+    is_union_tuple(S) && return CGVal(T, Boxed, box_union_tuple!(fc, v).leaves)
     # by a helper per type (outline.jl)
     r = call_outlined!(fc, (:box, S), "box_" * typename_str(S), CGVal[v], Any, box_inline!)
     return CGVal(T, Boxed, r.leaves)
@@ -874,6 +890,7 @@ The object `v` (a `\$JlValue`) as a value of the concrete type `T` (which it is)
 """
 function unbox!(fc::FnCtx, v::CGVal, @nospecialize(T))
     ts = fc.cgm.types
+    is_union_tuple(T) && return unbox_union_tuple!(fc, v, T)
     lt = layout(fc, T)
     if lt.kind === Boxed && is_jlvalue_type(ts, T)
         push_val!(fc, v)
@@ -899,4 +916,64 @@ function unbox_inline!(fc::FnCtx, v::CGVal, @nospecialize(T))
         emit!(fc.b, st isa PackedType ? :struct_get_u : :struct_get, box, i - 1)
     end
     return pop_val!(fc, T)
+end
+
+## tuples with union elements
+
+# whether the union tuple `v` is of the concrete tuple type `C` (its union elements)
+function union_tuple_isa!(fc::FnCtx, v::CGVal, @nospecialize(C))
+    res = const_value(fc, true)
+    for i in 1:fieldcount(C)
+        P = fieldtype(v.typ, i)
+        isconcretetype(P) && continue
+        e = get_field(fc, v, i)
+        t = P isa Union ? emit_isa!(fc, e, fieldtype(C, i)) : union_tuple_isa!(fc, e, fieldtype(C, i))
+        isconstant(res) ? (res = t) : (push_val!(fc, res); push_val!(fc, t); emit!(fc.b, :i32_and); res = pop_val!(fc, Bool))
+    end
+    return res
+end
+
+"The union tuple `v` boxed: as the concrete tuple type its elements make it."
+function box_union_tuple!(fc::FnCtx, v::CGVal)
+    res = new_val!(fc, Any)
+    combos = tuple_combinations(v.typ)
+    for (k, C) in enumerate(combos)
+        if k < length(combos)
+            push_val!(fc, union_tuple_isa!(fc, v, C))
+            if!(fc.b)
+        end
+        assign!(fc, res, box!(fc, convert_repr(fc, v, C), Any))
+        k < length(combos) && else!(fc.b)
+    end
+    for _ in 1:length(combos)-1
+        end!(fc.b)
+    end
+    return res
+end
+
+"The boxed value `v` as the union tuple type `T`: of whichever of its concrete types it is."
+function unbox_union_tuple!(fc::FnCtx, v::CGVal, @nospecialize(T))
+    res = new_val!(fc, T)
+    combos = tuple_combinations(T)
+    x = convert_repr(fc, v, Any)
+    for (k, C) in enumerate(combos)
+        push_val!(fc, emit_isa!(fc, x, C))
+        if!(fc.b)
+        assign!(fc, res, convert_repr(fc, convert_repr(fc, x, C), T))
+        else!(fc.b)
+    end
+    unreachable!(fc.b)
+    for _ in 1:length(combos)
+        end!(fc.b)
+    end
+    return res
+end
+
+# a value of type `S` where one of type `T` is expected, of another representation: where
+# the types have no value in common, code that does not run (inference put it there,
+# after a test that cannot pass), a trap; else unsupported
+function no_conversion!(fc::FnCtx, @nospecialize(S), @nospecialize(T))
+    typeintersect(S, T) === Union{} || unsupported("a conversion from ", S, " to ", T)
+    is_unreachable(fc.b) || unreachable!(fc.b)
+    return bottom()
 end

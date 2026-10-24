@@ -415,7 +415,9 @@ for (p, T) in (("d", Float64), ("s", Float32))
             ("$(p)ormrz_", P.ormrz!, [r, r, r, r, r, r, a, r, a, a, r, a, r, a, x, x]),
             ("$(p)laic1_", P.laic1!, [r, r, a, r, a, r, a, a, a]),
             ("$(p)geqrt_", P.geqrt!, [r, r, r, a, r, a, r, a, a]),
-            ("$(p)gemqrt_", P.gemqrt!, [r, r, r, r, r, r, a, r, a, r, a, r, a, a, x, x]))
+            ("$(p)gemqrt_", P.gemqrt!, [r, r, r, r, r, r, a, r, a, r, a, r, a, a, x, x]),
+            ("$(p)syevr_", P.syevr!, [r, r, r, r, a, r, r, r, r, r, r, a, a, a, r, a, a, r, a, r, a, x, x, x]),
+            ("$(p)gesdd_", P.gesdd!, [r, r, r, a, r, a, a, r, a, r, a, r, a, a, x]))
         RUNTIME_CCALLS[Symbol(name, "64_")] = RuntimeCcall(f, kinds)
     end
 end

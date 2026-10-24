@@ -28,7 +28,18 @@ la_qrp(n::Int) = (A = wmat(n + 4, 4, 0.3); b = [1.0 * k for k in 1:n+4]; F = qr(
 la_lsq(n::Int) = (A = wmat(3, 5 + n, 0.2); x = A \ [1.0, 2.0, 3.0]; (x[1], x[2], x[end], sum(x)))
 la_rankdef(n::Int) = (A = wmat(6, 3, 0.1); A = hcat(A, A[:, 1] + A[:, 2]); x = A \ [1.0 * k for k in 1:6]; vec4(x))
 
+# eigenvectors and singular vectors are defined up to sign: compared by their absolute values
+la_eigen(n::Int) = (A = wmat(n + 3, n + 3, 0.2); S = Symmetric(A + A'); E = eigen(S); w = eigvals(S);
+                    (w[1], w[end], sum(w), sum(abs.(E.vectors)), abs(E.vectors[1, 1]), sum(eigvals(S, 1:2))))
+la_svd(n::Int) = (A = wmat(n + 4, 3, 0.4); F = svd(A); s = svdvals(A);
+                  (s[1], s[end], F.S[2], sum(abs.(F.U)), sum(abs.(F.Vt)), sum(abs.(svd(A'; full=true).U)),
+                   Float64(rank(A)), opnorm(A), cond(A), sum(pinv(A))))
+
 @testset "linear algebra" begin
+    for n in 1:3
+        @wtest_approx la_eigen(n)
+        @wtest_approx la_svd(n)
+    end
     for n in 1:3
         @wtest_approx la_dot(n)
         @wtest_approx la_gemm(n)

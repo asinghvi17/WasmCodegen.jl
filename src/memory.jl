@@ -194,7 +194,7 @@ function emit_memoryrefset!(fc::FnCtx, r::CGVal, v::CGVal, bc)
         b = box!(fc, v, Any)
         push_element_address!(fc, r, ml)
         push_val!(fc, b)
-        emit!(fc.b, :ref_cast_null, box_type!(fc.cgm.types, E))
+        is_union_tuple(E) || emit!(fc.b, :ref_cast_null, box_type!(fc.cgm.types, E))
         emit!(fc.b, :array_set, ml.array)
         return v
     end

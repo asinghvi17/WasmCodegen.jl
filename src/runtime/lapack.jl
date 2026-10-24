@@ -578,4 +578,186 @@ function gemqrt!(side::UInt8, trans::UInt8, m::Int, n::Int, k::Int, nb::Int, V::
     end
 end
 
+## symmetric eigenvalues and singular values (Jacobi's methods)
+
+# the eigenvalues (ascending) and eigenvectors (columns of V, n×n) of the symmetric n×n S,
+# by cyclic Jacobi rotations
+function jacobi_eigen!(S::Matrix{T}, n::Int) where {T}
+    V = zeros(T, n, n)
+    for i in 1:n
+        V[i, i] = one(T)
+    end
+    for sweep in 1:100
+        off = zero(T)
+        for q in 2:n, p in 1:q-1
+            off += S[p, q]^2
+        end
+        off == 0 && break
+        for q in 2:n, p in 1:q-1
+            apq = S[p, q]
+            apq == 0 && continue
+            theta = (S[q, q] - S[p, p]) / (2apq)
+            t = copysign(one(T), theta) / (abs(theta) + sqrt(theta^2 + one(T)))
+            isfinite(theta) || (t = apq / (S[q, q] - S[p, p]))
+            c = one(T) / sqrt(t^2 + one(T))
+            s = t * c
+            for k in 1:n
+                skp, skq = S[k, p], S[k, q]
+                S[k, p] = c * skp - s * skq
+                S[k, q] = s * skp + c * skq
+            end
+            for k in 1:n
+                spk, sqk = S[p, k], S[q, k]
+                S[p, k] = c * spk - s * sqk
+                S[q, k] = s * spk + c * sqk
+            end
+            for k in 1:n
+                vkp, vkq = V[k, p], V[k, q]
+                V[k, p] = c * vkp - s * vkq
+                V[k, q] = s * vkp + c * vkq
+            end
+        end
+    end
+    w = T[S[i, i] for i in 1:n]
+    perm = sortperm(w)
+    return w[perm], V[:, perm]
+end
+
+"""`syevr`: the eigenvalues (ascending) and, with `jobz` 'V', eigenvectors of the symmetric
+A (stored in its `uplo` triangle): all of them (`range` 'A'), those in (vl, vu] ('V'), or
+the il-th to iu-th ('I'). A's triangle is destroyed. A workspace query where `lwork` or
+`liwork` is -1."""
+function syevr!(jobz::UInt8, range::UInt8, uplo::UInt8, n::Int, A::ArrayArg{T}, lda::Int,
+                vl::T, vu::T, il::Int, iu::Int, abstol::T, m::ArrayArg{Int}, W::ArrayArg{T},
+                Z::ArrayArg{T}, ldz::Int, isuppz::ArrayArg{Int}, work::ArrayArg{T}, lwork::Int,
+                iwork::ArrayArg{Int}, liwork::Int, info) where {T}
+    setinfo!(info, 0)
+    if lwork == -1 || liwork == -1
+        st!(work, 1, T(max(1, 26n)))
+        st!(iwork, 1, max(1, 10n))
+        return
+    end
+    S = Matrix{T}(undef, n, n)
+    up = isupper(uplo)
+    for j in 1:n, i in 1:n
+        S[i, j] = (up ? i <= j : i >= j) ? elem(A, lda, i, j) : elem(A, lda, j, i)
+    end
+    w, V = jacobi_eigen!(S, n)
+    sel = range == UInt8('V') || range == UInt8('v') ? [k for k in 1:n if vl < w[k] <= vu] :
+          range == UInt8('I') || range == UInt8('i') ? collect(il:iu) : collect(1:n)
+    st!(m, 1, length(sel))
+    for (k, j) in enumerate(sel)
+        st!(W, k, w[j])
+        if jobz == UInt8('V') || jobz == UInt8('v')
+            for i in 1:n
+                setelem!(Z, ldz, i, k, V[i, j])
+            end
+        end
+    end
+end
+
+"""`gesdd`: the singular values (descending) of the m×n A and, by `jobz`, none of the
+singular vectors ('N'), the first min(m, n) of each ('S', U m×k, Vᵀ k×n) or all ('A', U
+m×m, Vᵀ n×n), by one-sided Jacobi rotations. A is destroyed. A workspace query where
+`lwork` is -1."""
+function gesdd!(jobz::UInt8, m::Int, n::Int, A::ArrayArg{T}, lda::Int, S::ArrayArg{T},
+                U::ArrayArg{T}, ldu::Int, VT::ArrayArg{T}, ldvt::Int, work::ArrayArg{T},
+                lwork::Int, iwork::ArrayArg{Int}, info) where {T}
+    setinfo!(info, 0)
+    if lwork == -1
+        st!(work, 1, T(max(1, 4 * (m + n)^2)))
+        return
+    end
+    k = min(m, n)
+    # (on Aᵀ if wider than tall: its columns are the rows)
+    tall = m >= n
+    p, q = tall ? (m, n) : (n, m)
+    G = Matrix{T}(undef, p, q)
+    for j in 1:q, i in 1:p
+        G[i, j] = tall ? elem(A, lda, i, j) : elem(A, lda, j, i)
+    end
+    V = zeros(T, q, q)
+    for i in 1:q
+        V[i, i] = one(T)
+    end
+    tol = eps(T) * p
+    for sweep in 1:100
+        rotated = false
+        for b in 2:q, a in 1:b-1
+            alpha = beta = gamma = zero(T)
+            for i in 1:p
+                alpha += G[i, a]^2; beta += G[i, b]^2; gamma += G[i, a] * G[i, b]
+            end
+            (gamma == 0 || abs(gamma) <= tol * sqrt(alpha * beta)) && continue
+            rotated = true
+            zeta = (beta - alpha) / (2gamma)
+            t = copysign(one(T), zeta) / (abs(zeta) + sqrt(one(T) + zeta^2))
+            c = one(T) / sqrt(one(T) + t^2)
+            s = c * t
+            for i in 1:p
+                ga, gb = G[i, a], G[i, b]
+                G[i, a] = c * ga - s * gb
+                G[i, b] = s * ga + c * gb
+            end
+            for i in 1:q
+                va, vb = V[i, a], V[i, b]
+                V[i, a] = c * va - s * vb
+                V[i, b] = s * va + c * vb
+            end
+        end
+        rotated || break
+    end
+    sv = T[sqrt(sum(abs2, view(G, :, j))) for j in 1:q]
+    perm = sortperm(sv; rev=true)
+    for j in 1:k
+        st!(S, j, sv[perm[j]])
+    end
+    (jobz == UInt8('N') || jobz == UInt8('n')) && return
+    full = jobz == UInt8('A') || jobz == UInt8('a')
+    # the left vectors of G (normalized columns, completed to an orthonormal basis), the right
+    # ones V; for Aᵀ they swap
+    L = zeros(T, p, full ? p : k)
+    for j in 1:k
+        c = perm[j]
+        sv[c] > 0 && (L[:, j] .= view(G, :, c) ./ sv[c])
+    end
+    ncols = size(L, 2)
+    next = 1
+    for j in 1:ncols
+        sv_j = j <= k ? sv[perm[j]] : zero(T)
+        (j <= k && sv_j > 0) && continue
+        # a unit vector orthogonal to the previous columns (Gram-Schmidt on e_next)
+        while next <= p
+            v = zeros(T, p); v[next] = one(T); next += 1
+            for r in 1:ncols
+                r == j && continue
+                d = sum(i -> L[i, r] * v[i], 1:p)
+                v .-= d .* view(L, :, r)
+            end
+            nv = sqrt(sum(abs2, v))
+            if nv > T(0.1)
+                L[:, j] .= v ./ nv
+                break
+            end
+        end
+    end
+    R = zeros(T, q, full ? q : k)
+    for j in 1:k
+        R[:, j] .= view(V, :, perm[j])
+    end
+    if full && q > k
+        for j in k+1:q
+            R[:, j] .= view(V, :, perm[j])
+        end
+    end
+    # U: m×(m or k), Vᵀ: (n or k)×n
+    Uc, Vc = tall ? (L, R) : (R, L)
+    for j in 1:size(Uc, 2), i in 1:m
+        setelem!(U, ldu, i, j, Uc[i, j])
+    end
+    for j in 1:n, i in 1:size(Vc, 2)
+        setelem!(VT, ldvt, i, j, Vc[j, i])
+    end
+end
+
 end
