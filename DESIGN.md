@@ -27,7 +27,7 @@ collect: CC.compile! under WasmInterpreter    ── juliac's typeinf_ext_toplev
   │  check: juliac's trim verifier, on the native interpreter (trim_check)
   ▼
 per function: CodeInfo → IRCode → prepare → StructuredIRCode (IRStructurizer.jl)
-  │  prepare: strip exception handling, trap throws, drop unused type computations
+  │  prepare: exceptions as the program uses them, drop unused type computations
   ▼
 emit: walk the structured IR → WasmBuilder (validating builder)
   │  simple code: a local per value; per-type helpers for memory access and boxing
@@ -143,14 +143,39 @@ into copies, all exact:
 terminator type check is stricter than Julia's IR (a phi's edge value may be wider than
 the phi when a branch narrowed it), so that one validation is skipped.
 
-**Exceptions.** For now `throw` traps: `prepare` removes handlers (`EnterNode` edges,
-`:leave`, `:pop_exception`, `Upsilon`s; compaction drops the handler blocks), replaces
-the thrown value by `nothing`, and removes the computations that only built it (exception
-objects, error messages) when they are effect-free or build an exception or a string.
-Functions that always throw are still compiled (their effects before the throw happen).
-Structured try regions (`TryOp`, IRStructurizer branch `eh-tryop`) are designed and
-implemented; lowering them to `try_table`/`catch_ref` with a tag carrying the Julia
-exception is next.
+**Exceptions** (`exceptions.jl`) are Wasm's: one tag, whose payload is the exception
+object, `throw`, and `try_table`. What a program needs is decided for its closed world:
+
+- *nothing catches* (no `try` with a handler): a throw traps, `prepare` removes the
+  handlers of `try`/`finally` (`EnterNode` edges, `:leave`, `:pop_exception`, upsilons),
+  replaces the thrown value by `nothing` and removes the computations that only built it
+  (exception objects, error messages) when they are effect-free or build an exception or
+  a string. Functions that always throw are still compiled (their effects before the
+  throw happen);
+- *something catches but nothing reads the exception* (no `:the_exception`; Julia infers
+  exception types, so `catch e; e isa BoundsError` is often folded): throws unwind to the
+  handlers with a null payload, and exception objects are still not built;
+- *a handler reads the exception*: throws carry the objects, and the code generator's own
+  checks throw what Julia's C runtime throws (`BoundsError(memory, i)`, `DivideError`,
+  `UndefRefError`, `TypeError` of `typeassert`, `UndefVarError`, `MethodError`), built by
+  runtime functions (`runtime/errors.jl`). Errors Wasm checks itself (a failed cast, an
+  array index out of range) remain traps, which no handler catches.
+
+A `TryOp` (IRStructurizer branch `eh-tryop`) is
+
+    block $exit
+      block $handler (result exception)
+        try_table (catch $tag $handler)  body (its yield: results, br $exit)  end
+        unreachable
+      end
+      current exception := the caught one;  handler (its yield: results)
+    end
+
+A `LeaveOp` (an exit of a try body from a nested region) assigns the results and branches
+to `$exit`. Handler arguments (Julia's `PhiC`s) have locals, assigned by their upsilons,
+which may come before the `try`; Wasm locals keep the values a throw left. The current
+exception (`catch e`, `rethrow()`) is a global, set by a handler; `pop_exception` restores
+the value it had at the `try`.
 
 ## 4. Values
 
@@ -187,7 +212,10 @@ identity hash, assigned on first use.
   array, which can be indexed at run time; a run-time index into a small inline tuple of
   one element type builds a temporary array;
 - type objects (`DataType`s used as values): one interned object per type, holding the type
-  id it is.
+  id it is; what code asks of them at run time is answered by tables (section 8). A
+  `TypeName` has only its name; a `SimpleVector` (a type's parameters) is an array object;
+- immutable types Julia does not store inline (those containing themselves, as
+  `Base.ImmutableDict`, behind `IOContext`): immutable objects, a field per leaf.
 
 All types are in one recursion group, so they are nominal.
 
@@ -268,7 +296,10 @@ parameters). Builtins (`getfield`, `setfield!`, `===` (bitwise on floats, by con
 immutables), `isa` (type ids, a generated predicate per abstract type), `tuple`,
 `ifelse`, `memoryref*`, `_apply_iterate` into tuples, ...) and intrinsics are emitted
 inline, with Julia's semantics where Wasm's differ: over-shifts, saturating float→int,
-checked arithmetic, `fpiseq`, IEEE `min`/`max`, division traps.
+checked arithmetic, `fpiseq`, IEEE `min`/`max`, division traps. A `PiNode` narrows without
+a check, as natively: Julia's optimizer sometimes places one where it does not hold (a
+value forwarded with a flag saying whether it is `nothing`, read only where it is not), so
+a boxed value is converted only if it is of the narrower type.
 
 Operations whose code grows with the value they move are **outlined**: a helper function
 per operation and type, called where they are used (`outline.jl`): `memoryrefget`,
@@ -283,19 +314,53 @@ shared (10% smaller modules for the parser).
   code generator calls for what Wasm lacks, compiled into the module on demand
   (`runtime_function!` extends the closed world): 128-bit integer arithmetic on `UInt64`
   pairs (multiplication by 32-bit halves, shift-subtract division); `fma` is Base's
-  `fma_emulated`.
+  `fma_emulated`; Float16 conversions (compiler-rt's: exact widening, narrowing rounded
+  once, quiet NaNs), with Float16 arithmetic done in Float32 and rounded back, as LLVM
+  does without half-precision hardware; the exceptions of the code generator's checks.
 - **C library calls implemented in Julia** (`RUNTIME_CCALLS`), checked against the native
-  libraries: Unicode properties (`utf8proc_category`, `jl_id_char`, `jl_id_start_char`:
-  tables of runs computed from the native libraries when WasmCodegen is compiled, exact
-  on every code point; `utf8proc_grapheme_break_stateful`: utf8proc's rules over its
-  classes); `strtod`/`strtof` (the extent of the number as C finds it, the value from
-  Parsers.jl, which is correctly rounded without C or big floats) and `errno`;
-  `memmove`/`memset`/`memcmp`/`memchr` through pointers without origins.
+  libraries: Unicode properties (`utf8proc_category`, `utf8proc_isupper`/`islower`, case
+  mappings, `utf8proc_charwidth`, `jl_id_char`, `jl_id_start_char`: tables of runs
+  computed from the native libraries when WasmCodegen is compiled, exact on every code
+  point; `utf8proc_grapheme_break_stateful`: utf8proc's rules over its classes);
+  `strtod`/`strtof`/`jl_try_substrtod` (the extent of the number as C finds it, the value
+  from Parsers.jl, which is correctly rounded without C or big floats) and `errno`;
+  `memmove`/`memset`/`memcmp`/`memchr`/`strlen` through pointers without origins (a C
+  string ends at its owner's end: Julia's strings and symbols are NUL-terminated);
+  `jl_symbol_name` (a pointer into the symbol's bytes; `Cstring`s are pointers too).
+- **BLAS and LAPACK** (`runtime/blas.jl`, `lapack.jl`): what LinearAlgebra calls in
+  libblastrampoline, on Float64 and Float32: levels 1 to 3 (`dot`, norms, `gemv`, `gemm`,
+  triangular and symmetric products and solves, rank updates), LU (`getrf`, `getrs`,
+  `getri`), Cholesky (`potrf`, `potrs`), triangular solves, QR (`geqrt`/`gemqrt`, pivoted
+  `geqp3`/`ormqr`) and the rank-deficient least squares behind `\` (`laic1`, `tzrzf`,
+  `ormrz`): reference algorithms, unblocked. An array argument is a `MemoryRef` where the
+  pointer's memory is known, else the pointer; outputs are written through. Results agree
+  with an optimized BLAS's within rounding (the order of sums differs). Not yet: SVD and
+  eigenvalues.
 - **Hashes as the C runtime computes them**, so that dictionaries built at compile time are
   found at run time: `objectid` of symbols (their hash: MurmurHash3 of the name, mixed;
-  symbols in the image carry it, computed natively) and of isbits values of 1, 2, 4 or 8
-  bytes (`immut_id_`: the bits' hash and the type's). Strings and symbols are `===` by
-  their bytes, so symbols made at run time need no interning.
+  symbols in the image carry it, computed natively), of isbits values of 1, 2, 4 or 8
+  bytes (`immut_id_`: the bits' hash and the type's; other sizes, `memhash` of the
+  bytes), of immutable values with references (their fields' ids mixed, `bitmix`), and
+  strings (`memhash_seed`, which `hash(::String)` calls before Julia 1.13). Strings and
+  symbols are `===` by their bytes, so symbols made at run time need no interning. A
+  mutable object's `objectid` is natively a hash of its address: an object of the image
+  keeps the one it had natively (its header's hash refers to a table of them), so that
+  dictionaries keyed by such objects find them; others hash their identity hash.
+- **Types at run time** (`reflection.jl`). Types are not made at run time: those a
+  program can hold are the ones with objects in its image, all known when the module is
+  finished. So what code asks of a type at run time is computed natively for each of them
+  then, and looked up: `<:` in a table of bits over all pairs, and functions of types
+  (`Runtime.map_type(f, T)`, as `nonnothing_nonmissing_typeinfo` of `show`) in tables of
+  their values, whose objects are added to the image; `x isa Type{<:Real}` (a pattern that
+  holds of some types and not others of their kind) in a table of which types are, as a
+  type object's header only says which kind of type it is. `===` of values whose types
+  are known only at run time is `jl_egal`, generated over the module's types: identity for
+  mutable ones, contents for the others (strings, boxes, immutable objects, tuples,
+  SimpleVectors). These tables are built after the image and the type maps, which add
+  types. Printing a type (juliac's `show`,
+  which reflects on it) is a foldable function returning its name as a Symbol, so that
+  inference computes it for a type known at compile time (a `Union` or `UnionAll` is not
+  a constant for inference: printing one at run time needs reflection, not supported).
 - **Primitives**: runtime functions whose calls the code generator compiles to host
   imports (module `julia`): `write_byte(fd, byte)`, `entropy()` (the seed of the task's
   random number generator).
@@ -306,8 +371,8 @@ shared (10% smaller modules for the parser).
   UTF-8.
 
 Next: `IdDict` (the C runtime's identity hash table, also behind task-local storage and so
-`Random.seed!` of the global generator), exceptions with `try_table`, time; a WASI-style
-host interface.
+`Random.seed!` of the global generator) and `objectid` of mutable objects; BLAS and LAPACK
+(LinearAlgebra's calls into libblastrampoline); time; a WASI-style host interface.
 
 ## 9. Output, performance
 
@@ -341,8 +406,10 @@ Differential (`@wtest f(args...)`): native and compiled results compared (values
 types), in a persistent Node.js from `NodeJS_24_jll`, inside one session of patches.
 Coverage: numbers and control flow, 128-bit integers, pointers, identity, globals,
 structs/vectors/closures/broadcast/sort, dictionaries and sets, Random (the native
-streams), the image (tables, symbols, cycles, identity), and JuliaC.jl's own test programs
-(reshape, dispatch, reductions, concatenations, printing; the untrimmable one must be
-rejected). The tests run the optimized modules. The examples: `examples/lorenz`
+streams), the image (tables, symbols, cycles, identity), exceptions (try/catch/finally,
+rethrow, the exceptions of Base and of the code generator's checks), strings, Unicode and
+printing found missing by sweeping WasmTarget.jl's catalogue of Base operations, and
+JuliaC.jl's own test programs (reshape, dispatch, reductions, concatenations, printing;
+the untrimmable one must be rejected). The tests run the optimized modules. The examples: `examples/lorenz`
 (OrdinaryDiffEq), `examples/mtk` (a ModelingToolkit model), `examples/juliasyntax` (Julia's
 parser, compared with native JuliaSyntax node for node on Base's sources), each with a page.
