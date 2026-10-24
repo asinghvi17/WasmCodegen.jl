@@ -17,7 +17,8 @@ demand, over a few host imports.
 
 **Status: experimental.** The supported subset is what `juliac --trim=safe` accepts: no
 dynamic dispatch. Julia 1.13 is the main target, and 1.12 also works. Programs that run
-today include OrdinaryDiffEq's `Tsit5` on an `ODEProblem` built at compile time, a
+today include OrdinaryDiffEq's `Tsit5` on an `ODEProblem` built at compile time, its implicit
+`Rodas5P` on a stiff PDE with LinearSolve's solvers for its linear systems, a
 ModelingToolkit model, JuliaSyntax (Julia's parser), Random (bit-identical streams),
 dictionaries, exceptions (`try`/`catch`/`finally`, with Wasm's exception handling),
 LinearAlgebra (BLAS and LAPACK in the runtime), LinearSolve's pure-Julia solvers (its

@@ -1,0 +1,535 @@
+<title>Brusselator in WasmGC</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Literata:opsz,wght@7..72,500;7..72,600&family=Public+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  /* Layout: a bench notebook. The space-time plot of u(x, t) is the figure; controls and the
+     solver's counts sit in a column beside it; the comparison of linear solvers runs below. */
+  :root {
+    --bg: #f1f4f2;
+    --surface: #ffffff;
+    --ink: #13201c;
+    --muted: #56655f;
+    --line: #d3dcd8;
+    --accent: #0a756f;
+    --accent-ink: #ffffff;
+    --trace-u: #0a756f;
+    --trace-v: #b4501b;
+    --grid: #e5ebe8;
+    --warn: #a3330f;
+    --font-display: "Literata", Georgia, "Times New Roman", serif;
+    --font-body: "Public Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --font-data: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0c1311; --surface: #131c19; --ink: #e2eae7; --muted: #8e9f99; --line: #24322d;
+      --accent: #3fc0b6; --accent-ink: #06201d; --trace-u: #3fc0b6; --trace-v: #f08a4b;
+      --grid: #1b2622; --warn: #f2875f;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0c1311; --surface: #131c19; --ink: #e2eae7; --muted: #8e9f99; --line: #24322d;
+    --accent: #3fc0b6; --accent-ink: #06201d; --trace-u: #3fc0b6; --trace-v: #f08a4b;
+    --grid: #1b2622; --warn: #f2875f;
+    color-scheme: dark;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 15px;
+    line-height: 1.5;
+  }
+  .page {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding-block: 28px 48px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    display: grid;
+    gap: 28px;
+  }
+  header { display: grid; gap: 8px; max-width: 72ch; }
+  .eyebrow {
+    font-family: var(--font-data);
+    font-size: 12px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  h1 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: clamp(30px, 4.6vw, 44px);
+    line-height: 1.1;
+    margin: 0;
+    text-wrap: balance;
+  }
+  h2 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 21px;
+    margin: 0;
+    text-wrap: balance;
+  }
+  header p { margin: 0; color: var(--muted); }
+  .eq {
+    font-family: var(--font-data);
+    font-size: 13px;
+    color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 10px 14px;
+    overflow-x: auto;
+    white-space: pre;
+    line-height: 1.6;
+  }
+
+  .bench {
+    display: grid;
+    grid-template-columns: minmax(250px, 300px) minmax(0, 1fr);
+    gap: 24px;
+    align-items: start;
+  }
+  @media (max-width: 820px) { .bench { grid-template-columns: minmax(0, 1fr); } }
+
+  .controls { display: grid; gap: 18px; }
+  fieldset { border: 0; margin: 0; padding: 0; display: grid; gap: 14px; min-width: 0; }
+  legend {
+    font-family: var(--font-data);
+    font-size: 12px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    padding: 0;
+    margin-bottom: 4px;
+  }
+  .slider { display: grid; gap: 4px; }
+  .slider-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  .slider label { font-weight: 500; }
+  .slider output { font-family: var(--font-data); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .slider small { color: var(--muted); font-size: 12.5px; }
+  input[type="range"] { width: 100%; accent-color: var(--accent); margin: 0; }
+  input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
+  .seg { display: grid; grid-template-columns: 1fr; gap: 6px; }
+  .seg input { position: absolute; opacity: 0; pointer-events: none; }
+  .seg label {
+    display: grid;
+    gap: 1px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 8px 12px;
+    cursor: pointer;
+    background: var(--surface);
+  }
+  .seg label b { font-weight: 600; }
+  .seg label span { font-family: var(--font-data); font-size: 12px; color: var(--muted); }
+  .seg input:checked + label { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+  .seg input:focus-visible + label { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .readout {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px 16px;
+    border-top: 1px solid var(--line);
+    padding-top: 14px;
+  }
+  .readout div { display: grid; gap: 0; min-width: 0; }
+  .readout dt { font-size: 12.5px; color: var(--muted); }
+  .readout dd { margin: 0; font-family: var(--font-data); font-size: 17px; font-variant-numeric: tabular-nums; }
+  .readout .wide { grid-column: 1 / -1; }
+  .status { font-size: 13.5px; color: var(--muted); min-height: 1.5em; }
+  .status.bad { color: var(--warn); }
+
+  .figure {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 16px;
+    display: grid;
+    gap: 10px;
+    min-width: 0;
+  }
+  .figure-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 16px; align-items: baseline; }
+  .figure-head span { font-family: var(--font-data); font-size: 12.5px; color: var(--muted); }
+  canvas { display: block; width: 100%; max-width: 100%; }
+  #heat { aspect-ratio: 2.3 / 1; }
+  #trace { aspect-ratio: 4.2 / 1; }
+  .key { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: var(--muted); }
+  .key i { display: inline-block; width: 16px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+
+  .compare { display: grid; gap: 12px; }
+  .compare-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; align-items: center; }
+  .compare p { margin: 0; color: var(--muted); max-width: 75ch; }
+  button {
+    font: 500 14px var(--font-body);
+    background: var(--accent);
+    color: var(--accent-ink);
+    border: 0;
+    border-radius: 6px;
+    padding: 8px 16px;
+    cursor: pointer;
+  }
+  button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+  button:disabled { opacity: 0.6; cursor: progress; }
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 14px; }
+  th, td { padding: 9px 14px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  thead th { font-weight: 600; font-size: 12.5px; color: var(--muted); background: var(--surface); }
+  tbody tr:last-child td { border-bottom: 0; }
+  td { font-family: var(--font-data); font-variant-numeric: tabular-nums; }
+  td:first-child { font-family: var(--font-body); }
+  td:first-child span { display: block; font-family: var(--font-data); font-size: 12px; color: var(--muted); }
+
+  footer { color: var(--muted); font-size: 13.5px; display: grid; gap: 6px; max-width: 80ch; }
+  footer code { font-family: var(--font-data); font-size: 12.5px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="page">
+  <header>
+    <div class="eyebrow">Julia → WebAssembly GC · OrdinaryDiffEq + LinearSolve</div>
+    <h1>The Brusselator, a stiff reaction–diffusion system</h1>
+    <p>Two chemical species diffusing along a line, solved by OrdinaryDiffEq's <code>Rodas5P</code> in
+      your browser. Each step factorizes W = I/(γ·dt) − J and solves with it; which of LinearSolve's
+      pure-Julia solvers does that is yours to pick. All of it is Julia compiled to WebAssembly, the
+      integrators built at compile time and serialized into the module.</p>
+    <div class="eq">u_t = A + u²v − (B+1)·u + α·u_xx      u = A, v = B/A at x = 0 and 1
+v_t = B·u − u²v + α·v_xx              u(x, 0) = A + a·sin 2πx,  v(x, 0) = B/A,  __N__ points</div>
+  </header>
+
+  <section class="bench" aria-label="Solver bench">
+    <div class="controls">
+      <fieldset>
+        <legend>Parameters</legend>
+        <div class="slider">
+          <div class="slider-head"><label for="pA">Feed A</label><output id="oA" for="pA">1.00</output></div>
+          <input id="pA" type="range" min="0.5" max="2" step="0.01" value="1">
+        </div>
+        <div class="slider">
+          <div class="slider-head"><label for="pB">Rate B</label><output id="oB" for="pB">3.00</output></div>
+          <input id="pB" type="range" min="1" max="5" step="0.01" value="3">
+          <small id="hopf">Oscillates: B &gt; 1 + A² = 2.00</small>
+        </div>
+        <div class="slider">
+          <div class="slider-head"><label for="pD">Diffusion α</label><output id="oD" for="pD">0.020</output></div>
+          <input id="pD" type="range" min="0.002" max="0.1" step="0.001" value="0.02">
+        </div>
+        <div class="slider">
+          <div class="slider-head"><label for="pa">Initial bump a</label><output id="oa" for="pa">1.00</output></div>
+          <input id="pa" type="range" min="0" max="1.5" step="0.01" value="1">
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Linear solver for W</legend>
+        <div class="seg">
+          <input type="radio" name="solver" id="s1" value="1" checked>
+          <label for="s1"><b>Dense LU</b><span>GenericLUFactorization</span></label>
+          <input type="radio" name="solver" id="s2" value="2">
+          <label for="s2"><b>Sparse KLU</b><span>PureKLUFactorization</span></label>
+          <input type="radio" name="solver" id="s3" value="3">
+          <label for="s3"><b>Krylov GMRES</b><span>KrylovJL_GMRES</span></label>
+        </div>
+      </fieldset>
+
+      <dl class="readout">
+        <div class="wide"><dt>Solve time (WebAssembly)</dt><dd id="rTime">–</dd></div>
+        <div><dt>Steps (rejected)</dt><dd id="rSteps">–</dd></div>
+        <div><dt>W factorizations</dt><dd id="rW">–</dd></div>
+        <div><dt>Linear solves</dt><dd id="rSolves">–</dd></div>
+        <div><dt>f evaluations</dt><dd id="rF">–</dd></div>
+      </dl>
+      <div class="status" id="status" role="status">Loading the module…</div>
+    </div>
+
+    <div class="figure">
+      <div class="figure-head">
+        <h2>u(x, t)</h2>
+        <span id="range">–</span>
+      </div>
+      <canvas id="heat" aria-label="Space-time plot of the concentration u"></canvas>
+      <div class="figure-head">
+        <h2>At the midpoint x = ½</h2>
+        <div class="key"><span><i style="background: var(--trace-u)"></i>u</span><span><i style="background: var(--trace-v)"></i>v</span></div>
+      </div>
+      <canvas id="trace" aria-label="u and v at the midpoint over time"></canvas>
+    </div>
+  </section>
+
+  <section class="compare" aria-label="Linear solvers compared">
+    <div class="compare-head">
+      <h2>The three linear solvers, same parameters</h2>
+      <button id="run" type="button">Compare again</button>
+    </div>
+    <p>Each solver re-solves the problem above five times; the time is the median. The counts agree
+      because Rodas5P takes the same steps whichever solver it uses; GMRES solves W only to its
+      tolerance, so its answer differs from the factorizations' by about that much.</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Solver</th><th>WebAssembly</th><th>Native Julia, defaults</th><th>Steps</th><th>W</th><th>Solves</th><th>max |u − u<sub>LU</sub>|</th></tr>
+        </thead>
+        <tbody id="cmp">
+          <tr><td>Dense LU<span>GenericLUFactorization</span></td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+          <tr><td>Sparse KLU<span>PureKLUFactorization</span></td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+          <tr><td>Krylov GMRES<span>KrylovJL_GMRES</span></td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    <div>Module: __SIZE__ KB after <code>wasm-opt</code>, __FUNCS__ functions, __OBJECTS__ objects serialized from
+      the build (the three integrators and their LinearSolve caches). Compiled by WasmCodegen.jl from
+      <code>examples/brusselator/model.jl</code>, with an analytic Jacobian on the band of 2×2 blocks.</div>
+    <div>Native times are for the default parameters (A = 1, B = 3, α = 0.02, a = 1), measured when the page was built.</div>
+  </footer>
+</div>
+
+<script>
+(() => {
+  const WASM_BASE64 = "__WASM_BASE64__";
+  const NATIVE_MS = [__NATIVE__];
+  const NAMES = ["Dense LU", "Sparse KLU", "Krylov GMRES"];
+  const $ = (id) => document.getElementById(id);
+  const inputs = { A: $("pA"), B: $("pB"), D: $("pD"), a: $("pa") };
+  const heat = $("heat"), trace = $("trace");
+  let ex = null, N = 0, pending = false;
+  let field = null, mid = null, times = null, npts = 0;
+
+  const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const params = () => [+inputs.A.value, +inputs.B.value, +inputs.D.value, +inputs.a.value];
+  const solverChoice = () => +document.querySelector('input[name="solver"]:checked').value;
+  const fmtMs = (ms) => ms < 10 ? ms.toFixed(2) + " ms" : ms.toFixed(1) + " ms";
+
+  // a perceptual ramp (dark violet → magenta → orange → pale yellow), the same in both themes
+  const STOPS = [[0, [13, 8, 40]], [0.25, [84, 22, 112]], [0.5, [176, 54, 101]],
+                 [0.72, [236, 108, 50]], [0.88, [249, 178, 46]], [1, [252, 245, 176]]];
+  function ramp(t) {
+    t = Math.min(1, Math.max(0, t));
+    for (let i = 1; i < STOPS.length; i++) {
+      if (t <= STOPS[i][0]) {
+        const [t0, c0] = STOPS[i - 1], [t1, c1] = STOPS[i], f = (t - t0) / (t1 - t0);
+        return c0.map((v, k) => Math.round(v + (c1[k] - v) * f));
+      }
+    }
+    return STOPS[STOPS.length - 1][1];
+  }
+
+  function ticks(lo, hi, n) {
+    const span = hi - lo, raw = span / n, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const step = [1, 2, 5, 10].map((m) => m * mag).find((s) => span / s <= n) || 10 * mag;
+    const out = [];
+    for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-9; v += step) out.push(Math.round(v / step) * step);
+    return out;
+  }
+
+  function fitCanvas(c) {
+    const dpr = window.devicePixelRatio || 1, r = c.getBoundingClientRect();
+    const w = Math.max(1, Math.round(r.width * dpr)), h = Math.max(1, Math.round(r.height * dpr));
+    if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
+    return { ctx: c.getContext("2d"), w, h, dpr };
+  }
+
+  function readSolution(k, n) {
+    const f = new Float64Array(n * N), m = new Float64Array(2 * n), t = new Float64Array(n);
+    const j0 = (N >> 1) + 1;
+    for (let i = 1; i <= n; i++) {
+      t[i - 1] = ex.bz_time(k, i);
+      for (let j = 1; j <= N; j++) f[(i - 1) * N + j - 1] = ex.bz_value(k, i, j, 1);
+      m[2 * (i - 1)] = ex.bz_value(k, i, j0, 1);
+      m[2 * (i - 1) + 1] = ex.bz_value(k, i, j0, 2);
+    }
+    return { f, m, t };
+  }
+
+  function solve() {
+    pending = false;
+    if (!ex) return;
+    const k = solverChoice(), [A, B, D, a] = params();
+    const t0 = performance.now();
+    const n = ex.bz_solve(k, A, B, D, a);
+    const ms = performance.now() - t0;
+    const st = $("status");
+    if (n < 0) {
+      st.textContent = "Rodas5P stopped before t = 10 with these parameters. Lower B or α to continue.";
+      st.className = "status bad";
+      return;
+    }
+    st.textContent = `Solved to t = 10 with ${NAMES[k - 1]}; ${n} saved times, ${N} points each.`;
+    st.className = "status";
+    ({ f: field, m: mid, t: times } = readSolution(k, n));
+    npts = n;
+    $("rTime").textContent = fmtMs(ms);
+    $("rSteps").textContent = `${ex.bz_stat(k, 1)} (${ex.bz_stat(k, 2)})`;
+    $("rW").textContent = ex.bz_stat(k, 3);
+    $("rSolves").textContent = ex.bz_stat(k, 5);
+    $("rF").textContent = ex.bz_stat(k, 6);
+    draw();
+  }
+
+  function draw() {
+    if (!field) return;
+    drawHeat();
+    drawTrace();
+  }
+
+  function drawHeat() {
+    const { ctx, w, h, dpr } = fitCanvas(heat);
+    const ink = cssVar("--ink"), muted = cssVar("--muted"), line = cssVar("--line");
+    const padL = 34 * dpr, padR = 58 * dpr, padT = 6 * dpr, padB = 24 * dpr;
+    const pw = w - padL - padR, ph = h - padT - padB;
+    let lo = Infinity, hi = -Infinity;
+    for (const v of field) { if (v < lo) lo = v; if (v > hi) hi = v; }
+    if (hi - lo < 1e-9) hi = lo + 1e-9;
+    $("range").textContent = `u from ${lo.toFixed(2)} to ${hi.toFixed(2)}`;
+    // the field as an image: time across, x up (x = 0 at the bottom)
+    const img = new ImageData(npts, N);
+    for (let i = 0; i < npts; i++) {
+      for (let j = 0; j < N; j++) {
+        const c = ramp((field[i * N + j] - lo) / (hi - lo)), p = 4 * ((N - 1 - j) * npts + i);
+        img.data[p] = c[0]; img.data[p + 1] = c[1]; img.data[p + 2] = c[2]; img.data[p + 3] = 255;
+      }
+    }
+    const off = document.createElement("canvas");
+    off.width = npts; off.height = N;
+    off.getContext("2d").putImageData(img, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(off, padL, padT, pw, ph);
+    ctx.strokeStyle = line; ctx.lineWidth = dpr;
+    ctx.strokeRect(padL + 0.5, padT + 0.5, pw - 1, ph - 1);
+    ctx.fillStyle = muted;
+    ctx.font = `${11 * dpr}px "JetBrains Mono", monospace`;
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    const T = times[npts - 1];
+    for (const tv of ticks(0, T, 6)) ctx.fillText(String(tv), padL + pw * tv / T, padT + ph + 6 * dpr);
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    for (const xv of [0, 0.5, 1]) ctx.fillText(String(xv), padL - 6 * dpr, padT + ph * (1 - xv));
+    ctx.save(); ctx.translate(10 * dpr, padT + ph / 2); ctx.rotate(-Math.PI / 2);
+    ctx.textAlign = "center"; ctx.fillStyle = ink; ctx.fillText("x", 0, 0); ctx.restore();
+    // the color bar, with its range
+    const bx = padL + pw + 16 * dpr, bw = 12 * dpr;
+    for (let y = 0; y < ph; y++) {
+      const c = ramp(1 - y / ph);
+      ctx.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`;
+      ctx.fillRect(bx, padT + y, bw, 1);
+    }
+    ctx.fillStyle = muted; ctx.textAlign = "left";
+    ctx.textBaseline = "top"; ctx.fillText(hi.toFixed(1), bx + bw + 4 * dpr, padT);
+    ctx.textBaseline = "bottom"; ctx.fillText(lo.toFixed(1), bx + bw + 4 * dpr, padT + ph);
+  }
+
+  function drawTrace() {
+    const { ctx, w, h, dpr } = fitCanvas(trace);
+    const muted = cssVar("--muted"), grid = cssVar("--grid");
+    const padL = 34 * dpr, padR = 58 * dpr, padT = 8 * dpr, padB = 22 * dpr;
+    const pw = w - padL - padR, ph = h - padT - padB;
+    let lo = Infinity, hi = -Infinity;
+    for (const v of mid) { if (v < lo) lo = v; if (v > hi) hi = v; }
+    const span = Math.max(hi - lo, 1e-6); lo -= 0.05 * span; hi += 0.05 * span;
+    const T = times[npts - 1];
+    const X = (t) => padL + pw * t / T, Y = (v) => padT + ph * (1 - (v - lo) / (hi - lo));
+    ctx.clearRect(0, 0, w, h);
+    ctx.font = `${11 * dpr}px "JetBrains Mono", monospace`;
+    ctx.strokeStyle = grid; ctx.lineWidth = dpr; ctx.fillStyle = muted;
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    for (const v of ticks(lo, hi, 4)) {
+      ctx.beginPath(); ctx.moveTo(padL, Y(v)); ctx.lineTo(padL + pw, Y(v)); ctx.stroke();
+      ctx.fillText(String(v), padL - 6 * dpr, Y(v));
+    }
+    ctx.textAlign = "center"; ctx.textBaseline = "top";
+    for (const tv of ticks(0, T, 6)) ctx.fillText(String(tv), X(tv), padT + ph + 5 * dpr);
+    ctx.textAlign = "left"; ctx.textBaseline = "middle"; ctx.fillText("t", padL + pw + 8 * dpr, padT + ph + 11 * dpr);
+    for (const [off, color] of [[0, cssVar("--trace-u")], [1, cssVar("--trace-v")]]) {
+      ctx.strokeStyle = color; ctx.lineWidth = 2 * dpr; ctx.lineJoin = "round";
+      ctx.beginPath();
+      for (let i = 0; i < npts; i++) {
+        const x = X(times[i]), y = Y(mid[2 * i + off]);
+        i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+      }
+      ctx.stroke();
+    }
+  }
+
+  function compare() {
+    if (!ex) return;
+    const btn = $("run");
+    btn.disabled = true;
+    const [A, B, D, a] = params();
+    const rows = $("cmp").rows;
+    let ref = null;
+    for (let k = 1; k <= 3; k++) {
+      const runs = [];
+      let n = 0;
+      for (let r = 0; r < 5; r++) {
+        const t0 = performance.now();
+        n = ex.bz_solve(k, A, B, D, a);
+        runs.push(performance.now() - t0);
+      }
+      runs.sort((x, y) => x - y);
+      const cells = rows[k - 1].cells;
+      cells[2].textContent = NATIVE_MS[k - 1].toFixed(2) + " ms";
+      if (n < 0) {
+        cells[1].textContent = "stopped";
+        for (let c = 3; c < 7; c++) cells[c].textContent = "–";
+        continue;
+      }
+      const { f } = readSolution(k, n);
+      if (k === 1) ref = f;
+      let dev = 0;
+      if (ref && ref.length === f.length) for (let i = 0; i < f.length; i++) dev = Math.max(dev, Math.abs(f[i] - ref[i]));
+      cells[1].textContent = fmtMs(runs[2]);
+      cells[3].textContent = `${ex.bz_stat(k, 1)} (${ex.bz_stat(k, 2)})`;
+      cells[4].textContent = ex.bz_stat(k, 3);
+      cells[5].textContent = ex.bz_stat(k, 5);
+      cells[6].textContent = k === 1 ? "0" : (ref && ref.length === f.length ? dev.toExponential(1) : "–");
+    }
+    btn.disabled = false;
+    solve();   // (the selected solver's solution back on the plots)
+  }
+
+  function schedule() {
+    $("oA").textContent = (+inputs.A.value).toFixed(2);
+    $("oB").textContent = (+inputs.B.value).toFixed(2);
+    $("oD").textContent = (+inputs.D.value).toFixed(3);
+    $("oa").textContent = (+inputs.a.value).toFixed(2);
+    const A = +inputs.A.value, B = +inputs.B.value, crit = 1 + A * A;
+    $("hopf").textContent = B > crit ? `Oscillates: B > 1 + A² = ${crit.toFixed(2)}` :
+                                       `Settles: B ≤ 1 + A² = ${crit.toFixed(2)}`;
+    if (!pending) { pending = true; requestAnimationFrame(solve); }
+  }
+
+  for (const el of Object.values(inputs)) el.addEventListener("input", schedule);
+  for (const el of document.querySelectorAll('input[name="solver"]')) el.addEventListener("change", schedule);
+  $("run").addEventListener("click", () => setTimeout(compare, 0));
+  window.addEventListener("resize", () => requestAnimationFrame(draw));
+  window.matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", draw);
+  new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+  const bin = Uint8Array.from(atob(WASM_BASE64), (c) => c.charCodeAt(0));
+  const julia = {
+    write_byte: () => {},
+    entropy: () => 0n,
+    hrtime: () => BigInt(Math.round(performance.now() * 1e6)),
+  };
+  WebAssembly.instantiate(bin, { julia }).then(({ instance }) => {
+    ex = instance.exports;
+    N = ex.bz_n();
+    schedule();
+    setTimeout(compare, 50);
+  }).catch((err) => {
+    const st = $("status");
+    st.textContent = "This browser could not load the module (it needs WebAssembly GC and exception handling): " + err.message;
+    st.className = "status bad";
+  });
+})();
+</script>

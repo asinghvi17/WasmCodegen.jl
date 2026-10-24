@@ -372,7 +372,8 @@ shared (10% smaller modules for the parser).
   found at run time: `objectid` of symbols (their hash: MurmurHash3 of the name, mixed;
   symbols in the image carry it, computed natively), of isbits values of 1, 2, 4 or 8
   bytes (`immut_id_`: the bits' hash and the type's; other sizes, `memhash` of the
-  bytes), of immutable values with references (their fields' ids mixed, `bitmix`), and
+  bytes), of immutable values with references (their fields' ids mixed, `bitmix`; a field
+  stored inline of a union of types, by the member it holds), and
   strings (`memhash_seed`, which `hash(::String)` calls before Julia 1.13). Strings and
   symbols are `===` by their bytes, so symbols made at run time need no interning. A
   mutable object's `objectid` is natively a hash of its address: an object of the image
