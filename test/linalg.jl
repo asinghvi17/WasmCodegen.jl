@@ -34,8 +34,29 @@ la_eigen(n::Int) = (A = wmat(n + 3, n + 3, 0.2); S = Symmetric(A + A'); E = eige
 la_svd(n::Int) = (A = wmat(n + 4, 3, 0.4); F = svd(A); s = svdvals(A);
                   (s[1], s[end], F.S[2], sum(abs.(F.U)), sum(abs.(F.Vt)), sum(abs.(svd(A'; full=true).U)),
                    Float64(rank(A)), opnorm(A), cond(A), sum(pinv(A))))
+# symmetric indefinite (Bunch-Kaufman, its rook variant): a zero diagonal makes 2×2 pivots
+function la_bk(n::Int, upper::Bool, rook::Bool)
+    uplo = upper ? :U : :L
+    A = wmat(n + 4, n + 4, 0.5); B = A + A'
+    for k in 1:2:n+4
+        B[k, k] = 0.0
+    end
+    S = Symmetric(B, uplo); b = [1.0 * k for k in 1:n+4]
+    F = bunchkaufman(S, rook)
+    return (sum(F \ b), det(F), sum(S \ b), sum(F \ [b 2b]))
+end
+# (the full Vt of a wide matrix: its first rows only, the rest a basis of its null space)
+la_gesvd(n::Int) = (A = wmat(n + 4, 3, 0.4); F = svd(A; alg=LinearAlgebra.QRIteration());
+                    G = svd(A'; full=true, alg=LinearAlgebra.QRIteration());
+                    (F.S[1], F.S[end], sum(abs.(F.U)), sum(abs.(F.Vt)), sum(abs.(G.U)), sum(abs.(G.Vt[1:3, :]))))
 
 @testset "linear algebra" begin
+    for n in 0:3, upper in (true, false), rook in (false, true)
+        @wtest_approx la_bk(n, upper, rook)
+    end
+    for n in 1:2
+        @wtest_approx la_gesvd(n)
+    end
     for n in 1:3
         @wtest_approx la_eigen(n)
         @wtest_approx la_svd(n)

@@ -39,7 +39,123 @@ function nothing_merge(i::Int)
     (x === nothing ? -1.0 : sum(x), y === nothing ? -2.0 : sum(y))
 end
 
+# LLVM intrinsics through `ccall(..., llvmcall, ...)` on vectors (tuples of VecElements), loaded
+# and stored through pointers (LinearSolve's blocked LU kernel); exact products, so that fusing
+# the multiply-add or not gives the same result
+const V4 = NTuple{4,VecElement{Float64}}
+vfma(a::V4, b::V4, c::V4) = ccall("llvm.fmuladd.v4f64", llvmcall, V4, (V4, V4, V4), a, b, c)
+function vector_fma(n::Int)
+    v = collect(1.0:8.0) .* n
+    GC.@preserve v begin
+        p = pointer(v)
+        a = unsafe_load(Ptr{V4}(p))
+        b = unsafe_load(Ptr{V4}(p + 32))
+        unsafe_store!(Ptr{V4}(p + 32), vfma(a, b, ntuple(_ -> VecElement(0.5), 4)))
+    end
+    return ntuple(i -> v[i], Val(8))
+end
+
+# modules as values (SciMLLogging passes the logging module along)
+@noinline pick_module(i::Int) = i > 0 ? Base : Core
+modules(i::Int) = (checksum(string(nameof(pick_module(i)))), pick_module(i) === Base, pick_module(i) === pick_module(-i))
+
+# paths: Base splits them with regular expressions, here by their bytes
+const PATHS = ("/home/user/file.jl", "a/b/", "//x", "name.tar.gz", ".bashrc", "dir/..", "", "é/ü.txt")
+paths(i::Int) = (p = PATHS[i]; checksum(join((basename(p), dirname(p), splitext(p)..., splitdir(p)...), "|")) + isdirpath(p))
+clock(i::Int) = (t = time_ns(); s = sum(1:i); time_ns() >= t && s >= 0)
+
+# IdDict: identity hash tables (the C runtime's), built at run time and at compile time (laid
+# out natively by the same hash)
+const IDD = IdDict{Any,Int}(:a => 1, "s" => 2, 3 => 3, 2.5 => 4, (1, 2) => 5)
+function iddicts(n::Int)
+    d = IdDict{Any,Int}()
+    ks = [Int[k] for k in 1:n]  # mutable keys: by identity
+    for (k, v) in enumerate(ks)
+        d[v] = k
+    end
+    d[:sym] = -1; d["str"] = -2; d[2.5] = -3; d[nothing] = -4
+    s = sum(k -> d[k], ks; init=0)
+    n > 0 && delete!(d, ks[1])
+    delete!(d, nothing)
+    return (length(d), s, get(d, [1], 0), n > 0 && haskey(d, ks[1]), d[:sym] + d["str"] + d[2.5],
+            get(IDD, :a, 0) + get(IDD, "s", 0) + get(IDD, 3, 0) + get(IDD, 2.5, 0) + get(IDD, (1, 2), 0),
+            sum(values(d)), haskey(d, nothing))
+end
+
+# deepcopy: of immutable structs (the generic method: their fields, through `jl_new_structv`),
+# arrays and memory (through an IdDict)
+struct Pair3
+    a::Vector{Int}
+    b::Tuple{Float64,String}
+    c::Vector{Int}
+end
+function deepcopies(n::Int)
+    v = collect(1:n)
+    p = Pair3(v, (1.5, "x"), v)
+    q = deepcopy(p)
+    q.a[1] = -1
+    return (p.a[1], q.c[1], q.a === q.c, q.a === p.a, q.b === p.b, sum(deepcopy([v, v])[2]))
+end
+
+# locks and atomic fields, in a program of one task (a lock is never contended)
+const RLOCK = ReentrantLock()
+const SLOCK = Threads.SpinLock()
+mutable struct Atomics
+    @atomic n::Int
+    @atomic s::Union{Nothing,String}
+end
+function locks(i::Int)
+    s = Ref(0)
+    lock(RLOCK) do
+        lock(() -> (s[] += i), RLOCK)  # (reentrant)
+    end
+    lock(SLOCK); s[] += 1; unlock(SLOCK)
+    c = Atomics(i, nothing)
+    old = @atomicswap c.n = 5
+    r = @atomicreplace c.n 5 => 7
+    r2 = @atomicreplace c.n 5 => 9
+    m = @atomic c.n += 3
+    once = @atomiconce c.s = "x"
+    return (s[], old, r.success, r2.success, r2.old, c.n, m, islocked(RLOCK),
+            trylock(RLOCK) && (unlock(RLOCK); true), once, c.s === "x")
+end
+
+# Threads.Atomic (Julia 1.12 writes its operations as LLVM IR)
+function atomics(i::Int)
+    a = Threads.Atomic{Int}(i)
+    Threads.atomic_add!(a, 3); Threads.atomic_sub!(a, 1)
+    x = Threads.atomic_cas!(a, i + 2, 10)
+    y = Threads.atomic_xchg!(a, 4)
+    Threads.atomic_max!(a, 7); Threads.atomic_min!(a, 5); Threads.atomic_or!(a, 8)
+    f = Threads.Atomic{Float64}(1.5)
+    Threads.atomic_add!(f, 2.0)
+    z = Threads.atomic_cas!(f, 3.5, -1.0)
+    return (a[], x, y, f[], z)
+end
+
 @testset "coverage" begin
+    for i in 0:2
+        @wtest atomics(i)
+    end
+    for i in 0:2
+        @wtest locks(i)
+    end
+    for n in 1:3
+        @wtest deepcopies(n)
+    end
+    for n in (0, 1, 5, 40, 300)
+        @wtest iddicts(n)
+    end
+    for n in 0:2
+        @wtest vector_fma(n)
+    end
+    for i in -1:1
+        @wtest modules(i)
+    end
+    for i in eachindex(PATHS)
+        @wtest paths(i)
+    end
+    @wtest clock(3)
     for i in 0:4
         @wtest nothing_merge(i)
     end

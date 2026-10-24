@@ -4,7 +4,10 @@
 # is inline: the Memory, its array (so that accesses do not load it) and the index of its
 # element (0-based, in Julia elements).
 
-ref_eltype(@nospecialize(R)) = memory_eltype(R)
+function ref_eltype(@nospecialize(R))
+    is_memoryref_type(R) || unsupported("a memory reference of a type not known at compile time: ", R)
+    return memory_eltype(R)
+end
 
 # the length (in Julia elements) of the array on the stack, as an i32
 function emit_memory_length!(fc::FnCtx, ml::MemoryLayout)

@@ -229,11 +229,13 @@ function object_global!(img::Image, @nospecialize(x))
         return bytes_object_global!(img, x)
     elseif is_memory_type(T)
         return memory_global!(img, x)
-    elseif T === Core.TypeName
-        st = typename_object_type!(ts)
-        init = Inst[Inst(:i32_const, typeid!(ts, T)), Inst(:i32_const, 0),
-                    Inst(:global_get, object_global!(img, x.name)), Inst(:struct_new, st)]
-        g = add_global!(img.cgm.mod, "jl_typename_" * replace(string(x.name), r"[^A-Za-z0-9_]" => "_"),
+    elseif T === Core.TypeName || T === Module
+        st = named_object_type!(ts)
+        name = T === Module ? nameof(x) : x.name
+        init = Inst[Inst(:i32_const, typeid!(ts, T)), header_hash(img, x),
+                    Inst(:global_get, object_global!(img, name)), Inst(:struct_new, st)]
+        g = add_global!(img.cgm.mod, (T === Module ? "jl_module_" : "jl_typename_") *
+                                     replace(string(name), r"[^A-Za-z0-9_]" => "_"),
                         RefType(st, false), false, init)
         img.globals[x] = g
         return g

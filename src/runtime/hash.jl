@@ -115,3 +115,11 @@ bitmix(a::UInt64, b::UInt64) = int64hash(a ⊻ bswap(b))
 
 "The hash of the bits of a value of another size (`memhash` of its bytes)."
 bits_hash(x::NTuple{N,UInt8}) where {N} = murmur3_h2(i -> x[i + 1], N, 0xcafe8881)
+
+"""
+    objectid_as(x, T)
+
+`objectid(x)` of `x`, a `T`: the case of `T` of `objectid` of a value whose type is known only
+at run time (see `objectid_any_func!`).
+"""
+@noinline objectid_as(@nospecialize(x), ::Type{T}) where {T} = objectid(x::T)

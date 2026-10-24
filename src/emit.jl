@@ -152,8 +152,14 @@ function operand(fc::FnCtx, @nospecialize(x))
     return const_value(fc, x)
 end
 
-# an operand of a builtin: a constant module is compile-time information only (the module
-# of `getglobal`/`setglobal!`), never serialized
+# the builtins of globals (and `getfield`/`isdefined` of a module's): their module is
+# compile-time information only, never serialized
+const GLOBAL_BUILTINS = Any[getfield(Core, s) for s in (:getglobal, :setglobal!, :isdefinedglobal,
+                                                         :swapglobal!, :modifyglobal!, :replaceglobal!,
+                                                         :setglobalonce!, :get_binding_type, :getfield,
+                                                         :isdefined) if isdefined(Core, s)]
+
+# an operand of a builtin of globals: a constant module is a ghost
 function builtin_operand(fc::FnCtx, @nospecialize(x))
     m = x isa QuoteNode ? x.value : x
     if m isa GlobalRef
@@ -674,6 +680,10 @@ function emit_expr!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return emit_call!(fc, ex, typ)
     elseif head === :invoke
         return emit_invoke!(fc, ex, typ)
+    elseif head === :invoke_modify
+        # `modifyfield!(x, f, op, v, order)` with the method of `op` resolved
+        args = Any[operand(fc, a) for a in ex.args[3:end]]
+        return emit_builtin!(fc, Core.modifyfield!, args, typ)
     elseif head === :new
         T = operand(fc, ex.args[1])
         isconstant(T) || unsupported("`new` of a type that is not known at compile time")
@@ -724,7 +734,7 @@ function emit_call!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     (f isa CGVal && isconstant(f)) ||
         unsupported("a call of a function value of type ", f isa CGVal ? f.typ : f)
     fv = constant_value(f)
-    args = Any[fv isa Core.Builtin ? builtin_operand(fc, a) : operand(fc, a) for a in ex.args[2:end]]
+    args = Any[any(g -> fv === g, GLOBAL_BUILTINS) ? builtin_operand(fc, a) : operand(fc, a) for a in ex.args[2:end]]
     if fv isa Core.IntrinsicFunction
         return emit_intrinsic!(fc, fv, args, typ)
     elseif fv isa Core.Builtin

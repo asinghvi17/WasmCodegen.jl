@@ -85,6 +85,52 @@ function field_index(@nospecialize(T), f)
 end
 
 """
+The atomic operations on a field (`swapfield!`, `modifyfield!`, `replacefield!`,
+`setfieldonce!`): with one thread, the reads and writes they are, in order (orderings do not
+matter).
+"""
+function emit_atomic_field!(fc::FnCtx, @nospecialize(f), args::Vector{Any}, @nospecialize(typ))
+    x, idx = args[1]::CGVal, args[2]::CGVal
+    isconstant(idx) || unsupported(f, " of a field not known at compile time")
+    i = field_index(x.typ, constant_value(idx))
+    if f === Core.swapfield!
+        old = get_field(fc, x, i)
+        set_field!(fc, x, i, args[3])
+        return old
+    elseif f === Core.modifyfield!
+        op, v = args[3]::CGVal, args[4]::CGVal
+        isconstant(op) || unsupported("modifyfield! of a function not known at compile time")
+        old = get_field(fc, x, i)
+        new = call_runtime!(fc, constant_value(op), CGVal[old, v])
+        set_field!(fc, x, i, new)
+        return emit_new!(fc, typ, CGVal[old, new])
+    elseif f === Core.replacefield!
+        old = get_field(fc, x, i)
+        success = emit_egal!(fc, old, args[3])
+        push_val!(fc, success)
+        if!(fc.b); set_field!(fc, x, i, args[4]); end!(fc.b)
+        return emit_new!(fc, typ, CGVal[old, success])
+    else
+        # setfieldonce!: set if undefined
+        undef = emit_isdefined!(fc, x, i)
+        push_val!(fc, undef); emit!(fc.b, :i32_eqz)
+        r = new_local!(fc, I32)
+        emit!(fc.b, :local_tee, r)
+        if!(fc.b); set_field!(fc, x, i, args[3]); end!(fc.b)
+        emit!(fc.b, :local_get, r)
+        return pop_val!(fc, Bool)
+    end
+end
+
+"Whether `f` names no field of the concrete type `T` (in code inference has not proven dead)."
+is_no_field(@nospecialize(T), @nospecialize(f)) =
+    f isa Symbol && T isa DataType && isconcretetype(T) && Base.fieldindex(T, f, false) == 0
+
+"A `FieldError`: the type `T` has no field `name`."
+no_field!(fc::FnCtx, @nospecialize(T), name::Symbol) =
+    throw_error!(fc, Runtime.throw_field_error, () -> convert_repr(fc, const_value(fc, T), Any), const_value(fc, name))
+
+"""
     get_field(fc, x, i) -> CGVal
 
 The field `i` (constant) of the value `x`.
@@ -193,16 +239,22 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
             return const_value(fc, getfield(constant_value(x), constant_value(idx)))
         end
         if isconstant(idx)
+            is_no_field(x.typ, constant_value(idx)) && return no_field!(fc, x.typ, constant_value(idx))
             return get_field(fc, x, field_index(x.typ, constant_value(idx)))
         end
         return get_field_dynamic(fc, x, idx, typ)
     elseif f === Core.setfield!
         x, idx, v = args[1], args[2], args[3]
         isconstant(idx) || unsupported("setfield! with a field not known at compile time")
+        is_no_field(x.typ, constant_value(idx)) && return no_field!(fc, x.typ, constant_value(idx))
         return set_field!(fc, x, field_index(x.typ, constant_value(idx)), v)
+    elseif f === Core.swapfield! || f === Core.modifyfield! || f === Core.replacefield! ||
+           (isdefined(Core, :setfieldonce!) && f === Core.setfieldonce!)
+        return emit_atomic_field!(fc, f, args, typ)
     elseif f === Core.isdefined
         x, idx = args[1], args[2]
-        isconstant(idx) || unsupported("isdefined with a field not known at compile time")
+        isconstant(idx) || return isdefined_dynamic!(fc, x, idx)
+        is_no_field(x.typ, constant_value(idx)) && return const_value(fc, false)
         return emit_isdefined!(fc, x, field_index(x.typ, constant_value(idx)))
     elseif f === Core.:(===)
         return emit_egal!(fc, args[1], args[2])
@@ -225,12 +277,11 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
         return new_tuple_array!(fc, Core.SimpleVector, CGVal[a for a in args])
     elseif f === Core.isa
         T = args[2]
-        isconstant(T) || unsupported("isa with a type not known at compile time")
+        isconstant(T) || return isa_types!(fc, args[1], T)
         return emit_isa!(fc, args[1], constant_value(T))
     elseif f === Core.typeassert
         T = args[2]
-        isconstant(T) || unsupported("typeassert with a type not known at compile time")
-        t = emit_isa!(fc, args[1], constant_value(T))
+        t = isconstant(T) ? emit_isa!(fc, args[1], constant_value(T)) : isa_types!(fc, args[1], T)
         if !(isconstant(t) && constant_value(t))
             push_val!(fc, t)
             emit!(fc.b, :i32_eqz)
@@ -243,7 +294,7 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
     elseif f === Core.typeof
         x = args[1]::CGVal
         isconcretetype(x.typ) && return const_value(fc, x.typ)
-        unsupported("typeof of a value of abstract type ", x.typ)
+        return typeof_union!(fc, x, typ)
     elseif f === Core.tuple
         return make_tuple(fc, typ, CGVal[a for a in args])
     elseif f === Core.ifelse
@@ -252,8 +303,13 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
         return emit_throw!(fc, args[1])
     elseif f === Core.throw_methoderror
         vals = CGVal[a for a in args[2:end]]
+        # (the arguments' tuple; of values of types not known at compile time, a tuple of them
+        # as `Any`s, as its type cannot be known either)
+        argtuple() = all(v -> isconcretetype(v.typ), vals) ?
+            make_tuple(fc, Tuple{Any[v.typ for v in vals]...}, vals) :
+            new_tuple_array!(fc, Tuple{Vararg{Any}}, CGVal[convert_repr(fc, v, Any) for v in vals])
         return throw_error!(fc, Runtime.throw_method_error, () -> convert_repr(fc, args[1], Any),
-                            () -> convert_repr(fc, make_tuple(fc, Tuple{Any[v.typ for v in vals]...}, vals), Any))
+                            () -> convert_repr(fc, argtuple(), Any))
     elseif f === Core.nfields
         x = args[1]::CGVal
         isconcretetype(x.typ) && return const_value(fc, fieldcount(x.typ))
@@ -344,6 +400,65 @@ function emit_isdefined!(fc::FnCtx, x::CGVal, i::Int)
         end
     end
     return const_value(fc, true)
+end
+
+"""
+`x isa t` of a type `t` not known at compile time, but one of a few (of static type
+`Union{Type{A}, Type{B}, ...}`, as `typeof` of a value of a union is): of the one it is.
+"""
+function isa_types!(fc::FnCtx, x::CGVal, t::CGVal)
+    Ts = t.typ isa Union ? Base.uniontypes(t.typ) : Any[]
+    all(S -> S isa DataType && S.name === Type.body.name && !(S.parameters[1] isa TypeVar), Ts) && !isempty(Ts) ||
+        unsupported("isa with a type not known at compile time (of type ", t.typ, ")")
+    r = new_local!(fc, I32)
+    emit!(fc.b, :i32_const, 0); emit!(fc.b, :local_set, r)
+    for S in Ts
+        C = S.parameters[1]
+        push_val!(fc, emit_egal!(fc, t, const_value(fc, C)))
+        if!(fc.b)
+        push_val!(fc, emit_isa!(fc, x, C)); emit!(fc.b, :local_set, r)
+        end!(fc.b)
+    end
+    emit!(fc.b, :local_get, r)
+    return pop_val!(fc, Bool)
+end
+
+"`typeof(x)` of a value of a union of concrete types: the one it is (a chain of tests)."
+function typeof_union!(fc::FnCtx, x::CGVal, @nospecialize(typ))
+    Ts = Base.uniontypes(x.typ)
+    (x.typ isa Union && all(isconcretetype, Ts)) ||
+        unsupported("typeof of a value of abstract type ", x.typ)
+    r = new_local!(fc, jlvalue_ref(fc.cgm.types))
+    push_val!(fc, convert_repr(fc, const_value(fc, Ts[end]), Any)); emit!(fc.b, :local_set, r)
+    for C in Ts[1:end-1]
+        push_val!(fc, emit_isa!(fc, x, C))
+        if!(fc.b)
+        push_val!(fc, convert_repr(fc, const_value(fc, C), Any)); emit!(fc.b, :local_set, r)
+        end!(fc.b)
+    end
+    emit!(fc.b, :local_get, r)
+    return convert_repr(fc, pop_val!(fc, Any), typ)
+end
+
+"""
+`isdefined(x, i)` of a field index `i` not known at compile time: whether the field it is is
+defined (a chain of tests of the index); out of range, false.
+"""
+function isdefined_dynamic!(fc::FnCtx, x::CGVal, i::CGVal)
+    T = x.typ
+    (T isa DataType && isconcretetype(T) && i.typ <: Integer) ||
+        unsupported("isdefined with a field not known at compile time")
+    idx = convert_repr(fc, i, Int)
+    r = new_local!(fc, I32)
+    emit!(fc.b, :i32_const, 0); emit!(fc.b, :local_set, r)
+    for k in 1:fieldcount(T)
+        push_val!(fc, idx); emit!(fc.b, :i64_const, k); emit!(fc.b, :i64_eq)
+        if!(fc.b)
+        push_val!(fc, emit_isdefined!(fc, x, k)); emit!(fc.b, :local_set, r)
+        end!(fc.b)
+    end
+    emit!(fc.b, :local_get, r)
+    return pop_val!(fc, Bool)
 end
 
 """

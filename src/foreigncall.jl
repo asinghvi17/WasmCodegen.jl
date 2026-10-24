@@ -21,6 +21,10 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     name = foreigncall_name(ex.args[1])
     nargs = length(ex.args[3]::Core.SimpleVector)
     args = Any[operand(fc, a) for a in ex.args[6:5+nargs]]
+    if name === nothing && is_llvmcall(ex.args[5])
+        iname = llvm_intrinsic_name(ex.args[1])
+        iname === nothing || return emit_llvm_intrinsic!(fc, iname, args, typ)
+    end
     if name === :jl_alloc_genericmemory
         M = args[1]::CGVal
         isconstant(M) || unsupported("allocating a Memory of a type not known at compile time")
@@ -85,6 +89,28 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return string_ptr!(fc, args[1]::CGVal, typ, Symbol)
     elseif name === :jl_value_ptr
         return object_ptr!(fc, args[1]::CGVal, typ)
+    elseif name === :jl_new_structv
+        return new_structv!(fc, args[1]::CGVal, args[2]::CGVal)
+    elseif name === :jl_new_struct_uninit
+        T = args[1]::CGVal
+        (isconstant(T) && constant_value(T) isa DataType) ||
+            unsupported("a new object of a type not known at compile time")
+        return convert_repr(fc, emit_new!(fc, constant_value(T), CGVal[]), Any)
+    elseif name in (:jl_gc_disable_finalizers_internal, :jl_gc_enable_finalizers_internal,
+                    :jl_cpu_suspend, :jl_cpu_pause, :jl_cpu_wake, :jl_gc_safepoint,
+                    :jl_gc_run_pending_finalizers, :jl_threadid, :jl_get_task_tid,
+                    :jl_get_task_threadpoolid, :jl_threadpoolid)
+        # (one thread: the first, in the pool of id 0, as natively the main thread is; no
+        # finalizers run during code)
+        return typ === Nothing ? ghost(Nothing, nothing) : const_value(fc, zero(typ))
+    elseif name === :jl_hrtime
+        # (`time_ns`) the host's monotonic clock
+        call!(fc.b, host_import!(fc.cgm, "hrtime", ValType[], ValType[I64]))
+        return pop_val!(fc, UInt64)
+    elseif name === :jl_module_name
+        push_val!(fc, convert_repr(fc, args[1]::CGVal, Module))
+        emit!(fc.b, :struct_get, layout(fc, Module).wtype, HEADER_FIELDS)
+        return pop_val!(fc, Symbol)
     elseif (r = runtime_ccall(name)) !== nothing
         return emit_runtime_ccall!(fc, r, args, typ)
     elseif name === :jl_get_world_counter || name === :jl_get_tls_world_age
@@ -101,6 +127,66 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return bottom()
     end
     unsupported("the foreign call ", something(name, ex.args[1]))
+end
+
+"""
+`jl_new_structv(T, fields, nf)` (`deepcopy` of an immutable value): a new `T` of the values
+at the pointer `fields` (an array of them). The first `nf` are given, the rest undefined:
+only of types whose fields are all defined, where `nf` is all of them.
+"""
+function new_structv!(fc::FnCtx, T::CGVal, p::CGVal)
+    (isconstant(T) && constant_value(T) isa DataType) ||
+        unsupported("a new object of a type not known at compile time")
+    S = constant_value(T)
+    (isconcretetype(S) && S.name.n_uninitialized == 0) ||
+        unsupported("a new ", S, " from fields that may be undefined")
+    vals = CGVal[convert_repr(fc, ptr_load!(fc, p, const_value(fc, k), Any), fieldtype(S, k))
+                 for k in 1:fieldcount(S)]
+    return convert_repr(fc, emit_new!(fc, S, vals), Any)
+end
+
+function is_llvmcall(@nospecialize(cc))
+    cc isa QuoteNode && (cc = cc.value)
+    cc isa Tuple && !isempty(cc) && (cc = cc[1])
+    return cc === :llvmcall
+end
+
+function llvm_intrinsic_name(@nospecialize(x))
+    x isa QuoteNode && (x = x.value)
+    x isa String && return startswith(x, "llvm.") ? x : nothing
+    x isa Tuple && !isempty(x) && return llvm_intrinsic_name(x[1])
+    x isa Expr && x.head === :tuple && !isempty(x.args) && return llvm_intrinsic_name(x.args[1])
+    return nothing
+end
+
+# LLVM's intrinsics (`llvm.<name>.<type>`) that code calls with `ccall(..., llvmcall, ...)`,
+# as the Julia intrinsics that are the same operation
+const LLVM_INTRINSICS = Dict("fmuladd" => II.muladd_float, "fma" => II.fma_float,
+                             "sqrt" => II.sqrt_llvm, "fabs" => II.abs_float,
+                             "copysign" => II.copysign_float, "floor" => II.floor_llvm,
+                             "ceil" => II.ceil_llvm, "trunc" => II.trunc_llvm,
+                             "rint" => II.rint_llvm)
+
+"""
+    emit_llvm_intrinsic!(fc, name, args, typ) -> CGVal
+
+The call of the LLVM intrinsic `name` on floats, or on vectors of them (tuples of
+`VecElement`s) element by element.
+"""
+function emit_llvm_intrinsic!(fc::FnCtx, name::String, args::Vector{Any}, @nospecialize(typ))
+    parts = split(name, '.')
+    f = length(parts) == 3 ? get(LLVM_INTRINSICS, parts[2], nothing) : nothing
+    f === nothing && unsupported("the LLVM intrinsic ", name)
+    if typ isa DataType && typ <: Tuple && fieldcount(typ) > 0 && fieldtype(typ, 1) <: VecElement
+        E = fieldtype(typ, 1)
+        elems = CGVal[]
+        for k in 1:fieldcount(typ)
+            xs = Any[get_field(fc, get_field(fc, a::CGVal, k), 1) for a in args]
+            push!(elems, emit_new!(fc, E, CGVal[emit_intrinsic!(fc, f, xs, fieldtype(E, 1))]))
+        end
+        return emit_new!(fc, typ, elems)
+    end
+    return emit_intrinsic!(fc, f, args, typ)
 end
 
 """
@@ -132,9 +218,17 @@ function emit_objectid!(fc::FnCtx, x::CGVal)
         call!(fc.b, objectid_mutable_func!(fc.cgm))
         return pop_val!(fc, UInt64)
     end
-    (T isa DataType && isconcretetype(T) && !ismutabletype(T)) ||
-        unsupported("objectid of a value of type ", T)
-    return immut_id!(fc, x, T, const_value(fc, UInt64(reinterpret(UInt32, getfield(T, :hash)))))
+    if !(T isa DataType && isconcretetype(T) && !ismutabletype(T))
+        # by its type at run time
+        push_val!(fc, convert_repr(fc, x, Any))
+        call!(fc.b, objectid_any_func!(fc.cgm))
+        return pop_val!(fc, UInt64)
+    end
+    h(fc) = const_value(fc, UInt64(reinterpret(UInt32, getfield(T, :hash))))
+    layout(fc, T).kind === Boxed || return immut_id!(fc, x, T, h(fc))
+    # an immutable object (which may refer to others of its type): by a helper per type
+    return call_outlined!(fc, (:objectid, T), "objectid_" * typename_str(T), CGVal[x], UInt64,
+                          (hfc, a) -> immut_id!(hfc, a[1], T, h(hfc)))
 end
 
 # `immut_id_(T, x, h)`: the id of the immutable value `x`, from `h`: of its bits where it has
@@ -368,6 +462,12 @@ const RUNTIME_CCALLS = Dict{Symbol,RuntimeCcall}(
     # C strings: the bytes before a NUL (a string's or symbol's end)
     :strlen => RuntimeCcall(Runtime.ptr_strlen, [:val]),
     :jl_cstr_to_string => RuntimeCcall(Runtime.cstr_to_string, [:val]),
+    # identity hash tables (`IdDict`)
+    :jl_eqtable_put => RuntimeCcall(Runtime.EqTables.put, [:val, :val, :val, :val]),
+    :jl_eqtable_get => RuntimeCcall(Runtime.EqTables.get, [:val, :val, :val]),
+    :jl_eqtable_pop => RuntimeCcall(Runtime.EqTables.pop, [:val, :val, :val, :val]),
+    :jl_eqtable_nextind => RuntimeCcall(Runtime.EqTables.nextind, [:val, :val]),
+    :jl_idtable_rehash => RuntimeCcall(Runtime.EqTables.rehash, [:val, :val]),
     # hashing of strings before Julia 1.13
     :memhash_seed => RuntimeCcall(Runtime.memhash_seed, [:val, :val, :val]),
 )
@@ -417,7 +517,12 @@ for (p, T) in (("d", Float64), ("s", Float32))
             ("$(p)geqrt_", P.geqrt!, [r, r, r, a, r, a, r, a, a]),
             ("$(p)gemqrt_", P.gemqrt!, [r, r, r, r, r, r, a, r, a, r, a, r, a, a, x, x]),
             ("$(p)syevr_", P.syevr!, [r, r, r, r, a, r, r, r, r, r, r, a, a, a, r, a, a, r, a, r, a, x, x, x]),
-            ("$(p)gesdd_", P.gesdd!, [r, r, r, a, r, a, a, r, a, r, a, r, a, a, x]))
+            ("$(p)gesdd_", P.gesdd!, [r, r, r, a, r, a, a, r, a, r, a, r, a, a, x]),
+            ("$(p)gesvd_", P.gesvd!, [r, r, r, r, a, r, a, a, r, a, r, a, r, a, x, x]),
+            ("$(p)sytrf_", P.sytrf!, [r, r, a, r, a, a, r, a, x]),
+            ("$(p)sytrf_rook_", P.sytrf_rook!, [r, r, a, r, a, a, r, a, x]),
+            ("$(p)sytrs_", P.sytrs!, [r, r, r, a, r, a, a, r, a, x]),
+            ("$(p)sytrs_rook_", P.sytrs_rook!, [r, r, r, a, r, a, a, r, a, x]))
         RUNTIME_CCALLS[Symbol(name, "64_")] = RuntimeCcall(f, kinds)
     end
 end

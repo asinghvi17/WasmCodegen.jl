@@ -257,7 +257,7 @@ function compute_layout(ts::Types, @nospecialize(T))
     # concrete type, but its values are inline all the same
     is_inline_tuple(T) && return immutable_layout(ts, T)
     is_vararg_tuple(T) && return tuple_array_layout(ts, T, vararg_eltype(T))
-    T === Core.TypeName && return boxed_layout(ts, T, typename_object_type!(ts))
+    (T === Core.TypeName || T === Module) && return boxed_layout(ts, T, named_object_type!(ts))
     # a SimpleVector (a type's parameters): its elements in an array, as a large tuple's
     T === Core.SimpleVector && return tuple_array_layout(ts, T, Any)
     if !(T isa DataType) || !isconcretetype(T) || any(R -> T === R, RUNTIME_TYPES)
@@ -479,12 +479,12 @@ function type_object_type!(ts::Types)
 end
 
 """
-    typename_object_type!(ts) -> TypeRef
+    named_object_type!(ts) -> TypeRef
 
-The Wasm struct type of `Core.TypeName` objects: the header and the name (a Symbol), the
-one field of theirs code reads at run time (to print a type's name).
+The Wasm struct type of `Core.TypeName` and `Module` objects: the header and the name (a
+Symbol), what code reads of them at run time (to print a type's or a module's name).
 """
-function typename_object_type!(ts::Types)
+function named_object_type!(ts::Types)
     get!(ts.boxes, :typename) do
         add_type!(ts.mod, StructType([FieldType(I32, false), FieldType(I32, true),
                                        FieldType(layout(ts, Symbol).leaves[1].type, false)]);

@@ -44,6 +44,21 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
     elseif m.module === Runtime && m.name === :map_type
         f = mi.specTypes.parameters[2]
         return emit_map_type!(fc, f.instance, operand(fc, ex.args[4]))
+    elseif m.module === Base && (m.name === :enq_work || (m.name === :wait && length(mi.specTypes.parameters) == 1))
+        # one task: waiting can only wait forever, and there is no other task to schedule (in
+        # place of the scheduler: task switches, the C runtime's queues and threads)
+        msg = m.name === :wait ? "deadlock: waiting in a program of one task" : "scheduling a task in a program of one task"
+        return throw_error!(fc, Runtime.throw_concurrency_error, () -> const_value(fc, msg))
+    elseif m.module === Runtime.EqTables && m.name === :unset!
+        # a null reference in the element
+        a, i = CGVal[operand(fc, x) for x in ex.args[3:end]]
+        ml = memory_layout(fc.cgm.types, Any)
+        push_memory_array!(fc, a)
+        push_val!(fc, convert_repr(fc, i, Int)); emit!(fc.b, :i32_wrap_i64)
+        emit!(fc.b, :i32_const, 1); emit!(fc.b, :i32_sub)
+        push_default!(fc, ml.storage)
+        emit!(fc.b, :array_set, ml.array)
+        return ghost(Nothing, nothing)
     elseif m.module === Runtime && m.name === :reinterpret_bits
         Out = mi.specTypes.parameters[2].parameters[1]
         In = mi.specTypes.parameters[3]

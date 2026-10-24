@@ -11,3 +11,7 @@
 @noinline throw_field_error(@nospecialize(T), s::Symbol) = throw(FieldError(T::DataType, s))
 @noinline throw_rethrow_error() = error("rethrow() not allowed outside a catch block")
 @noinline throw_rethrow_other_error() = error("rethrow(exc) not allowed outside a catch block")
+@noinline throw_concurrency_error(msg::String) = throw(ConcurrencyViolationError(msg))
+
+"The C runtime's `jl_gc_have_pending_finalizers`, as code reads it: none ever are."
+const PENDING_FINALIZERS = Ref{Cint}(0)

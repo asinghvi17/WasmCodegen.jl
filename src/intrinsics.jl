@@ -87,6 +87,8 @@ Emit the intrinsic `f` on the values `args`, of result type `typ`.
 """
 function emit_intrinsic!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{Any}, @nospecialize(typ))
     args = CGVal[a for a in args]
+    f === II.cglobal && return emit_cglobal!(fc, args[1], typ)
+    f === II.llvmcall && return emit_llvmcall!(fc, args, typ)
     if !(f in PTR_INTRINSICS) && (any(a -> is_ptr_type(a.typ), args) || is_ptr_type(typ))
         # integer operations on pointers: of their addresses
         r = emit_intrinsic!(fc, f, Any[is_ptr_type(a.typ) ? ptr_address(a) : a for a in args],
@@ -563,4 +565,74 @@ function emit_float16!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{CGVal}
              for a in args]
     r = emit_intrinsic!(fc, f, xs, typ === Float16 ? Float32 : typ)
     return typ === Float16 ? float16_from!(fc, r) : r
+end
+
+"""
+    emit_cglobal!(fc, name, P) -> CGVal
+
+`cglobal(name, T)`: a pointer to a global variable of the C runtime. Of those code reads,
+its value as the module has it (in an object of the image): no finalizers are pending
+(`jl_gc_have_pending_finalizers`).
+"""
+function emit_cglobal!(fc::FnCtx, name::CGVal, @nospecialize(P))
+    s = isconstant(name) ? foreigncall_name(constant_value(name)) : nothing
+    s === :jl_gc_have_pending_finalizers ||
+        unsupported("the global variable ", something(s, name.typ), " of the C runtime")
+    return object_ptr!(fc, const_value(fc, Runtime.PENDING_FINALIZERS), P)
+end
+
+# the operations of `atomicrmw` on the old value and the operand
+const ATOMICRMW_OPS = Dict("add" => II.add_int, "sub" => II.sub_int, "and" => II.and_int,
+                           "or" => II.or_int, "xor" => II.xor_int)
+
+"""
+    emit_llvmcall!(fc, args, R) -> CGVal
+
+`llvmcall(ir, R, argtypes, args...)`, of the LLVM IR of `Threads.Atomic`'s operations (Julia
+1.12 writes them so): an atomic load, store, `cmpxchg` or `atomicrmw` through the pointer
+that is the first argument. With one thread, the loads and stores they are. Other IR is
+unsupported.
+"""
+function emit_llvmcall!(fc::FnCtx, args::Vector{CGVal}, @nospecialize(R))
+    ir = isconstant(args[1]) ? constant_value(args[1]) : nothing
+    ir isa Tuple && (ir = ir[1])
+    vals = args[4:end]
+    (ir isa String && !isempty(vals) && is_ptr_type(vals[1].typ)) || unsupported("the intrinsic llvmcall")
+    p = vals[1]
+    T = eltype(p.typ)
+    one_ = const_value(fc, 1)
+    if occursin("load atomic", ir)
+        return ptr_load!(fc, p, one_, T)
+    elseif occursin("store atomic", ir)
+        ptr_store!(fc, p, convert_repr(fc, vals[2], T), one_)
+        return ghost(Nothing, nothing)
+    end
+    old = ptr_load!(fc, p, one_, T)
+    if occursin("cmpxchg", ir)
+        # (compared by their bits, as `cmpxchg` compares)
+        I = T <: AbstractFloat ? Base.uinttype(T) : T
+        bits(v) = I === T ? v : emit_intrinsic!(fc, II.bitcast, Any[const_value(fc, I), v], I)
+        eq = emit_intrinsic!(fc, II.eq_int, Any[bits(old), bits(vals[2])], Bool)
+        push_val!(fc, eq)
+        if!(fc.b); ptr_store!(fc, p, convert_repr(fc, vals[3], T), one_); end!(fc.b)
+        return old
+    end
+    m = match(r"atomicrmw (\w+)", ir)
+    m === nothing && unsupported("the intrinsic llvmcall")
+    op, v = m[1], convert_repr(fc, vals[2], T)
+    new = if op == "xchg"
+        v
+    elseif haskey(ATOMICRMW_OPS, op)
+        emit_intrinsic!(fc, ATOMICRMW_OPS[op], Any[old, v], T)
+    elseif op == "nand"
+        emit_intrinsic!(fc, II.not_int, Any[emit_intrinsic!(fc, II.and_int, Any[old, v], T)], T)
+    elseif op in ("max", "min", "umax", "umin")
+        lt = startswith(op, "u") ? II.ult_int : II.slt_int
+        c = endswith(op, "max") ? emit_intrinsic!(fc, lt, Any[old, v], Bool) : emit_intrinsic!(fc, lt, Any[v, old], Bool)
+        emit_builtin!(fc, Core.ifelse, Any[c, v, old], T)
+    else
+        unsupported("the intrinsic llvmcall (atomicrmw ", op, ")")
+    end
+    ptr_store!(fc, p, new, one_)
+    return old
 end

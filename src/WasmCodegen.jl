@@ -32,6 +32,7 @@ include("runtime/floats.jl")
 include("runtime/float16.jl")
 include("runtime/errors.jl")
 include("runtime/types.jl")
+include("runtime/eqtable.jl")
 include("runtime/blas.jl")
 include("runtime/lapack.jl")
 end

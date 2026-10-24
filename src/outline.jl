@@ -38,7 +38,16 @@ function call_outlined!(fc::FnCtx, key, name::AbstractString, args::Vector{CGVal
                 k += n
             end
         end
-        r = body(hfc, hargs)
+        r = try
+            body(hfc, hargs)
+        catch
+            # (a helper whose body cannot be compiled traps, should its caller trap instead)
+            empty!(f.body)
+            hb = Builder(cgm.mod, f)
+            unreachable!(hb)
+            finish!(hb)
+            rethrow()
+        end
         if !is_unreachable(hfc.b)
             if lt.kind === Bottom || r.kind === Bottom
                 unreachable!(hfc.b)

@@ -277,6 +277,85 @@ function finish_egal!(cgm::CGModule)
     finish!(b)
 end
 
+## objectid of values whose types are known only at run time
+
+"""
+    objectid_any_func!(cgm) -> Func
+
+`jl_object_id(x::\$JlValue) -> i64`: `objectid(x)`, by the type of `x`: of each type whose
+values are objects, the code of `objectid` of a value of that type (`Runtime.objectid_as`,
+compiled with the module's code, see `compile_objectid_cases!`). Generated when the module's
+types are known (`finish_objectid_any!`); a type it has no case for traps.
+"""
+objectid_any_func!(cgm::CGModule) = get!(cgm.helpers, :objectid_any) do
+    add_func!(cgm.mod, "jl_object_id", ValType[jlvalue_ref(cgm.types)], ValType[I64])
+end
+
+# the types whose values may be objects of their own (boxed, or inline with a box): those
+# `jl_object_id` has cases for (types and other objects of the runtime: by identity)
+function objectid_case_type(ts::Types, @nospecialize(T))
+    (T isa DataType && isconcretetype(T)) || return false
+    any(R -> T === R, RUNTIME_TYPES) && return false
+    l = layout(ts, T)
+    return l.kind === Boxed || l.kind === Ghost || (l.kind === Inline && haskey(ts.boxes, (:box, T)))
+end
+
+"""
+    compile_objectid_cases!(cgm)
+
+Compiles `objectid` of each type whose values may be objects, for `jl_object_id`, once the
+module's code is compiled: until it adds no types.
+"""
+function compile_objectid_cases!(cgm::CGModule)
+    haskey(cgm.helpers, :objectid_any) || return
+    cases = get!(() -> Dict{Int,FuncInfo}(), cgm.helpers, :objectid_cases)
+    ts = cgm.types
+    # (compiled for every such type, whether or not its values are ever hashed: one whose
+    # `objectid` cannot be compiled traps there, and is not an error of the program)
+    config, ndiag = cgm.config, length(cgm.diagnostics)
+    cgm.config = Config(; on_unsupported=:trap, trim=:unsafe, verify=config.verify,
+                        trim_patches=config.trim_patches, optimize=config.optimize)
+    try
+        while true
+            n = length(cases)
+            for (id, T) in enumerate(copy(ts.typelist))
+                (haskey(cases, id) || !objectid_case_type(ts, T)) && continue
+                cases[id] = runtime_function!(cgm, Runtime.objectid_as, (Any, Type{T}))
+            end
+            length(cases) == n && break
+            process_worklist!(cgm)
+        end
+    finally
+        cgm.config = config
+        resize!(cgm.diagnostics, ndiag)
+    end
+end
+
+function finish_objectid_any!(cgm::CGModule)
+    f = get(cgm.helpers, :objectid_any, nothing)
+    f === nothing && return
+    cases = get(cgm.helpers, :objectid_cases, Dict{Int,FuncInfo}())
+    ts = cgm.types
+    b = Builder(cgm.mod, f)
+    tid = add_local!(f, I32)
+    emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :local_set, tid)
+    for (id, T) in enumerate(ts.typelist)
+        info = get(cases, id, nothing)
+        if info === nothing
+            # objects of the runtime (types, ...) and mutable ones: by identity
+            (T isa DataType && ismutabletype(T)) || continue
+        end
+        emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+        if!(b)
+        emit!(b, :local_get, 0)
+        call!(b, info === nothing ? objectid_mutable_func!(cgm) : info.func)
+        return!(b)
+        end!(b)
+    end
+    unreachable!(b)
+    finish!(b)
+end
+
 function emit_fields_egal!(cgm::CGModule, b::Builder, f::Func, st::TypeRef, ca::Int, cb::Int)
     fields = (typedef(cgm.mod, st).comp::StructType).fields
     for w in HEADER_FIELDS+1:length(fields)
@@ -292,6 +371,9 @@ function emit_fields_egal!(cgm::CGModule, b::Builder, f::Func, st::TypeRef, ca::
             emit!(b, :i32_reinterpret_f32); emit!(b, :i32_ne)
         elseif stg === I64
             emit!(b, :i64_ne)
+        elseif stg isa RefType && stg.heap isa TypeRef && typedef(cgm.mod, stg.heap).comp isa ArrayType
+            # (the array of a memory, in a reference to its element: the same memory)
+            emit!(b, :ref_eq); emit!(b, :i32_eqz)
         elseif stg isa RefType
             # (a reference to some object: compared with jl_egal)
             call!(b, f); emit!(b, :i32_eqz)

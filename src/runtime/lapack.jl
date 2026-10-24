@@ -1,5 +1,6 @@
 # LAPACK, for what LinearAlgebra's factorizations call: LU (`getrf`, `getrs`, `getri`),
-# Cholesky (`potrf`, `potrs`), triangular solves (`trtrs`) and copies (`lacpy`), on real
+# Cholesky (`potrf`, `potrs`), Bunch-Kaufman (`sytrf`, `sytrs` and their rook variants), QR,
+# SVD and symmetric eigenvalues, triangular solves (`trtrs`) and copies (`lacpy`), on real
 # elements, with unblocked algorithms over the BLAS kernels (`blas.jl`). Outputs (`info`,
 # pivots) are written through their arguments. Results can differ from an optimized
 # LAPACK's in their last bits.
@@ -656,18 +657,14 @@ function syevr!(jobz::UInt8, range::UInt8, uplo::UInt8, n::Int, A::ArrayArg{T}, 
     end
 end
 
-"""`gesdd`: the singular values (descending) of the m×n A and, by `jobz`, none of the
-singular vectors ('N'), the first min(m, n) of each ('S', U m×k, Vᵀ k×n) or all ('A', U
-m×m, Vᵀ n×n), by one-sided Jacobi rotations. A is destroyed. A workspace query where
-`lwork` is -1."""
-function gesdd!(jobz::UInt8, m::Int, n::Int, A::ArrayArg{T}, lda::Int, S::ArrayArg{T},
-                U::ArrayArg{T}, ldu::Int, VT::ArrayArg{T}, ldvt::Int, work::ArrayArg{T},
-                lwork::Int, iwork::ArrayArg{Int}, info) where {T}
-    setinfo!(info, 0)
-    if lwork == -1
-        st!(work, 1, T(max(1, 4 * (m + n)^2)))
-        return
-    end
+"""
+    jacobi_svd(m, n, A, lda, fullu, fullv) -> (S, U, V)
+
+The singular values (descending) of the m×n A, and its left and right singular vectors: the
+first min(m, n) of each, or all (`fullu`, `fullv`, completed to orthonormal bases), by
+one-sided Jacobi rotations.
+"""
+function jacobi_svd(m::Int, n::Int, A::ArrayArg{T}, lda::Int, fullu::Bool, fullv::Bool) where {T}
     k = min(m, n)
     # (on Aᵀ if wider than tall: its columns are the rows)
     tall = m >= n
@@ -709,14 +706,11 @@ function gesdd!(jobz::UInt8, m::Int, n::Int, A::ArrayArg{T}, lda::Int, S::ArrayA
     end
     sv = T[sqrt(sum(abs2, view(G, :, j))) for j in 1:q]
     perm = sortperm(sv; rev=true)
-    for j in 1:k
-        st!(S, j, sv[perm[j]])
-    end
-    (jobz == UInt8('N') || jobz == UInt8('n')) && return
-    full = jobz == UInt8('A') || jobz == UInt8('a')
+    S = T[sv[perm[j]] for j in 1:k]
     # the left vectors of G (normalized columns, completed to an orthonormal basis), the right
     # ones V; for Aᵀ they swap
-    L = zeros(T, p, full ? p : k)
+    fulll, fullr = tall ? (fullu, fullv) : (fullv, fullu)
+    L = zeros(T, p, fulll ? p : k)
     for j in 1:k
         c = perm[j]
         sv[c] > 0 && (L[:, j] .= view(G, :, c) ./ sv[c])
@@ -741,23 +735,420 @@ function gesdd!(jobz::UInt8, m::Int, n::Int, A::ArrayArg{T}, lda::Int, S::ArrayA
             end
         end
     end
-    R = zeros(T, q, full ? q : k)
-    for j in 1:k
+    R = zeros(T, q, fullr ? q : k)
+    for j in 1:size(R, 2)
         R[:, j] .= view(V, :, perm[j])
     end
-    if full && q > k
-        for j in k+1:q
-            R[:, j] .= view(V, :, perm[j])
-        end
-    end
-    # U: m×(m or k), Vᵀ: (n or k)×n
-    Uc, Vc = tall ? (L, R) : (R, L)
-    for j in 1:size(Uc, 2), i in 1:m
-        setelem!(U, ldu, i, j, Uc[i, j])
-    end
-    for j in 1:n, i in 1:size(Vc, 2)
-        setelem!(VT, ldvt, i, j, Vc[j, i])
+    return tall ? (S, L, R) : (S, R, L)
+end
+
+# the m×c matrix U into the array X (leading dimension ldx), and Vᵀ of the n×r V
+function put_u!(X::ArrayArg{T}, ldx::Int, U::Matrix{T}) where {T}
+    for j in 1:size(U, 2), i in 1:size(U, 1)
+        setelem!(X, ldx, i, j, U[i, j])
     end
 end
+function put_vt!(X::ArrayArg{T}, ldx::Int, V::Matrix{T}) where {T}
+    for j in 1:size(V, 1), i in 1:size(V, 2)
+        setelem!(X, ldx, i, j, V[j, i])
+    end
+end
+
+"""`gesdd`: the singular values (descending) of the m×n A and, by `jobz`, none of the
+singular vectors ('N'), the first min(m, n) of each ('S', U m×k, Vᵀ k×n) or all ('A', U
+m×m, Vᵀ n×n). A is destroyed. A workspace query where `lwork` is -1."""
+function gesdd!(jobz::UInt8, m::Int, n::Int, A::ArrayArg{T}, lda::Int, S::ArrayArg{T},
+                U::ArrayArg{T}, ldu::Int, VT::ArrayArg{T}, ldvt::Int, work::ArrayArg{T},
+                lwork::Int, iwork::ArrayArg{Int}, info) where {T}
+    setinfo!(info, 0)
+    if lwork == -1
+        st!(work, 1, T(max(1, 4 * (m + n)^2)))
+        return
+    end
+    full = jobz == UInt8('A') || jobz == UInt8('a')
+    sv, Uc, Vc = jacobi_svd(m, n, A, lda, full, full)
+    for j in eachindex(sv)
+        st!(S, j, sv[j])
+    end
+    (jobz == UInt8('N') || jobz == UInt8('n')) && return
+    put_u!(U, ldu, Uc)
+    put_vt!(VT, ldvt, Vc)
+end
+
+"""`gesvd`: as `gesdd`, the left and right singular vectors chosen separately (`jobu`,
+`jobvt`): none ('N'), the first min(m, n) ('S', or 'O': written over A) or all ('A')."""
+function gesvd!(jobu::UInt8, jobvt::UInt8, m::Int, n::Int, A::ArrayArg{T}, lda::Int,
+                S::ArrayArg{T}, U::ArrayArg{T}, ldu::Int, VT::ArrayArg{T}, ldvt::Int,
+                work::ArrayArg{T}, lwork::Int, info) where {T}
+    setinfo!(info, 0)
+    if lwork == -1
+        st!(work, 1, T(max(1, 4 * (m + n)^2)))
+        return
+    end
+    job(c) = c | 0x20  # (lowercase)
+    sv, Uc, Vc = jacobi_svd(m, n, A, lda, job(jobu) == UInt8('a'), job(jobvt) == UInt8('a'))
+    for j in eachindex(sv)
+        st!(S, j, sv[j])
+    end
+    job(jobu) in (UInt8('a'), UInt8('s')) && put_u!(U, ldu, Uc)
+    job(jobvt) in (UInt8('a'), UInt8('s')) && put_vt!(VT, ldvt, Vc)
+    job(jobu) == UInt8('o') && put_u!(A, lda, Uc)
+    job(jobvt) == UInt8('o') && put_vt!(A, lda, Vc)
+end
+
+
+## symmetric indefinite: A = U D Uᵀ or L D Lᵀ, D of 1×1 and 2×2 blocks (Bunch-Kaufman, LAPACK's
+## unblocked `dsytf2` and `dsytf2_rook`, and their solves)
+
+# the first of the n elements of largest magnitude from A(i, j) in steps (di, dj) (`idamax`)
+function iamax_at(A::ArrayArg{T}, lda::Int, n::Int, i::Int, j::Int, di::Int, dj::Int) where {T}
+    n < 1 && return 0
+    k, m = 1, abs(elem(A, lda, i, j))
+    for t in 2:n
+        a = abs(elem(A, lda, i + (t - 1) * di, j + (t - 1) * dj))
+        a > m && ((k, m) = (t, a))
+    end
+    return k
+end
+
+# swap the n elements from A(i1, j1) in steps (a1, b1) with those from A(i2, j2) (`dswap`)
+function swap_at!(A, lda::Int, n::Int, i1::Int, j1::Int, a1::Int, b1::Int, i2::Int, j2::Int, a2::Int, b2::Int)
+    for t in 0:n-1
+        x = elem(A, lda, i1 + t * a1, j1 + t * b1)
+        setelem!(A, lda, i1 + t * a1, j1 + t * b1, elem(A, lda, i2 + t * a2, j2 + t * b2))
+        setelem!(A, lda, i2 + t * a2, j2 + t * b2, x)
+    end
+end
+swap_diag!(A, lda::Int, p::Int, q::Int) =
+    (x = elem(A, lda, p, p); setelem!(A, lda, p, p, elem(A, lda, q, q)); setelem!(A, lda, q, q, x))
+
+# the symmetric rank-1 update of the n×n block from A(o+1, o+1), in its `upper` triangle or
+# the lower one, with the n elements of the column `c` of A from row `r` (`dsyr`)
+function syr_at!(A::ArrayArg{T}, lda::Int, upper::Bool, n::Int, alpha::T, r::Int, c::Int, o::Int) where {T}
+    for j in 1:n
+        xj = elem(A, lda, r + j - 1, c)
+        xj == 0 && continue
+        t = alpha * xj
+        for i in (upper ? (1:j) : (j:n))
+            setelem!(A, lda, o + i, o + j, elem(A, lda, o + i, o + j) + elem(A, lda, r + i - 1, c) * t)
+        end
+    end
+end
+
+"""`sytf2`/`sytf2_rook`: the factorization of `sytrf` (Bunch-Kaufman's partial pivoting) or
+`sytrf_rook` (rook pivoting), unblocked; `info` > 0 at the first zero pivot."""
+function sytf2!(uplo::UInt8, n::Int, A::ArrayArg{T}, lda::Int, ipiv::ArrayArg{Int}, info, rook::Bool) where {T}
+    alpha = (one(T) + sqrt(T(17))) / 8
+    sfmin = floatmin(T)
+    inf = 0
+    upper = isupper(uplo)
+    k = upper ? n : 1
+    while upper ? k >= 1 : k <= n
+        kstep = 1
+        p = k
+        absakk = abs(elem(A, lda, k, k))
+        if upper
+            imax = k > 1 ? iamax_at(A, lda, k - 1, 1, k, 1, 0) : 0
+        else
+            imax = k < n ? k + iamax_at(A, lda, n - k, k + 1, k, 1, 0) : 0
+        end
+        colmax = imax > 0 ? abs(elem(A, lda, imax, k)) : zero(T)
+        if max(absakk, colmax) == 0 || (!rook && isnan(absakk))
+            inf == 0 && (inf = k)
+            kp = k
+        else
+            if !(absakk < alpha * colmax)
+                kp = k
+            elseif !rook
+                # the largest off-diagonal element of the row and column imax
+                if upper
+                    jmax = imax + iamax_at(A, lda, k - imax, imax, imax + 1, 0, 1)
+                    rowmax = abs(elem(A, lda, imax, jmax))
+                    if imax > 1
+                        jmax = iamax_at(A, lda, imax - 1, 1, imax, 1, 0)
+                        rowmax = max(rowmax, abs(elem(A, lda, jmax, imax)))
+                    end
+                else
+                    jmax = k - 1 + iamax_at(A, lda, imax - k, imax, k, 0, 1)
+                    rowmax = abs(elem(A, lda, imax, jmax))
+                    if imax < n
+                        jmax = imax + iamax_at(A, lda, n - imax, imax + 1, imax, 1, 0)
+                        rowmax = max(rowmax, abs(elem(A, lda, jmax, imax)))
+                    end
+                end
+                if absakk >= alpha * colmax * (colmax / rowmax)
+                    kp = k
+                elseif abs(elem(A, lda, imax, imax)) >= alpha * rowmax
+                    kp = imax
+                else
+                    kp = imax
+                    kstep = 2
+                end
+            else
+                # rook: along rows and columns until a pivot (or a 2×2 one) is found
+                while true
+                    if upper
+                        if imax != k
+                            jmax = imax + iamax_at(A, lda, k - imax, imax, imax + 1, 0, 1)
+                            rowmax = abs(elem(A, lda, imax, jmax))
+                        else
+                            rowmax = zero(T)
+                        end
+                        if imax > 1
+                            itemp = iamax_at(A, lda, imax - 1, 1, imax, 1, 0)
+                            dtemp = abs(elem(A, lda, itemp, imax))
+                            dtemp > rowmax && ((rowmax, jmax) = (dtemp, itemp))
+                        end
+                    else
+                        if imax != k
+                            jmax = k - 1 + iamax_at(A, lda, imax - k, imax, k, 0, 1)
+                            rowmax = abs(elem(A, lda, imax, jmax))
+                        else
+                            rowmax = zero(T)
+                        end
+                        if imax < n
+                            itemp = imax + iamax_at(A, lda, n - imax, imax + 1, imax, 1, 0)
+                            dtemp = abs(elem(A, lda, itemp, imax))
+                            dtemp > rowmax && ((rowmax, jmax) = (dtemp, itemp))
+                        end
+                    end
+                    if !(abs(elem(A, lda, imax, imax)) < alpha * rowmax)
+                        kp = imax
+                        break
+                    elseif p == jmax || rowmax <= colmax
+                        kp = imax
+                        kstep = 2
+                        break
+                    else
+                        p = imax
+                        colmax = rowmax
+                        imax = jmax
+                    end
+                end
+            end
+            kk = upper ? k - kstep + 1 : k + kstep - 1
+            if rook && kstep == 2 && p != k
+                if upper
+                    p > 1 && swap_at!(A, lda, p - 1, 1, k, 1, 0, 1, p, 1, 0)
+                    p < k - 1 && swap_at!(A, lda, k - p - 1, p + 1, k, 1, 0, p, p + 1, 0, 1)
+                else
+                    p < n && swap_at!(A, lda, n - p, p + 1, k, 1, 0, p + 1, p, 1, 0)
+                    p > k + 1 && swap_at!(A, lda, p - k - 1, k + 1, k, 1, 0, p, k + 1, 0, 1)
+                end
+                swap_diag!(A, lda, k, p)
+            end
+            if kp != kk
+                # interchange rows and columns kk and kp of the trailing (or leading) block
+                if upper
+                    kp > 1 && swap_at!(A, lda, kp - 1, 1, kk, 1, 0, 1, kp, 1, 0)
+                    kk - kp - 1 > 0 && swap_at!(A, lda, kk - kp - 1, kp + 1, kk, 1, 0, kp, kp + 1, 0, 1)
+                else
+                    kp < n && swap_at!(A, lda, n - kp, kp + 1, kk, 1, 0, kp + 1, kp, 1, 0)
+                    kp - kk - 1 > 0 && swap_at!(A, lda, kp - kk - 1, kk + 1, kk, 1, 0, kp, kk + 1, 0, 1)
+                end
+                swap_diag!(A, lda, kk, kp)
+                if kstep == 2
+                    r = upper ? k - 1 : k + 1
+                    x = elem(A, lda, r, k)
+                    setelem!(A, lda, r, k, elem(A, lda, kp, k))
+                    setelem!(A, lda, kp, k, x)
+                end
+            end
+            if kstep == 1
+                # A := A - (1/d) x xᵀ on the rest, x the column k (scaled by 1/d after)
+                m, r, o = upper ? (k - 1, 1, 0) : (n - k, k + 1, k)
+                if m > 0
+                    akk = elem(A, lda, k, k)
+                    if !rook || abs(akk) >= sfmin
+                        d = one(T) / akk
+                        syr_at!(A, lda, upper, m, -d, r, k, o)
+                        for i in r:r+m-1
+                            setelem!(A, lda, i, k, d * elem(A, lda, i, k))
+                        end
+                    else
+                        for i in r:r+m-1
+                            setelem!(A, lda, i, k, elem(A, lda, i, k) / akk)
+                        end
+                        syr_at!(A, lda, upper, m, -akk, r, k, o)
+                    end
+                end
+            elseif upper && k > 2
+                # A := A - (W(k-1) W(k)) D⁻¹ (W(k-1) W(k))ᵀ on A(1:k-2, 1:k-2)
+                d12 = elem(A, lda, k - 1, k)
+                d22 = elem(A, lda, k - 1, k - 1) / d12
+                d11 = elem(A, lda, k, k) / d12
+                t = one(T) / (d11 * d22 - one(T))
+                rook || (d12 = t / d12)
+                for j in k-2:-1:1
+                    a1, a0 = elem(A, lda, j, k - 1), elem(A, lda, j, k)
+                    wkm1 = (rook ? t : d12) * (d11 * a1 - a0)
+                    wk = (rook ? t : d12) * (d22 * a0 - a1)
+                    for i in j:-1:1
+                        v = rook ? elem(A, lda, i, j) - (elem(A, lda, i, k) / d12) * wk - (elem(A, lda, i, k - 1) / d12) * wkm1 :
+                                   elem(A, lda, i, j) - elem(A, lda, i, k) * wk - elem(A, lda, i, k - 1) * wkm1
+                        setelem!(A, lda, i, j, v)
+                    end
+                    setelem!(A, lda, j, k, rook ? wk / d12 : wk)
+                    setelem!(A, lda, j, k - 1, rook ? wkm1 / d12 : wkm1)
+                end
+            elseif !upper && k < n - 1
+                d21 = elem(A, lda, k + 1, k)
+                d11 = elem(A, lda, k + 1, k + 1) / d21
+                d22 = elem(A, lda, k, k) / d21
+                t = one(T) / (d11 * d22 - one(T))
+                rook || (d21 = t / d21)
+                for j in k+2:n
+                    a0, a1 = elem(A, lda, j, k), elem(A, lda, j, k + 1)
+                    wk = (rook ? t : d21) * (d11 * a0 - a1)
+                    wkp1 = (rook ? t : d21) * (d22 * a1 - a0)
+                    for i in j:n
+                        v = rook ? elem(A, lda, i, j) - (elem(A, lda, i, k) / d21) * wk - (elem(A, lda, i, k + 1) / d21) * wkp1 :
+                                   elem(A, lda, i, j) - elem(A, lda, i, k) * wk - elem(A, lda, i, k + 1) * wkp1
+                        setelem!(A, lda, i, j, v)
+                    end
+                    setelem!(A, lda, j, k, rook ? wk / d21 : wk)
+                    setelem!(A, lda, j, k + 1, rook ? wkp1 / d21 : wkp1)
+                end
+            end
+        end
+        # the interchanges: kp of a 1×1 block; of a 2×2 one, -kp on both (Bunch-Kaufman) or
+        # the two of rook pivoting
+        if kstep == 1
+            st!(ipiv, k, kp)
+        else
+            st!(ipiv, k, rook ? -p : -kp)
+            st!(ipiv, upper ? k - 1 : k + 1, -kp)
+        end
+        k = upper ? k - kstep : k + kstep
+    end
+    setinfo!(info, inf)
+end
+
+"`sytrf` (`rook` false) and `sytrf_rook`: unblocked (a workspace query where `lwork` is -1)."
+function sytrf!(uplo::UInt8, n::Int, A::ArrayArg{T}, lda::Int, ipiv::ArrayArg{Int},
+                work::ArrayArg{T}, lwork::Int, info, rook::Bool=false) where {T}
+    if lwork == -1
+        st!(work, 1, T(max(1, n)))
+        setinfo!(info, 0)
+        return
+    end
+    sytf2!(uplo, n, A, lda, ipiv, info, rook)
+end
+sytrf_rook!(uplo::UInt8, n::Int, A::ArrayArg{T}, lda::Int, ipiv::ArrayArg{Int},
+            work::ArrayArg{T}, lwork::Int, info) where {T} = sytrf!(uplo, n, A, lda, ipiv, work, lwork, info, true)
+
+swaprhs!(B, ldb::Int, p::Int, q::Int, nrhs::Int) = p == q || swaprows!(B, ldb, p, q, nrhs)
+
+# B(rows r .+ (0:m-1), :) -= A(r:r+m-1, c) * B(k, :)  (`dger`)
+function ger_rhs!(B::ArrayArg{T}, ldb::Int, A::ArrayArg{T}, lda::Int, m::Int, r::Int, c::Int, k::Int, nrhs::Int) where {T}
+    for j in 1:nrhs
+        t = -elem(B, ldb, k, j)
+        for i in 0:m-1
+            setelem!(B, ldb, r + i, j, elem(B, ldb, r + i, j) + elem(A, lda, r + i, c) * t)
+        end
+    end
+end
+# B(k, :) -= A(r:r+m-1, c)ᵀ B(r:r+m-1, :)  (`dgemv` of Bᵀ)
+function gemv_rhs!(B::ArrayArg{T}, ldb::Int, A::ArrayArg{T}, lda::Int, m::Int, r::Int, c::Int, k::Int, nrhs::Int) where {T}
+    for j in 1:nrhs
+        t = zero(T)
+        for i in 0:m-1
+            t += elem(B, ldb, r + i, j) * elem(A, lda, r + i, c)
+        end
+        setelem!(B, ldb, k, j, elem(B, ldb, k, j) - t)
+    end
+end
+# the 2×2 block of D at rows (a, b), its off-diagonal element A(a, b) of the stored triangle
+function solve2!(B::ArrayArg{T}, ldb::Int, A::ArrayArg{T}, lda::Int, a::Int, b::Int, offd::T, nrhs::Int) where {T}
+    akm1 = elem(A, lda, a, a) / offd
+    ak = elem(A, lda, b, b) / offd
+    denom = akm1 * ak - one(T)
+    for j in 1:nrhs
+        bkm1 = elem(B, ldb, a, j) / offd
+        bk = elem(B, ldb, b, j) / offd
+        setelem!(B, ldb, a, j, (ak * bkm1 - bk) / denom)
+        setelem!(B, ldb, b, j, (akm1 * bk - bkm1) / denom)
+    end
+end
+
+"""`sytrs` (`rook` false) and `sytrs_rook`: solve A X = B with the factors of `sytrf` (or
+`sytrf_rook`), X overwriting B."""
+function sytrs!(uplo::UInt8, n::Int, nrhs::Int, A::ArrayArg{T}, lda::Int, ipiv::ArrayArg{Int},
+                B::ArrayArg{T}, ldb::Int, info, rook::Bool=false) where {T}
+    setinfo!(info, 0)
+    if isupper(uplo)
+        # U D X = B, then Uᵀ X = B
+        k = n
+        while k >= 1
+            if ld(ipiv, k) > 0
+                swaprhs!(B, ldb, k, ld(ipiv, k), nrhs)
+                ger_rhs!(B, ldb, A, lda, k - 1, 1, k, k, nrhs)
+                d = one(T) / elem(A, lda, k, k)
+                for j in 1:nrhs
+                    setelem!(B, ldb, k, j, d * elem(B, ldb, k, j))
+                end
+                k -= 1
+            else
+                swaprhs!(B, ldb, rook ? k : k - 1, -ld(ipiv, k), nrhs)
+                rook && swaprhs!(B, ldb, k - 1, -ld(ipiv, k - 1), nrhs)
+                ger_rhs!(B, ldb, A, lda, k - 2, 1, k, k, nrhs)
+                ger_rhs!(B, ldb, A, lda, k - 2, 1, k - 1, k - 1, nrhs)
+                solve2!(B, ldb, A, lda, k - 1, k, elem(A, lda, k - 1, k), nrhs)
+                k -= 2
+            end
+        end
+        k = 1
+        while k <= n
+            if ld(ipiv, k) > 0
+                gemv_rhs!(B, ldb, A, lda, k - 1, 1, k, k, nrhs)
+                swaprhs!(B, ldb, k, ld(ipiv, k), nrhs)
+                k += 1
+            else
+                gemv_rhs!(B, ldb, A, lda, k - 1, 1, k, k, nrhs)
+                gemv_rhs!(B, ldb, A, lda, k - 1, 1, k + 1, k + 1, nrhs)
+                swaprhs!(B, ldb, k, -ld(ipiv, k), nrhs)
+                rook && swaprhs!(B, ldb, k + 1, -ld(ipiv, k + 1), nrhs)
+                k += 2
+            end
+        end
+    else
+        # L D X = B, then Lᵀ X = B
+        k = 1
+        while k <= n
+            if ld(ipiv, k) > 0
+                swaprhs!(B, ldb, k, ld(ipiv, k), nrhs)
+                ger_rhs!(B, ldb, A, lda, n - k, k + 1, k, k, nrhs)
+                d = one(T) / elem(A, lda, k, k)
+                for j in 1:nrhs
+                    setelem!(B, ldb, k, j, d * elem(B, ldb, k, j))
+                end
+                k += 1
+            else
+                swaprhs!(B, ldb, rook ? k : k + 1, -ld(ipiv, k), nrhs)
+                rook && swaprhs!(B, ldb, k + 1, -ld(ipiv, k + 1), nrhs)
+                ger_rhs!(B, ldb, A, lda, n - k - 1, k + 2, k, k, nrhs)
+                ger_rhs!(B, ldb, A, lda, n - k - 1, k + 2, k + 1, k + 1, nrhs)
+                solve2!(B, ldb, A, lda, k, k + 1, elem(A, lda, k + 1, k), nrhs)
+                k += 2
+            end
+        end
+        k = n
+        while k >= 1
+            if ld(ipiv, k) > 0
+                gemv_rhs!(B, ldb, A, lda, n - k, k + 1, k, k, nrhs)
+                swaprhs!(B, ldb, k, ld(ipiv, k), nrhs)
+                k -= 1
+            else
+                gemv_rhs!(B, ldb, A, lda, n - k, k + 1, k, k, nrhs)
+                gemv_rhs!(B, ldb, A, lda, n - k, k + 1, k - 1, k - 1, nrhs)
+                swaprhs!(B, ldb, k, -ld(ipiv, k), nrhs)
+                rook && swaprhs!(B, ldb, k - 1, -ld(ipiv, k - 1), nrhs)
+                k -= 2
+            end
+        end
+    end
+end
+sytrs_rook!(uplo::UInt8, n::Int, nrhs::Int, A::ArrayArg{T}, lda::Int, ipiv::ArrayArg{Int},
+            B::ArrayArg{T}, ldb::Int, info) where {T} = sytrs!(uplo, n, nrhs, A, lda, ipiv, B, ldb, info, true)
 
 end
