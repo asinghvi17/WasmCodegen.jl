@@ -25,6 +25,12 @@ Base.@kwdef struct Config
     The code generator emits simple code (a local per value) and leaves allocating locals,
     putting values on the operand stack and the rest to it."
     optimize::Union{Nothing,Cmd} = `-O3`
+    "The structured IR of each function is kept for the session (the process) and reused by every
+    later compilation that has the same function: keyed by its CodeInstance and the module's
+    exception mode. Pays off when compilations share code, e.g. a solver compiled for many models
+    behind a model-independent interface. Emission only reads the structured IR, so it is reused
+    as it is. See `ir_cache_stats`, `empty_ir_cache!`."
+    ir_cache::Bool = false
 end
 
 """
