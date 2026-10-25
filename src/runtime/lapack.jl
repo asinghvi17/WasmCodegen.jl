@@ -581,19 +581,35 @@ end
 
 ## symmetric eigenvalues and singular values (Jacobi's methods)
 
+# the power of 2 to scale the matrix X by so that its largest magnitude is 1, where it is out
+# of the range in which sums of squares of its elements neither overflow nor underflow (else
+# 0), as LAPACK scales: the rotations are computed of X·2^e, the values unscaled after
+function jacobi_scale!(X::Matrix{T}) where {T}
+    amax = maximum(abs, X; init=zero(T))
+    rmin = sqrt(floatmin(T) / eps(T))
+    (iszero(amax) || !isfinite(amax) || rmin <= amax <= inv(rmin)) && return 0
+    e = -exponent(amax)
+    X .= ldexp.(X, e)
+    return e
+end
+
 # the eigenvalues (ascending) and eigenvectors (columns of V, n×n) of the symmetric n×n S,
-# by cyclic Jacobi rotations
+# by cyclic Jacobi rotations, until the off-diagonal elements are negligible
 function jacobi_eigen!(S::Matrix{T}, n::Int) where {T}
     V = zeros(T, n, n)
     for i in 1:n
         V[i, i] = one(T)
     end
+    e = jacobi_scale!(S)
     for sweep in 1:100
-        off = zero(T)
-        for q in 2:n, p in 1:q-1
-            off += S[p, q]^2
+        off = dia = zero(T)
+        for q in 1:n
+            dia += S[q, q]^2
+            for p in 1:q-1
+                off += S[p, q]^2
+            end
         end
-        off == 0 && break
+        off <= (eps(T) / 2)^2 * (dia + off) && break
         for q in 2:n, p in 1:q-1
             apq = S[p, q]
             apq == 0 && continue
@@ -619,7 +635,7 @@ function jacobi_eigen!(S::Matrix{T}, n::Int) where {T}
             end
         end
     end
-    w = T[S[i, i] for i in 1:n]
+    w = T[ldexp(S[i, i], -e) for i in 1:n]
     perm = sortperm(w)
     return w[perm], V[:, perm]
 end
@@ -677,6 +693,7 @@ function jacobi_svd(m::Int, n::Int, A::ArrayArg{T}, lda::Int, fullu::Bool, fullv
     for i in 1:q
         V[i, i] = one(T)
     end
+    e = jacobi_scale!(G)
     tol = eps(T) * p
     for sweep in 1:100
         rotated = false
@@ -685,10 +702,12 @@ function jacobi_svd(m::Int, n::Int, A::ArrayArg{T}, lda::Int, fullu::Bool, fullv
             for i in 1:p
                 alpha += G[i, a]^2; beta += G[i, b]^2; gamma += G[i, a] * G[i, b]
             end
-            (gamma == 0 || abs(gamma) <= tol * sqrt(alpha * beta)) && continue
+            # (the norms' product, and zeta's, without overflow: G is scaled only to below
+            # sqrt(floatmax), its squares' sums to below floatmax)
+            (gamma == 0 || abs(gamma) <= tol * (sqrt(alpha) * sqrt(beta))) && continue
             rotated = true
             zeta = (beta - alpha) / (2gamma)
-            t = copysign(one(T), zeta) / (abs(zeta) + sqrt(one(T) + zeta^2))
+            t = copysign(one(T), zeta) / (abs(zeta) + hypot(one(T), zeta))
             c = one(T) / sqrt(one(T) + t^2)
             s = c * t
             for i in 1:p
@@ -706,7 +725,7 @@ function jacobi_svd(m::Int, n::Int, A::ArrayArg{T}, lda::Int, fullu::Bool, fullv
     end
     sv = T[sqrt(sum(abs2, view(G, :, j))) for j in 1:q]
     perm = sortperm(sv; rev=true)
-    S = T[sv[perm[j]] for j in 1:k]
+    S = T[ldexp(sv[perm[j]], -e) for j in 1:k]
     # the left vectors of G (normalized columns, completed to an orthonormal basis), the right
     # ones V; for Aᵀ they swap
     fulll, fullr = tall ? (fullu, fullv) : (fullv, fullu)

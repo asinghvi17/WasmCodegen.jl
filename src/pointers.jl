@@ -56,7 +56,7 @@ function memoryref_ptr!(fc::FnCtx, r::CGVal)
     sz = elem_unit(E)
     push_leaf!(fc, r.leaves[3])
     emit!(fc.b, :i64_extend_i32_u)
-    if !(E isa Union || Base.aligned_sizeof(E) == 0)
+    if !index_ptr(E)
         emit!(fc.b, :i64_const, sz)
         emit!(fc.b, :i64_mul)
         push_memory_base!(fc, CGVal(memory_type(r.typ), Boxed, LeafVal[r.leaves[1]]))
@@ -70,9 +70,12 @@ function memoryref_ptr!(fc::FnCtx, r::CGVal)
     return new_ptr!(fc, Ptr{Cvoid}, r.leaves[1], PtrOrigin(r.leaves[1], r.leaves[2], off, E))
 end
 
-# the bytes of an element of a memory of `E` in pointer offsets: 1 for unions and elements
-# of no size, whose "pointers" are their indices (as natively)
-elem_unit(@nospecialize(E)) = E isa Union || Base.aligned_sizeof(E) == 0 ? 1 : Base.aligned_sizeof(E)
+# whether the "pointers" to elements of a memory of `E` are their indices (as natively: of
+# isbits unions and elements of no size)
+index_ptr(@nospecialize(E)) = Base.isbitsunion(E) || Base.aligned_sizeof(E) == 0
+
+# the bytes of an element of a memory of `E` in pointer offsets (1 for `index_ptr` ones)
+elem_unit(@nospecialize(E)) = index_ptr(E) ? 1 : Base.aligned_sizeof(E)
 
 """The pointer to the bytes of the String `s` (`jl_string_ptr`), or of the name of the
 Symbol `s` (`jl_symbol_name`, with `S = Symbol`)."""
@@ -265,12 +268,17 @@ function ptr_store!(fc::FnCtx, p::CGVal, v::CGVal, i::CGVal)
     o = p.origin
     if o !== nothing && !is_object_origin(o) && memory_layout(fc.cgm.types, o.eltype).storage isa RefType
         # a memory of references: only clearing (storing a null pointer) is meaningful
-        (isconstant(v) && constant_value(v) == C_NULL) ||
-            unsupported("storing a ", v.typ, " through a pointer into a memory of references")
+        (isconstant(v) && constant_value(v) == C_NULL && !Base.allocatedinline(o.eltype)) ||
+            unsupported("storing a ", v.typ, " through a pointer into a memory of ", o.eltype)
         ml = memory_layout(fc.cgm.types, o.eltype)
         push_leaf!(fc, o.array)
         push_leaf!(fc, o.index)
         emit!(fc.b, :i32_const, elem_unit(o.eltype)); emit!(fc.b, :i32_div_u)
+        if !(isconstant(i) && constant_value(i) == 1)
+            # (the `i`-th pointer: the `i`-th reference)
+            push_val!(fc, convert_repr(fc, i, Int)); emit!(fc.b, :i32_wrap_i64)
+            emit!(fc.b, :i32_const, 1); emit!(fc.b, :i32_sub); emit!(fc.b, :i32_add)
+        end
         emit!(fc.b, :ref_null, (ml.storage::RefType).heap)
         emit!(fc.b, :array_set, ml.array)
         return p

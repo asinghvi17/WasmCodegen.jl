@@ -27,12 +27,12 @@ function emit_memorynew!(fc::FnCtx, @nospecialize(M), n::CGVal)
     is_memory_type(M) || unsupported("memorynew of ", M)
     ml = memory_layout(fc.cgm.types, memory_eltype(M))
     n = convert_repr(fc, n, Int)
-    # the length must fit an i32 array length (an error otherwise, as natively for too
-    # large an allocation)
+    # the length must fit an i32 array length (an error otherwise, as natively for a
+    # negative or too large one)
     push_val!(fc, n)
     emit!(fc.b, :i64_const, typemax(Int32) ÷ ml.stride)
     emit!(fc.b, :i64_gt_u)
-    if!(fc.b); unreachable!(fc.b); end!(fc.b)
+    if!(fc.b); throw_error!(fc, Runtime.throw_memory_size_error, n); end!(fc.b)
     push_val!(fc, n)
     emit!(fc.b, :i32_wrap_i64)
     if ml.stride != 1
@@ -162,6 +162,7 @@ function emit_memoryrefget!(fc::FnCtx, r::CGVal, bc, @nospecialize(typ))
         push_element_address!(fc, r, ml)
         emit!(fc.b, :array_get, ml.array)
         box = CGVal(Any, Boxed, LeafVal[pop_val!(fc, Any).leaves[1]])
+        check_defined!(fc, box, E)
         return unbox!(fc, box, E)
     end
     for k in 0:length(el.leaves)-1
@@ -170,13 +171,36 @@ function emit_memoryrefget!(fc::FnCtx, r::CGVal, bc, @nospecialize(typ))
         ml.widened && narrow_leaf!(fc, el.leaves[k+1].type)
     end
     v = pop_val!(fc, E)
-    if el.kind === Boxed
-        # an undefined element is an error (UndefRefError)
-        push_val!(fc, v)
-        emit!(fc.b, :ref_is_null)
-        if!(fc.b); throw_error!(fc, Runtime.throw_undefref_error); end!(fc.b)
-    end
+    (el.kind === Boxed || ml.storage isa RefType) && check_defined!(fc, v, E)
     return v
+end
+
+# whether natively a value of type `E` never stored (an element, a field) is its zero bits,
+# not undefined: of a type stored inline without references (unions: their first type)
+zero_defined(@nospecialize(E)) = Base.allocatedinline(E) && (E isa Union || Base.datatype_pointerfree(E))
+
+"The value of the `zero_defined` type `T` of zero bits (a union's: of its first type)."
+function zero_bits(@nospecialize(T))
+    T isa Union && return zero_bits(first(Base.uniontypes(T)))
+    Base.issingletontype(T) && return T.instance
+    buf = zeros(UInt8, sizeof(T))
+    return GC.@preserve buf unsafe_load(Ptr{T}(pointer(buf)))
+end
+
+# with `v` (in locals) a value of type `E` stored as references, where a null first one is a
+# value never stored: that is its zero bits where natively it is (`zero_defined`), else an
+# error (UndefRefError)
+function check_defined!(fc::FnCtx, v::CGVal, @nospecialize(E))
+    k = findfirst(l -> l.type isa RefType, layout(fc, v.typ).leaves)
+    push_leaf!(fc, v.leaves[k])
+    emit!(fc.b, :ref_is_null)
+    if!(fc.b)
+    if zero_defined(E)
+        assign!(fc, v, const_value(fc, zero_bits(E)))
+    else
+        throw_error!(fc, Runtime.throw_undefref_error)
+    end
+    end!(fc.b)
 end
 
 """
@@ -239,7 +263,8 @@ function emit_memoryref_isassigned!(fc::FnCtx, r::CGVal, bc)
     E = ref_eltype(r.typ)
     ml = memory_layout(fc.cgm.types, E)
     push_in_bounds!(fc, r, ml)
-    if ml.boxed || ml.elem.kind === Boxed || (ml.storage isa RefType)
+    # (an element never stored is undefined if natively it is)
+    if (ml.boxed || ml.elem.kind === Boxed || (ml.storage isa RefType)) && !zero_defined(E)
         if!(fc.b, I32)
         push_element_address!(fc, r, ml)
         emit!(fc.b, :array_get, ml.array)

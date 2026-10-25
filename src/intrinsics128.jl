@@ -4,8 +4,7 @@
 is128(@nospecialize(T)) = T isa DataType && isprimitivetype(T) && sizeof(T) == 16
 
 halves(v::CGVal) = (CGVal(UInt64, Inline, LeafVal[v.leaves[1]]), CGVal(UInt64, Inline, LeafVal[v.leaves[2]]))
-as_type(@nospecialize(T), v::CGVal) = CGVal(T, layout_kind_inline(), v.leaves)
-layout_kind_inline() = Inline
+as_type(@nospecialize(T), v::CGVal) = CGVal(T, Inline, v.leaves)
 
 rt(fc::FnCtx, f, args::CGVal...) = call_runtime!(fc, f, CGVal[args...])
 
@@ -71,6 +70,8 @@ function emit_intrinsic128!(fc::FnCtx, f::Core.IntrinsicFunction, args::Vector{C
         else
             cnt = to_u64!(fc, n)
         end
+        # (a narrower value by a 128-bit count: shifted as such)
+        is128(x.typ) || return emit_intrinsic!(fc, f, Any[x, cnt], typ)
         return as_type(x.typ, rt(fc, fn, halves(x)..., cnt))
     elseif f === II.sext_int || f === II.zext_int
         R128 = constant_value(args[1]); x = args[2]

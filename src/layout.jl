@@ -214,6 +214,11 @@ const RUNTIME_TYPES = Any[DataType, UnionAll, Union, Core.TypeofBottom, TypeVar,
                           Core.SimpleVector, Module, Method, Core.MethodInstance,
                           Core.CodeInstance, Core.TypeName]
 
+# the types of type objects: a module has one object per type it represents, in its image,
+# whose `objectid` is the native one (immutable or not)
+is_type_object_type(@nospecialize(T)) =
+    T === DataType || T === UnionAll || T === Union || T === Core.TypeofBottom
+
 function primitive_leaves(@nospecialize T)
     T === Float64 && return [Leaf(F64)]
     T === Float32 && return [Leaf(F32)]
@@ -496,9 +501,6 @@ end
 const DATA_FIELD = HEADER_FIELDS
 "The index of the hash of a `Symbol` object (after its bytes)."
 const SYMBOL_HASH_FIELD = DATA_FIELD + 1
-
-"Whether the objects of the boxed type `T` are `\$JlValue`s (they all are)."
-is_jlvalue_type(ts::Types, @nospecialize(T)) = true
 
 """
     valtypes(ts, T) -> Vector{ValType}

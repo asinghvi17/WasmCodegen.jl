@@ -211,7 +211,8 @@ function emit_objectid!(fc::FnCtx, x::CGVal)
     elseif T === String
         # of its bytes, as natively
         return call_runtime!(fc, Runtime.memhash, CGVal[x, const_value(fc, 0xedc3b677)])
-    elseif T isa DataType && isconcretetype(T) && ismutabletype(T) && layout(fc, T).kind === Boxed
+    elseif (T isa DataType && isconcretetype(T) && ismutabletype(T) && layout(fc, T).kind === Boxed) ||
+           is_type_object_type(T)
         # natively a hash of its address: of an object of the image, the one it had natively;
         # of others, a hash of their identity hash (see `objectid_mutable_func!`)
         push_val!(fc, convert_repr(fc, x, Any))
@@ -334,19 +335,25 @@ function push_array_index!(fc::FnCtx, o::PtrOrigin, n::Union{Nothing,CGVal}=noth
     end
 end
 
-# push whether the byte offsets of the origins and the length `n` are multiples of the
-# storage size `s` of their arrays' elements (an i32)
+# push whether the byte offsets of the origins and the length `n` are multiples of `s`, the
+# bytes of their arrays' elements or of their Julia elements (an i32)
 function push_aligned!(fc::FnCtx, origins, n::CGVal, s::Int)
+    rem!() = ispow2(s) ? (emit!(fc.b, :i32_const, s - 1); emit!(fc.b, :i32_and)) :
+                         (emit!(fc.b, :i32_const, s); emit!(fc.b, :i32_rem_u))
     for (k, o) in enumerate(origins)
-        push_leaf!(fc, o.index)
+        push_leaf!(fc, o.index); rem!()
         k > 1 && emit!(fc.b, :i32_or)
     end
     push_val!(fc, n)
     layout(fc, n.typ).leaves[1].type === I64 && emit!(fc.b, :i32_wrap_i64)
+    rem!()
     emit!(fc.b, :i32_or)
-    emit!(fc.b, :i32_const, s - 1); emit!(fc.b, :i32_and)
     emit!(fc.b, :i32_eqz)
 end
+
+# the unit of byte offsets and lengths a bulk operation on a memory of `E` can do on its
+# array: its array elements' bytes (of a memory addressable by bytes), else whole elements
+bulk_unit(fc::FnCtx, @nospecialize(E)) = byte_addressable(fc, E) ? storage_size(fc, E) : elem_unit(E)
 
 byte_ptr(p::CGVal) = CGVal(Ptr{UInt8}, Inline, p.leaves)
 
@@ -367,7 +374,7 @@ function emit_memmove!(fc::FnCtx, dst, src, n, bytes::Bool)
         if md.array == ms.array && (od.eltype === os.eltype || ba)
             # bytes of arrays of bytes, or whole elements (of elements not stored as bytes,
             # pointers to whole elements)
-            s = bytes && ba ? storage_size(fc, od.eltype) : 1
+            s = bytes ? bulk_unit(fc, od.eltype) : 1
             if s > 1
                 push_aligned!(fc, (od, os), n, s)
                 if!(fc.b)
@@ -403,7 +410,7 @@ function emit_memset!(fc::FnCtx, p, val, n)
         ml = memory_layout(fc.cgm.types, o.eltype)
         bytewise = ml.storage === I8 && ml.stride == 1
         if bytewise || (isconstant(val) && iszero(constant_value(val)))
-            s = !bytewise && byte_addressable(fc, o.eltype) ? storage_size(fc, o.eltype) : 1
+            s = bytewise ? 1 : bulk_unit(fc, o.eltype)
             if s > 1
                 push_aligned!(fc, (o,), n, s)
                 if!(fc.b)
