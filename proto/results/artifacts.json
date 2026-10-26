@@ -1,0 +1,20 @@
+{
+  "image_local": {
+    "library_bytes": 2691528,
+    "trim": "safe"
+  },
+  "transferred": {
+    "library_bytes": 2623288,
+    "trim": "safe",
+    "serialized_bytes": 20344
+  },
+  "wasm_gc": {
+    "bytes": 130655,
+    "compile_seconds": 52.916125602,
+    "functions": 82,
+    "serialized_objects": 234,
+    "trim_report": "",
+    "diagnostics": 0,
+    "trim": "safe"
+  }
+}

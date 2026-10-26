@@ -1,0 +1,210 @@
+{
+  "named": {
+    "produce": {
+      "command": [
+        "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+        "--startup-file=no",
+        "--project=.task/app-env",
+        "proto/transfer/serialization_probe.jl",
+        "named",
+        "produce",
+        "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/serialization-probe/named/state.jls"
+      ],
+      "returncode": 0,
+      "seconds": 0.8770830305293202,
+      "log": ".task/serialization-probe/named/produce.log"
+    },
+    "consume": {
+      "command": [
+        "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+        "--startup-file=no",
+        "--project=.task/app-env",
+        "proto/transfer/serialization_probe.jl",
+        "named",
+        "consume",
+        "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/serialization-probe/named/state.jls"
+      ],
+      "returncode": 0,
+      "seconds": 0.6137605933472514,
+      "log": ".task/serialization-probe/named/consume.log"
+    },
+    "pass": true,
+    "bundle_bytes": 43
+  },
+  "closure": {
+    "produce": {
+      "command": [
+        "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+        "--startup-file=no",
+        "--project=.task/app-env",
+        "proto/transfer/serialization_probe.jl",
+        "closure",
+        "produce",
+        "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/serialization-probe/closure/state.jls"
+      ],
+      "returncode": 0,
+      "seconds": 0.8889586059376597,
+      "log": ".task/serialization-probe/closure/produce.log"
+    },
+    "consume": {
+      "command": [
+        "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+        "--startup-file=no",
+        "--project=.task/app-env",
+        "proto/transfer/serialization_probe.jl",
+        "closure",
+        "consume",
+        "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/serialization-probe/closure/state.jls"
+      ],
+      "returncode": 0,
+      "seconds": 0.6149887321516871,
+      "log": ".task/serialization-probe/closure/consume.log"
+    },
+    "pass": true,
+    "bundle_bytes": 84
+  },
+  "rgf": {
+    "produce": {
+      "command": [
+        "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+        "--startup-file=no",
+        "--project=.task/app-env",
+        "proto/transfer/serialization_probe.jl",
+        "rgf",
+        "produce",
+        "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/serialization-probe/rgf/state.jls"
+      ],
+      "returncode": 0,
+      "seconds": 0.9891765788197517,
+      "log": ".task/serialization-probe/rgf/produce.log"
+    },
+    "consume": {
+      "command": [
+        "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+        "--startup-file=no",
+        "--project=.task/app-env",
+        "proto/transfer/serialization_probe.jl",
+        "rgf",
+        "consume",
+        "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/serialization-probe/rgf/state.jls"
+      ],
+      "returncode": 0,
+      "seconds": 0.813694154843688,
+      "log": ".task/serialization-probe/rgf/consume.log"
+    },
+    "pass": true,
+    "bundle_bytes": 303
+  },
+  "rgf-dropped": {
+    "produce": {
+      "command": [
+        "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+        "--startup-file=no",
+        "--project=.task/app-env",
+        "proto/transfer/serialization_probe.jl",
+        "rgf-dropped",
+        "produce",
+        "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/serialization-probe/rgf-dropped/state.jls"
+      ],
+      "returncode": 0,
+      "seconds": 1.0239138845354319,
+      "log": ".task/serialization-probe/rgf-dropped/produce.log"
+    },
+    "consume": {
+      "command": [
+        "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+        "--startup-file=no",
+        "--project=.task/app-env",
+        "proto/transfer/serialization_probe.jl",
+        "rgf-dropped",
+        "consume",
+        "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/serialization-probe/rgf-dropped/state.jls"
+      ],
+      "returncode": 0,
+      "seconds": 0.8059415090829134,
+      "log": ".task/serialization-probe/rgf-dropped/consume.log"
+    },
+    "pass": true,
+    "bundle_bytes": 314
+  },
+  "sciml": {
+    "produce": {
+      "command": [
+        "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+        "--startup-file=no",
+        "--project=.task/app-env",
+        "proto/transfer/serialization_probe.jl",
+        "sciml",
+        "produce",
+        "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/serialization-probe/sciml/state.jls"
+      ],
+      "returncode": 0,
+      "seconds": 2.7949589267373085,
+      "log": ".task/serialization-probe/sciml/produce.log"
+    },
+    "consume": {
+      "command": [
+        "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+        "--startup-file=no",
+        "--project=.task/app-env",
+        "proto/transfer/serialization_probe.jl",
+        "sciml",
+        "consume",
+        "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/serialization-probe/sciml/state.jls"
+      ],
+      "returncode": 0,
+      "seconds": 2.9047956401482224,
+      "log": ".task/serialization-probe/sciml/consume.log"
+    },
+    "pass": true,
+    "bundle_bytes": 11168
+  },
+  "missing_runtime_source": {
+    "command": [
+      "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+      "--startup-file=no",
+      "--project=.task/app-env",
+      "proto/transfer/serialization_probe.jl",
+      "named",
+      "consume-without-source",
+      "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/serialization-probe/named/state.jls"
+    ],
+    "returncode": 1,
+    "seconds": 1.9318354008719325,
+    "log": ".task/serialization-probe/named/missing-source.log",
+    "expected": "failure: named callable requires its runtime module definitions",
+    "pass": true
+  },
+  "build_only_type": {
+    "produce": {
+      "command": [
+        "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+        "--startup-file=no",
+        "--project=.task/app-env",
+        "proto/transfer/serialization_probe.jl",
+        "build-only-type",
+        "produce",
+        "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/serialization-probe/build-only-type/state.jls"
+      ],
+      "returncode": 0,
+      "seconds": 1.1502336282283068,
+      "log": ".task/serialization-probe/build-only-type/produce.log"
+    },
+    "consume": {
+      "command": [
+        "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+        "--startup-file=no",
+        "--project=.task/app-env",
+        "proto/transfer/serialization_probe.jl",
+        "build-only-type",
+        "consume",
+        "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/serialization-probe/build-only-type/state.jls"
+      ],
+      "returncode": 1,
+      "seconds": 1.698838802985847,
+      "log": ".task/serialization-probe/build-only-type/consume.log"
+    },
+    "expected": "unavailable setup-only package type fails reconstruction",
+    "pass": true
+  }
+}

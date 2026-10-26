@@ -1,0 +1,4 @@
+Test Summary:               | Pass  Total  Time
+staging and native wrappers |   25     25  1.4s
+Test Summary:                   | Pass  Total  Time
+zero-argument physical ABI JSON |    3      3  0.3s

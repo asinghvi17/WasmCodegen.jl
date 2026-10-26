@@ -1,0 +1,18 @@
+{
+  "native_vs_julia": {
+    "comparisons": 2406,
+    "max_absolute_error": 0.0
+  },
+  "wasm_vs_julia": {
+    "comparisons": 2406,
+    "max_absolute_error": 1.7887913372760522e-12
+  },
+  "wasm_vs_native": {
+    "comparisons": 2406,
+    "max_absolute_error": 1.7887913372760522e-12
+  },
+  "transferred_vs_julia": {
+    "comparisons": 2406,
+    "max_absolute_error": 0.0
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "build": {
+    "command": [
+      "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+      "--startup-file=no",
+      "--project=.task/native-env",
+      "proto/transfer/lorenz_native.jl"
+    ],
+    "returncode": 0,
+    "seconds": 20.534016360528767,
+    "log": ".task/native-build/lorenz-transferred/build.log"
+  },
+  "library_bytes": 2622632,
+  "bundle_bytes": 20344,
+  "compile_c": {
+    "command": [
+      "gcc",
+      "-std=c11",
+      "-Wall",
+      "-Wextra",
+      "-Werror",
+      "-I/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/native-build/lorenz-transferred",
+      "proto/lorenz_test.c",
+      "-L/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/native-build/lorenz-transferred",
+      "-llorenz",
+      "-Wl,-rpath,$ORIGIN",
+      "-lm",
+      "-o",
+      "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/native-build/lorenz-transferred/test"
+    ],
+    "returncode": 0,
+    "seconds": 0.07149226125329733,
+    "log": ".task/native-build/lorenz-transferred/compile-c.log"
+  },
+  "run_c": {
+    "command": [
+      "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/native-build/lorenz-transferred/test"
+    ],
+    "returncode": 0,
+    "seconds": 0.04068969935178757,
+    "log": ".task/native-build/lorenz-transferred/c-test.log",
+    "stderr_log": ".task/native-build/lorenz-transferred/c-stderr.log"
+  },
+  "max_abs_error": 0.0,
+  "compared_values": 2406,
+  "pass": true
+}

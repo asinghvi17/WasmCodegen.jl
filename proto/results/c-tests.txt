@@ -1,0 +1,1 @@
+C lifecycle, null/exception, isolation, 1000 reuse cycles passed

@@ -1,0 +1,45 @@
+ERROR: LoadError: KeyError: key Base.PkgId(Base.UUID("fcdd198a-44be-4a22-ac97-b7efb066e8eb"), "SetupOnlyTypes") not found
+Stacktrace:
+  [1] getindex
+    @ ./dict.jl:477 [inlined]
+  [2] macro expansion
+    @ ./lock.jl:376 [inlined]
+  [3] root_module(key::Base.PkgId)
+    @ Base ./loading.jl:2636
+  [4] deserialize_module(s::Serializer{IOStream})
+    @ Serialization ~/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/share/julia/stdlib/v1.12/Serialization/src/Serialization.jl:1031
+  [5] handle_deserialize(s::Serializer{IOStream}, b::Int32)
+    @ Serialization ~/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/share/julia/stdlib/v1.12/Serialization/src/Serialization.jl:933
+  [6] deserialize(s::Serializer{IOStream})
+    @ Serialization ~/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/share/julia/stdlib/v1.12/Serialization/src/Serialization.jl:851
+  [7] deserialize_datatype(s::Serializer{IOStream}, full::Bool)
+    @ Serialization ~/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/share/julia/stdlib/v1.12/Serialization/src/Serialization.jl:1543
+  [8] handle_deserialize(s::Serializer{IOStream}, b::Int32)
+    @ Serialization ~/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/share/julia/stdlib/v1.12/Serialization/src/Serialization.jl:904
+  [9] deserialize(s::Serializer{IOStream})
+    @ Serialization ~/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/share/julia/stdlib/v1.12/Serialization/src/Serialization.jl:851
+ [10] handle_deserialize(s::Serializer{IOStream}, b::Int32)
+    @ Serialization ~/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/share/julia/stdlib/v1.12/Serialization/src/Serialization.jl:911
+ [11] deserialize(s::Serializer{IOStream})
+    @ Serialization ~/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/share/julia/stdlib/v1.12/Serialization/src/Serialization.jl:851
+ [12] handle_deserialize(s::Serializer{IOStream}, b::Int32)
+    @ Serialization ~/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/share/julia/stdlib/v1.12/Serialization/src/Serialization.jl:957
+ [13] deserialize
+    @ ~/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/share/julia/stdlib/v1.12/Serialization/src/Serialization.jl:851 [inlined]
+ [14] deserialize(s::IOStream)
+    @ Serialization ~/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/share/julia/stdlib/v1.12/Serialization/src/Serialization.jl:838
+ [15] open(f::typeof(deserialize), args::String; kwargs::@Kwargs{})
+    @ Base ./io.jl:412
+ [16] open
+    @ ./io.jl:409 [inlined]
+ [17] deserialize(filename::String)
+    @ Serialization ~/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/share/julia/stdlib/v1.12/Serialization/src/Serialization.jl:848
+ [18] top-level scope
+    @ ~/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/proto/transfer/serialization_probe.jl:16
+ [19] include(mod::Module, _path::String)
+    @ Base ./Base.jl:306
+ [20] exec_options(opts::Base.JLOptions)
+    @ Base ./client.jl:317
+ [21] _start()
+    @ Base ./client.jl:550
+in expression starting at ${REPO}/proto/transfer/serialization_probe.jl:9

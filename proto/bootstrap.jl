@@ -1,0 +1,15 @@
+# Run with Julia 1.12.7 from the repository root, using a writable task depot.
+using Pkg
+cp("proto/locks/wasm.toml", "Manifest.toml";force=true)
+Pkg.activate(".")
+Pkg.instantiate(;allow_autoprecomp=false)
+mkpath(".task/app-env")
+cp("proto/locks/app-project.toml", ".task/app-env/Project.toml";force=true)
+cp("proto/locks/app.toml", ".task/app-env/Manifest.toml";force=true)
+Pkg.activate(".task/app-env")
+Pkg.instantiate(;allow_autoprecomp=false)
+mkpath(".task/native-env")
+cp("proto/locks/native-project.toml", ".task/native-env/Project.toml";force=true)
+cp("proto/locks/native.toml", ".task/native-env/Manifest.toml";force=true)
+Pkg.activate(".task/native-env")
+Pkg.instantiate(;allow_autoprecomp=false)

@@ -1,0 +1,38 @@
+Compiling...
+WARNING: Detected access to binding `TransferProgram.StagedBuildOnlyBad` in a world prior to its definition world.
+  Julia 1.12 has introduced more strict world age semantics for global bindings.
+  !!! This code may malfunction under Revise.
+  !!! This code will error in future versions of Julia.
+Hint: Add an appropriate `invokelatest` around the access to this binding.
+To make this warning an error, and hence obtain a stack trace, use `julia --depwarn=error`.
+WARNING: Detected access to binding `StagedBuildOnlyBad.CALLBACK` in a world prior to its definition world.
+  Julia 1.12 has introduced more strict world age semantics for global bindings.
+  !!! This code may malfunction under Revise.
+  !!! This code will error in future versions of Julia.
+Hint: Add an appropriate `invokelatest` around the access to this binding.
+To make this warning an error, and hence obtain a stack trace, use `julia --depwarn=error`.
+Verifier error #1: unresolved call from statement (Base.getfield(StagedBuildOnlyBad.CALLBACK, :x)::Any)(1.0)::Any
+Stacktrace:
+ [1] __init__()
+   @ StagedBuildOnlyBad ~/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/proto/transfer/fixtures/StagedBuildOnlyBad/src/StagedBuildOnlyBad.jl:4
+
+✓ Compiling...
+ERROR: LoadError: Failed to compile ${REPO}/.task/native-build/image-local-bad/build.jl
+Stacktrace:
+ [1] error(s::String)
+   @ Base ./error.jl:44
+ [2] compile_products(recipe::JuliaC.ImageRecipe)
+   @ JuliaC ~/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/depot/packages/JuliaC/CQ4OE/src/compiling.jl:267
+ [3] (::Main.ProgramBuild.var"#31#32"{String, String, Bool, ProgramSpec, String, @NamedTuple{kind::String, setup_mode::String, status_type::String, success::Int64, statuses::Dict{String, Int64}, signatures::Vector{Any}, threading::String, out_pointers::String}, String, String, Nothing, String})()
+   @ Main.ProgramBuild ~/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/proto/ProgramBuild/src/native.jl:126
+ [4] build(spec::ProgramSpec, ::NativeLibrary; output_dir::String, project::String, mode::ImageLocal, trim_mode::String, bundle::Bool)
+   @ Main.ProgramBuild ~/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/proto/ProgramBuild/src/native.jl:121
+ [5] top-level scope
+   @ ~/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/proto/transfer/build.jl:12
+ [6] include(mod::Module, _path::String)
+   @ Base ./Base.jl:306
+ [7] exec_options(opts::Base.JLOptions)
+   @ Base ./client.jl:317
+ [8] _start()
+   @ Base ./client.jl:550
+in expression starting at ${REPO}/proto/transfer/build.jl:12

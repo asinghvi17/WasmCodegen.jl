@@ -1,0 +1,67 @@
+runner_exit_code: 0
+  Activating project at `~/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2`
+  Activating project at `~/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/app-env`
+  Activating project at `~/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/native-env`
+Test Summary:               | Pass  Total  Time
+staging and native wrappers |   25     25  1.4s
+Compiling...
+✓ Compiling...
+{"node":"v26.10.0","comparisons":2406,"maxAbsoluteError":1.7887913372760522e-12,"absoluteTolerance":1e-7,"relativeTolerance":1e-8,"lifecycle":"passed","isolation":"passed"}
+C lifecycle, null/exception, isolation, 1000 reuse cycles passed
+Compiling...
+✓ Compiling...
+C lifecycle, null/exception, isolation, 1000 reuse cycles passed
+{
+  "native_vs_julia": {
+    "comparisons": 2406,
+    "max_absolute_error": 0.0
+  },
+  "wasm_vs_julia": {
+    "comparisons": 2406,
+    "max_absolute_error": 1.7887913372760522e-12
+  },
+  "wasm_vs_native": {
+    "comparisons": 2406,
+    "max_absolute_error": 1.7887913372760522e-12
+  },
+  "transferred_vs_julia": {
+    "comparisons": 2406,
+    "max_absolute_error": 0.0
+  }
+}
+Test Summary:               | Pass  Total  Time
+staging and native wrappers |   25     25  1.5s
+Test Summary:                   | Pass  Total  Time
+zero-argument physical ABI JSON |    3      3  0.2s
+Wasm private callees, root exports, unsigned loader normalization passed
+baseline PASS
+image-local-bad PASS
+transferred-bad PASS
+named PASS
+closure PASS
+rgf PASS
+rgf-dropped PASS
+sciml PASS
+missing_runtime_source PASS (expected failure)
+build_only_type PASS (expected failure)
+Lorenz transferred native PASS
+{
+  "image_local": {
+    "library_bytes": 2691528,
+    "trim": "safe"
+  },
+  "transferred": {
+    "library_bytes": 2623288,
+    "trim": "safe",
+    "serialized_bytes": 20344
+  },
+  "wasm_gc": {
+    "bytes": 130655,
+    "compile_seconds": 52.916125602,
+    "functions": 82,
+    "serialized_objects": 234,
+    "trim_report": "",
+    "diagnostics": 0,
+    "trim": "safe"
+  }
+}

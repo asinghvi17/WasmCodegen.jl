@@ -1,1 +1,5 @@
 Manifest*.toml
+.task/
+proto/build/
+inputs/
+__pycache__/

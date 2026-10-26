@@ -1,0 +1,120 @@
+{
+  "baseline": {
+    "command": [
+      "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+      "--startup-file=no",
+      "--project=.task/native-env",
+      "proto/transfer/build.jl",
+      "baseline"
+    ],
+    "returncode": 0,
+    "seconds": 12.512213837355375,
+    "log": ".task/native-build/baseline/build.log",
+    "expected": "build and C pass",
+    "library_bytes": 1844520,
+    "compile_c": {
+      "command": [
+        "gcc",
+        "-std=c11",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-I/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/native-build/baseline",
+        "proto/transfer/test.c",
+        "-L/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/native-build/baseline",
+        "-ltransfer",
+        "-Wl,-rpath,$ORIGIN",
+        "-lm",
+        "-o",
+        "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/native-build/baseline/test"
+      ],
+      "returncode": 0,
+      "seconds": 0.0709156570956111,
+      "log": ".task/native-build/baseline/compile-c.log"
+    },
+    "run_c": {
+      "command": [
+        "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/native-build/baseline/test"
+      ],
+      "returncode": 0,
+      "seconds": 0.03533494006842375,
+      "log": ".task/native-build/baseline/c-test.log"
+    },
+    "pass": true,
+    "setup_calls": [
+      "pid=5538 imaging=1 bad_loaded=false",
+      "pid=5538 imaging=1 bad_loaded=false",
+      "pid=5538 imaging=1 bad_loaded=false",
+      "pid=5538 imaging=1 bad_loaded=false"
+    ]
+  },
+  "image-local-bad": {
+    "command": [
+      "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+      "--startup-file=no",
+      "--project=.task/native-env",
+      "proto/transfer/build.jl",
+      "image-local-bad"
+    ],
+    "returncode": 1,
+    "seconds": 12.730648768134415,
+    "log": ".task/native-build/image-local-bad/build.log",
+    "expected": "safe trim failure from dynamic initializer",
+    "pass": true,
+    "setup_calls": [
+      "pid=5768 imaging=1 bad_loaded=true",
+      "pid=5768 imaging=1 bad_loaded=true",
+      "pid=5768 imaging=1 bad_loaded=true",
+      "pid=5768 imaging=1 bad_loaded=true"
+    ]
+  },
+  "transferred-bad": {
+    "command": [
+      "/home/asinghvi17/.julia/juliaup/julia-1.12.7+0.x64.linux.gnu/bin/julia",
+      "--startup-file=no",
+      "--project=.task/native-env",
+      "proto/transfer/build.jl",
+      "transferred-bad"
+    ],
+    "returncode": 0,
+    "seconds": 14.437926082871854,
+    "log": ".task/native-build/transferred-bad/build.log",
+    "expected": "build and C pass",
+    "library_bytes": 1848312,
+    "compile_c": {
+      "command": [
+        "gcc",
+        "-std=c11",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-I/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/native-build/transferred-bad",
+        "proto/transfer/test.c",
+        "-L/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/native-build/transferred-bad",
+        "-ltransfer",
+        "-Wl,-rpath,$ORIGIN",
+        "-lm",
+        "-o",
+        "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/native-build/transferred-bad/test"
+      ],
+      "returncode": 0,
+      "seconds": 0.07018704898655415,
+      "log": ".task/native-build/transferred-bad/compile-c.log"
+    },
+    "run_c": {
+      "command": [
+        "/home/asinghvi17/.factory/runners/work/clones/44bd0c90-20a4-48e1-96e2-c8b973d2eee2/.task/native-build/transferred-bad/test"
+      ],
+      "returncode": 0,
+      "seconds": 0.036679803393781185,
+      "log": ".task/native-build/transferred-bad/c-test.log"
+    },
+    "pass": true,
+    "setup_calls": [
+      "pid=5808 imaging=0 bad_loaded=true",
+      "pid=5808 imaging=0 bad_loaded=true",
+      "pid=5808 imaging=0 bad_loaded=true",
+      "pid=5808 imaging=0 bad_loaded=true"
+    ]
+  }
+}

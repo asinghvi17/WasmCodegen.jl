@@ -1,0 +1,5 @@
+[deps]
+DiffEqBase = "2b5f629d-d688-5b77-993f-72d75c75574e"
+OrdinaryDiffEqTsit5 = "b1df2697-797e-41e3-8120-5422d3b24e4a"
+SciMLLogging = "a6db7da4-7206-11f0-1eab-35f2a5dbe1d1"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"

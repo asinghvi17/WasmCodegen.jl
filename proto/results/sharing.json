@@ -1,0 +1,16 @@
+{
+  "source_sha256": "515bd888c656ea29382441382a8b4b38fe96da377e11ba87c1d624a775487f8e",
+  "same_program_source_both_native_modes": true,
+  "same_kernel_all_targets": true,
+  "physical_lines_including_blanks_comments": {
+    "ProgramBuild/src/ProgramBuild.jl": 178,
+    "ProgramBuild/src/native.jl": 135,
+    "ProgramBuild/src/transfer.jl": 38,
+    "ProgramBuild/src/wasm.jl": 116
+  },
+  "shared": 178,
+  "wasm_specific": 116,
+  "native_specific": 173,
+  "framework_total": 467,
+  "program_lines": 45
+}
