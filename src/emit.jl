@@ -93,15 +93,19 @@ end
 function structured_ir(cgm::CGModule, mi::Core.MethodInstance)
     cgm.config.ir_cache || return structurize_prepared(cgm, mi)
     key = (first(cgm.world.sources[mi]), cgm.exceptions)
-    sci = get(IR_CACHE, key, nothing)
-    if sci === nothing
-        t = time_ns()
-        sci = structurize_prepared(cgm, mi)
+    sci = @lock IR_CACHE_LOCK begin
+        sci = get(IR_CACHE, key, nothing)
+        sci === nothing || (IR_CACHE_STATS.hits += 1)
+        sci
+    end
+    sci === nothing || return sci
+    # structurized outside the lock: compilations missing the same function at once each do it
+    t = time_ns()
+    sci = structurize_prepared(cgm, mi)
+    @lock IR_CACHE_LOCK begin
         IR_CACHE_STATS.misses += 1
         IR_CACHE_STATS.miss_ns += time_ns() - t
         IR_CACHE[key] = sci
-    else
-        IR_CACHE_STATS.hits += 1
     end
     return sci
 end
@@ -116,8 +120,10 @@ function structurize_prepared(cgm::CGModule, mi::Core.MethodInstance)
     end
 end
 
-# (CodeInstance, exception mode) => structured IR, for the session (`Config(ir_cache = true)`)
+# (CodeInstance, exception mode) => structured IR, for the session (`Config(ir_cache = true)`);
+# it and its counters are shared by compilations on other threads, under `IR_CACHE_LOCK`
 const IR_CACHE = IdDict{Any,Any}()
+const IR_CACHE_LOCK = ReentrantLock()
 mutable struct IRCacheStats
     hits::Int
     misses::Int
@@ -126,12 +132,14 @@ end
 const IR_CACHE_STATS = IRCacheStats(0, 0, 0)
 
 "The structured-IR cache's hits, misses, entries, and the time spent structurizing its misses."
-ir_cache_stats() = (; hits = IR_CACHE_STATS.hits, misses = IR_CACHE_STATS.misses, entries = length(IR_CACHE),
-                      miss_s = IR_CACHE_STATS.miss_ns / 1e9)
+ir_cache_stats() = @lock IR_CACHE_LOCK (; hits = IR_CACHE_STATS.hits, misses = IR_CACHE_STATS.misses,
+                                          entries = length(IR_CACHE), miss_s = IR_CACHE_STATS.miss_ns / 1e9)
 "Empty the structured-IR cache and its counters."
 function empty_ir_cache!()
-    empty!(IR_CACHE)
-    IR_CACHE_STATS.hits = 0; IR_CACHE_STATS.misses = 0; IR_CACHE_STATS.miss_ns = 0
+    @lock IR_CACHE_LOCK begin
+        empty!(IR_CACHE)
+        IR_CACHE_STATS.hits = 0; IR_CACHE_STATS.misses = 0; IR_CACHE_STATS.miss_ns = 0
+    end
     nothing
 end
 
