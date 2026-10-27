@@ -107,6 +107,30 @@ function carry_nested(m::Int, n::Int)
     s
 end
 
+# an inner carry continued with an outer one that starts undefined (`prev`): `prev` holds the
+# previous iteration's pointer, so neither is the same pointer moved
+function carry_previous_owner(xs::Vector{Vector{Int}}, n::Int)
+    local prev::Ptr{Int}
+    s = 0
+    GC.@preserve xs begin
+        for k in eachindex(xs)
+            r = pointer(xs[k])
+            p = r
+            j = 0
+            while true
+                s = 10s + unsafe_load(p)
+                k == 1 && break
+                p = prev
+                j += 1
+                j >= n && break
+            end
+            prev = r
+        end
+    end
+    s
+end
+carry_previous(a::Int, b::Int, c::Int, n::Int) = carry_previous_owner([[a], [b], [c]], n)
+
 # whether the function compiled for `f` itself accesses memory through pointers without
 # origin (calls the byte-wise helpers); other functions of the module may (Base's copies)
 function uses_byte_access(c, f)
@@ -124,6 +148,7 @@ end
     @wtest carry_swap(5)
     @wtest carry_nested(3, 4)
     @wtest carry_mutual(6)
+    @wtest carry_previous(1, 2, 3, 2)
     for (f, T) in ((carry_sum, (Int,)), (carry_vec, (Int,)), (carry_nested, (Int, Int)), (carry_store, (Int,)),
                    (carry_mutual, (Int,)))
         @test !uses_byte_access(wcompile(f, T), f)

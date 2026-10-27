@@ -500,10 +500,11 @@ function analyze_ptr_carries!(fc::FnCtx, block)
     ptrcarry(id) = haskey(carrytypes, id) && is_ptr_type(CC.widenconst(carrytypes[id]))
     # the roots of the pointer carries: the least fixed point of
     # roots(c) = union of the bases of its incoming values, where the base of a value is the
-    # pointer it is derived from, expanded to the roots of a carry
+    # pointer it is derived from, expanded to the roots of a carry. An undefined initial value
+    # is no known pointer (`nothing`): such a carry holds what an earlier iteration left in it,
+    # which a pointer defined in the loop's body (its other root) no longer points into.
     world = fc.cgm.world.world
-    bases = Dict{Int,Vector{Any}}(id => Any[ptr_base(fc, stmts, world, x) for x in xs
-                                            if !(x isa IRStructurizer.Undef)]
+    bases = Dict{Int,Vector{Any}}(id => Any[ptr_base(fc, stmts, world, x) for x in xs]
                                   for (id, xs) in incoming if ptrcarry(id))
     roots = Dict{Int,Set{Any}}(id => Set{Any}() for id in keys(bases))
     changed = true
