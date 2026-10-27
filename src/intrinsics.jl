@@ -7,7 +7,8 @@
 
 const II = Core.Intrinsics
 
-nbits(@nospecialize(T)) = 8 * sizeof(T)
+# (a Bool is one bit, as natively compiled code's intrinsics see it)
+nbits(@nospecialize(T)) = T === Bool ? 1 : 8 * sizeof(T)
 
 # the Wasm type of a primitive type's single leaf
 function prim_wtype(fc::FnCtx, @nospecialize(T))
@@ -24,7 +25,6 @@ wop(t::ValType, op::AbstractString) = Symbol(wprefix(t), "_", op)
 "Mask the integer of type `T` on the stack to its bits (for types narrower than 32 bits)."
 function mask!(fc::FnCtx, @nospecialize(T))
     n = nbits(T)
-    T === Bool && (n = 1)
     if n < 32
         emit!(fc.b, :i32_const, (1 << n) - 1)
         emit!(fc.b, :i32_and)
@@ -34,7 +34,11 @@ end
 "Sign-extend the integer of type `T` on the stack (for types narrower than 32 bits)."
 function sext!(fc::FnCtx, @nospecialize(T))
     n = nbits(T)
-    if n == 8
+    if T === Bool
+        # (of one bit: true is -1)
+        emit!(fc.b, :i32_const, 31); emit!(fc.b, :i32_shl)
+        emit!(fc.b, :i32_const, 31); emit!(fc.b, :i32_shr_s)
+    elseif n == 8
         emit!(fc.b, :i32_extend8_s)
     elseif n == 16
         emit!(fc.b, :i32_extend16_s)
@@ -379,7 +383,7 @@ end
 function emit_bswap!(fc::FnCtx, x::CGVal)
     T = x.typ
     n = nbits(T)
-    n == 8 && return x
+    n <= 8 && return x
     t = prim_wtype(fc, T)
     acc = new_local!(fc, t)
     emit!(fc.b, wop(t, "const"), 0)

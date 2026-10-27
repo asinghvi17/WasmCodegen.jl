@@ -59,7 +59,7 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
             add_export!(cgm.mod, e.name, info.func)
         end
         process_worklist!(cgm)
-        compile_objectid_cases!(cgm)
+        compile_runtime_cases!(cgm)
         # the runtime functions the code needed (added to the world as it was emitted) may
         # use exceptions more than the program did: then again, as they need
         m = exception_mode(w)
@@ -105,6 +105,7 @@ function finish_module!(cgm::CGModule)
     finish_type_isa!(cgm)
     finish_egal!(cgm)
     finish_objectid_any!(cgm)
+    finish_tuples!(cgm)
     finish_objectid!(cgm)
     finish_pointers!(cgm)
     finish_types!(cgm)
