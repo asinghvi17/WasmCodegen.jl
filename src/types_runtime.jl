@@ -139,12 +139,11 @@ function current_task_global!(cgm::CGModule)
     push!(init, Inst(:struct_new, l.wtype))
     g = add_global!(cgm.mod, "jl_current_task", RefType(l.wtype, false), false, init)
     cgm.helpers[:current_task] = g
-    # a new task holds `nothing` (not a null reference) in its Any-typed fields (storage, result,
-    # scope, logstate, ...), so that `task_local_storage` creates its IdDict as natively
+    # the root task holds `nothing` (not a null reference) in the fields `jl_init_root_task` sets,
+    # so that `task_local_storage` creates its IdDict as natively; `code` stays undefined
     nothing_g = singleton_global!(cgm.image, Nothing)
-    for k in 1:fieldcount(Task)
-        fieldtype(Task, k) === Any || continue
-        w = first(l.fields[k]) - 1
+    for name in (:next, :queue, :storage, :donenotify, :result, :scope)
+        w = first(l.fields[Base.fieldindex(Task, name)]) - 1
         push!(cgm.image.init, Inst(:global_get, g), Inst(:global_get, nothing_g), Inst(:struct_set, l.wtype, w))
     end
     entropy = host_import!(cgm, "entropy", ValType[], ValType[I64])
