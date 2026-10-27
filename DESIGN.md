@@ -215,7 +215,10 @@ identity hash, assigned on first use.
 - large homogeneous tuples (more than 64 leaves) and tuples of unknown length
   (`Tuple{Vararg{T}}`, e.g. from splatting a vector): an immutable object holding an
   array, which can be indexed at run time; a run-time index into a small inline tuple of
-  one element type builds a temporary array;
+  one element type builds a temporary array. A tuple held as an object (an `Any`) is one
+  of its concrete type, so a tuple of unknown length becomes one of the concrete type its
+  elements make it, and one is rebuilt as an array from such an object, by helpers per
+  type of unknown length generated over the module's concrete tuple types (section 8);
 - type objects (`DataType`s used as values): one interned object per type, holding the type
   id it is; what code asks of them at run time is answered by tables (section 8). A
   `TypeName` has only its name; a `SimpleVector` (a type's parameters) is an array object;
@@ -228,7 +231,12 @@ All types are in one recursion group, so they are nominal.
 type (packed `i8`/`i16` for small ones); an inline value whose leaves are stored alike as
 its leaves (stride `k`: `SVector{3,Float64}` is 3 `f64`s, as Julia lays it out); other
 isbits values as their leaves widened to `i64` (never `#undef`); other inline values
-(with references, mixed) as references to boxes; references as references.
+(with references, mixed) as references to boxes; references as references. Where Julia
+stores a type inline without references (isbits types, isbits unions, structs with union
+fields), a value never stored (an element of a new memory, a field `new` is not given) is
+its zero bits, a union's of its first type (`Vector{Union{Missing,Float64}}(undef, n)`
+holds `missing`s): a null reference read there is that value, and `new` stores it; of
+other types, a null reference is `#undef` (`UndefRefError`).
 `MemoryRef{T}` is inline: the Memory object, its array (so accesses don't load it) and the
 element index. `Array` is then Base's own mutable struct, and Base's array code (growth
 with `_growend!`, `copyto!`, broadcasting, `sort!`, `cat`) compiles from its Julia source.
@@ -284,13 +292,17 @@ built it.
 - Large numeric arrays are `array.new_default` in the initializer and filled by the start
   function from passive data segments (`array.init_data`); large reference arrays are filled
   by the start function.
-- `MemoryRef` constants are (Memory object, array, index); type objects are interned.
+- `MemoryRef` constants are (Memory object, array, index); type objects are interned, and
+  carry their native `objectid` (as mutable objects do), so that `IdDict`s with type keys
+  built at compile time find them.
 - Global variables are mutable globals (one per leaf of the declared type), initialized
   with their value at compile time.
 - A `Ptr` constant is its address without owner (an address of the build process).
 - A symbol carries its hash, as Julia's runtime computed it, so that dictionaries with
   symbol keys built at compile time are found at run time.
 - Not serializable (an error naming the object): tasks, modules, methods.
+- Not preserved: memory shared between distinct `Memory` objects (an `unsafe_wrap` of
+  another array's data is a copy), and the distinctness of equal `String`s (one object).
 
 ## 7. Functions, calls, intrinsics
 
@@ -393,8 +405,15 @@ shared (10% smaller modules for the parser).
   SimpleVectors). Their `objectid` is `jl_object_id`, by type too: of each type whose
   values may be objects, the code of `objectid` for that type, compiled once the program's
   code is (until it adds no types; a type whose `objectid` cannot be compiled traps there,
-  not an error of the program). These tables are built after the image and the type maps,
-  which add types. Printing a type (juliac's `show`,
+  not an error of the program). The conversions of tuples of unknown length to and from
+  objects (section 4) are helpers of the same kind: per concrete tuple type of the
+  module, a test of the elements and the conversion, compiled with the code. A tuple whose
+  concrete type the module does not have (no code names it) is an object of `Tuple`, its
+  elements as objects: one such object of its elements whatever type it came from,
+  compared (`===`) and hashed (`objectid`, not the native one) by its elements, and tested
+  by them for tuple types; `typeof` of it is `Tuple`. These cases are compiled until
+  they, and the values of the type maps, add no types, and the tables are built after
+  them and the image. Printing a type (juliac's `show`,
   which reflects on it) is a foldable function returning its name as a Symbol, so that
   inference computes it for a type known at compile time (a `Union` or `UnionAll` is not
   a constant for inference: printing one at run time needs reflection, not supported).

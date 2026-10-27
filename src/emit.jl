@@ -229,12 +229,6 @@ function emit_terminator!(fc::FnCtx, @nospecialize(term))
     elseif term isa IRStructurizer.ContinueOp
         lt = fc.loops[end]
         assign_all!(fc, lt.carries, term.values)
-        if lt.iv !== nothing
-            push_val!(fc, lt.iv)
-            push_val!(fc, convert_repr(fc, operand(fc, lt.step), lt.iv.typ))
-            emit!(fc.b, layout(fc, lt.iv.typ).leaves[1].type === I64 ? :i64_add : :i32_add)
-            pop_to!(fc, lt.iv)
-        end
         br!(fc.b, br_depth(fc, lt.cont))
     elseif term isa IRStructurizer.BreakOp
         lt = fc.loops[end]
@@ -397,8 +391,8 @@ function same_repr(fc::FnCtx, @nospecialize(S), @nospecialize(T))
         return length(ls.leaves) == length(lt.leaves) &&
                all(i -> ls.leaves[i].type == lt.leaves[i].type, eachindex(lt.leaves))
     elseif ls.kind === Boxed && lt.kind === Boxed
-        return ls.wtype == lt.wtype ||
-               (lt.wtype == fc.cgm.types.jlvalue && is_jlvalue_type(fc.cgm.types, S))
+        # (a tuple of unknown length as an object is of its concrete type: see `convert_repr`)
+        return ls.wtype == lt.wtype || (lt.wtype == fc.cgm.types.jlvalue && !is_vararg_tuple(S))
     end
     return false
 end
@@ -534,7 +528,7 @@ function emit_cfop!(fc::FnCtx, op::IRStructurizer.LoopOp, @nospecialize(typ))
     results = CGVal[result_val!(fc, fc.opidx, i, R) for (i, R) in enumerate(result_types(typ))]
     block!(fc.b); exit = open_label!(fc)
     loop!(fc.b); cont = open_label!(fc)
-    push!(fc.loops, LoopTarget(exit, cont, carries, results, nothing, nothing))
+    push!(fc.loops, LoopTarget(exit, cont, carries, results))
     emit_block!(fc, op.body)
     pop!(fc.loops)
     # falling off the end of the body does not happen (it continues or breaks)
@@ -544,32 +538,6 @@ function emit_cfop!(fc::FnCtx, op::IRStructurizer.LoopOp, @nospecialize(typ))
     return MultiVal(results)
 end
 
-function emit_cfop!(fc::FnCtx, op::IRStructurizer.ForOp, @nospecialize(typ))
-    ivT = CC.widenconst(op.iv_arg.type)
-    iv = new_val!(fc, ivT)
-    assign!(fc, iv, convert_repr(fc, operand(fc, op.lower), ivT))
-    fc.blockargs[op.iv_arg.id] = iv
-    carries = carry_vals!(fc, op.body.args)
-    assign_all!(fc, carries, op.init_values)
-    bind_block_args!(fc, op.body.args, carries)
-    upper = convert_repr(fc, operand(fc, op.upper), ivT)
-    is64 = layout(fc, ivT).leaves[1].type === I64
-    block!(fc.b); exit = open_label!(fc)
-    loop!(fc.b); cont = open_label!(fc)
-    # exit unless iv < upper (signed)
-    push_val!(fc, iv)
-    push_val!(fc, upper)
-    emit!(fc.b, is64 ? :i64_ge_s : :i32_ge_s)
-    br_if!(fc.b, br_depth(fc, exit))
-    push!(fc.loops, LoopTarget(exit, cont, carries, carries, iv, op.step))
-    emit_block!(fc, op.body)
-    pop!(fc.loops)
-    is_unreachable(fc.b) || unreachable!(fc.b)
-    end!(fc.b); close_label!(fc)
-    end!(fc.b); close_label!(fc)
-    return MultiVal(carries)
-end
-
 function emit_cfop!(fc::FnCtx, op::IRStructurizer.WhileOp, @nospecialize(typ))
     carries = carry_vals!(fc, op.before.args)
     assign_all!(fc, carries, op.init_values)
@@ -577,7 +545,7 @@ function emit_cfop!(fc::FnCtx, op::IRStructurizer.WhileOp, @nospecialize(typ))
     results = CGVal[result_val!(fc, fc.opidx, i, R) for (i, R) in enumerate(result_types(typ))]
     block!(fc.b); exit = open_label!(fc)
     loop!(fc.b); cont = open_label!(fc)
-    push!(fc.loops, LoopTarget(exit, cont, carries, results, nothing, nothing))
+    push!(fc.loops, LoopTarget(exit, cont, carries, results))
     # the before region, up to its condition
     for inst in IRStructurizer.instructions(op.before)
         is_unreachable(fc.b) && break
@@ -843,22 +811,105 @@ function convert_repr(fc::FnCtx, v, @nospecialize(T))
         end
     else # Boxed
         if lt.wtype == fc.cgm.types.jlvalue
-            # an abstract type: any object
-            if lv.kind === Boxed && is_jlvalue_type(fc.cgm.types, v.typ)
+            # an abstract type: any object (a tuple of unknown length: of its concrete type)
+            if is_vararg_tuple(v.typ) && lv.elements !== nothing
+                isconstant(v) && return box!(fc, v, T)
+                push_val!(fc, v)
+                call!(fc.b, tuple_canon_func!(fc.cgm, v.typ))
+                return pop_val!(fc, T)
+            elseif lv.kind === Boxed
                 return CGVal(T, Boxed, v.leaves, v.constant)
             end
             return box!(fc, v, T)
         elseif lv.kind === Boxed && lv.wtype == lt.wtype
+            if lt.elements !== nothing && isconcretetype(T) && !isconcretetype(v.typ)
+                # a tuple of unknown length as the large tuple it is: its type's object
+                return retag_tuple_array!(fc, v, T)
+            end
             return CGVal(T, Boxed, v.leaves, v.constant)
         elseif lt.elements !== nothing && lv.kind in (Inline, Ghost) && v.typ <: Tuple
             # a tuple of known length as a tuple of unknown length (an array)
             return new_tuple_array!(fc, T, CGVal[get_field(fc, v, i) for i in 1:fieldcount(v.typ)])
         elseif lv.kind === Boxed && lv.wtype == fc.cgm.types.jlvalue
+            if is_vararg_tuple(T) && lt.elements !== nothing
+                # any tuple as one of unknown length: an array object
+                push_val!(fc, v)
+                call!(fc.b, tuple_from_func!(fc.cgm, T))
+                return pop_val!(fc, T)
+            end
             return unbox!(fc, v, T)
+        elseif lt.elements !== nothing && lv.elements !== nothing
+            # a tuple as an array object of another storage of its elements
+            return convert_tuple_array!(fc, v, T)
         else
             return no_conversion!(fc, v.typ, T)
         end
     end
+end
+
+# the tuple-array object `v` (of a tuple type of unknown length) as an object of the large
+# tuple type `T` (of the same Wasm type), which it is: the same array, `T`'s type id
+function retag_tuple_array!(fc::FnCtx, v::CGVal, @nospecialize(T))
+    l = layout(fc, T)
+    emit!(fc.b, :i32_const, typeid!(fc.cgm.types, T))
+    emit!(fc.b, :i32_const, 0)
+    push_val!(fc, v)
+    emit!(fc.b, :struct_get, l.wtype, DATA_FIELD)
+    emit!(fc.b, :struct_new, l.wtype)
+    return pop_val!(fc, T)
+end
+
+# the tuple-array object `v` as one of the tuple type `T` whose elements are stored otherwise
+# (a tuple of unknown length, a large tuple): a new array of its elements, each converted
+function convert_tuple_array!(fc::FnCtx, v::CGVal, @nospecialize(T))
+    lv, lt = layout(fc, v.typ), layout(fc, T)
+    mv, mt = lv.elements::MemoryLayout, lt.elements::MemoryLayout
+    E = mt.elem.T
+    src, dst = new_local!(fc, RefType(mv.array, true)), new_local!(fc, RefType(mt.array, true))
+    n, k = new_local!(fc, I32), new_local!(fc, I64)
+    push_val!(fc, v)
+    emit!(fc.b, :struct_get, lv.wtype, DATA_FIELD)
+    emit!(fc.b, :local_tee, src)
+    emit_memory_length!(fc, mv)
+    emit!(fc.b, :local_tee, n)
+    mt.stride != 1 && (emit!(fc.b, :i32_const, mt.stride); emit!(fc.b, :i32_mul))
+    emit!(fc.b, :array_new_default, mt.array)
+    emit!(fc.b, :local_set, dst)
+    if mt.elem.kind !== Ghost
+        # (the k-th element, from 1, while there is one)
+        emit!(fc.b, :i64_const, 1); emit!(fc.b, :local_set, k)
+        block!(fc.b); open_label!(fc)
+        loop!(fc.b); open_label!(fc)
+        emit!(fc.b, :local_get, k); emit!(fc.b, :local_get, n); emit!(fc.b, :i64_extend_i32_u)
+        emit!(fc.b, :i64_gt_s)
+        br_if!(fc.b, 1)
+        K = CGVal(Int, Inline, LeafVal[k])
+        e = mv.elem.kind === Ghost ? ghost(mv.elem.T, something(ghost_value(mv.elem.T))) :
+            array_element_get!(fc, src, mv, K)
+        e = convert_repr(fc, e, E)
+        if e.kind !== Bottom
+            leaves = mt.boxed ? box!(fc, e, Any).leaves : e.leaves
+            for (j, leaf) in enumerate(leaves)
+                emit!(fc.b, :local_get, dst)
+                emit!(fc.b, :local_get, k); emit!(fc.b, :i32_wrap_i64); emit!(fc.b, :i32_const, 1); emit!(fc.b, :i32_sub)
+                mt.stride != 1 && (emit!(fc.b, :i32_const, mt.stride); emit!(fc.b, :i32_mul))
+                j > 1 && (emit!(fc.b, :i32_const, j - 1); emit!(fc.b, :i32_add))
+                push_leaf!(fc, leaf)
+                mt.boxed && !is_union_tuple(E) && emit!(fc.b, :ref_cast_null, box_type!(fc.cgm.types, E))
+                mt.widened && widen_leaf!(fc, mt.elem.leaves[j].type)
+                emit!(fc.b, :array_set, mt.array)
+            end
+        end
+        emit!(fc.b, :local_get, k); emit!(fc.b, :i64_const, 1); emit!(fc.b, :i64_add); emit!(fc.b, :local_set, k)
+        br!(fc.b, 0)
+        end!(fc.b); close_label!(fc)
+        end!(fc.b); close_label!(fc)
+    end
+    emit!(fc.b, :i32_const, typeid!(fc.cgm.types, T))
+    emit!(fc.b, :i32_const, 0)
+    emit!(fc.b, :local_get, dst)
+    emit!(fc.b, :struct_new, lt.wtype)
+    return pop_val!(fc, T)
 end
 
 """
@@ -899,10 +950,9 @@ end
 The object `v` (a `\$JlValue`) as a value of the concrete type `T` (which it is).
 """
 function unbox!(fc::FnCtx, v::CGVal, @nospecialize(T))
-    ts = fc.cgm.types
     is_union_tuple(T) && return unbox_union_tuple!(fc, v, T)
     lt = layout(fc, T)
-    if lt.kind === Boxed && is_jlvalue_type(ts, T)
+    if lt.kind === Boxed
         push_val!(fc, v)
         emit!(fc.b, :ref_cast_null, lt.wtype)
         return pop_val!(fc, T)

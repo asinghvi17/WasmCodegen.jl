@@ -81,16 +81,13 @@ valtypes(cgm::CGModule, @nospecialize(T)) = valtypes(cgm.types, T)
     LoopTarget
 
 An enclosing loop: the depths of its labels (`exit`: the block around the loop; `cont`:
-the loop itself), the locals of its carried values and results, and for a `for` loop its
-induction variable and step.
+the loop itself), and the locals of its carried values and results.
 """
 struct LoopTarget
     exit::Int
     cont::Int
     carries::Vector{CGVal}
     results::Vector{CGVal}
-    iv::Union{Nothing,CGVal}
-    step::Any
 end
 
 """

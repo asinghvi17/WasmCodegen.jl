@@ -125,15 +125,8 @@ function finish_type_maps!(cgm::CGModule)
     maps = [(k[2], f) for (k, f) in cgm.helpers if k isa Tuple && k[1] === :map_type]
     isempty(maps) && return
     img = cgm.image
+    add_type_map_types!(cgm)
     types = type_objects(cgm)
-    while true
-        for (f, _) in maps, T in types
-            object_global!(img, f(T))
-        end
-        all = type_objects(cgm)
-        length(all) == length(types) && break
-        types = all
-    end
     ts = cgm.types
     jl = jlvalue_ref(ts)
     refs = array_type!(ts, jl)
@@ -150,6 +143,24 @@ function finish_type_maps!(cgm::CGModule)
         emit!(b, :array_get, refs)
         finish!(b)
     end
+end
+
+# the type objects of the values of the module's functions of types on its types, until they
+# add none (the number of types added)
+function add_type_map_types!(cgm::CGModule)
+    maps = [k[2] for k in keys(cgm.helpers) if k isa Tuple && k[1] === :map_type]
+    isempty(maps) && return 0
+    types = type_objects(cgm)
+    n = length(types)
+    while true
+        for f in maps, T in types
+            object_global!(cgm.image, f(T))
+        end
+        all = type_objects(cgm)
+        length(all) == length(types) && break
+        types = all
+    end
+    return length(types) - n
 end
 
 ## isa of type objects
@@ -232,7 +243,8 @@ function finish_egal!(cgm::CGModule)
         (add_local!(f, RefType(st, true)), add_local!(f, RefType(st, true)))
     end
     for (id, T) in enumerate(copy(ts.typelist))
-        (T isa DataType && isconcretetype(T)) || continue
+        # (and tuples of a type of unknown length, their concrete one not in the module)
+        (T isa DataType && (isconcretetype(T) || is_vararg_tuple(T))) || continue
         l = layout(ts, T)
         # the Wasm struct type of T's objects, and what to compare in it
         st, how = if T === String || T === Symbol
@@ -265,8 +277,8 @@ function finish_egal!(cgm::CGModule)
             elseif how === :elements
                 egal_array_elements!(cgm, b, f, st, l.elements::MemoryLayout, ca, cb)
             else
-                # (fields from the header's end)
-                emit_fields_egal!(cgm, b, f, st, ca, cb)
+                # (fields from the header's end, as `egal_leaves`)
+                emit_fields_egal!(cgm, b, f, st, ca, cb, egal_leaves(ts, T))
                 emit!(b, :i32_const, 1); return!(b)
             end
         end
@@ -284,7 +296,7 @@ end
 
 `jl_object_id(x::\$JlValue) -> i64`: `objectid(x)`, by the type of `x`: of each type whose
 values are objects, the code of `objectid` of a value of that type (`Runtime.objectid_as`,
-compiled with the module's code, see `compile_objectid_cases!`). Generated when the module's
+compiled with the module's code, see `compile_runtime_cases!`). Generated when the module's
 types are known (`finish_objectid_any!`); a type it has no case for traps.
 """
 objectid_any_func!(cgm::CGModule) = get!(cgm.helpers, :objectid_any) do
@@ -301,34 +313,46 @@ function objectid_case_type(ts::Types, @nospecialize(T))
 end
 
 """
-    compile_objectid_cases!(cgm)
+    compile_runtime_cases!(cgm)
 
-Compiles `objectid` of each type whose values may be objects, for `jl_object_id`, once the
-module's code is compiled: until it adds no types.
+Compiles the cases of the helpers that dispatch on the module's types (`jl_object_id`, the
+conversions of tuples of unknown length), once the module's code is compiled: until they, and
+the values of its functions of types (`add_type_map_types!`), add no types. (Compiled for every type they may meet, whether or not a value of it ever reaches
+them: a case that cannot be compiled traps there, and is not an error of the program.)
 """
-function compile_objectid_cases!(cgm::CGModule)
-    haskey(cgm.helpers, :objectid_any) || return
-    cases = get!(() -> Dict{Int,FuncInfo}(), cgm.helpers, :objectid_cases)
-    ts = cgm.types
-    # (compiled for every such type, whether or not its values are ever hashed: one whose
-    # `objectid` cannot be compiled traps there, and is not an error of the program)
+function compile_runtime_cases!(cgm::CGModule)
     config, ndiag = cgm.config, length(cgm.diagnostics)
     cgm.config = Config(; on_unsupported=:trap, trim=:unsafe, verify=config.verify,
                         trim_patches=config.trim_patches, optimize=config.optimize)
     try
         while true
-            n = length(cases)
-            for (id, T) in enumerate(copy(ts.typelist))
-                (haskey(cases, id) || !objectid_case_type(ts, T)) && continue
-                cases[id] = runtime_function!(cgm, Runtime.objectid_as, (Any, Type{T}))
-            end
-            length(cases) == n && break
+            n = add_type_map_types!(cgm) + add_objectid_cases!(cgm) + add_tuple_cases!(cgm)
+            n == 0 && break
             process_worklist!(cgm)
         end
     finally
         cgm.config = config
         resize!(cgm.diagnostics, ndiag)
     end
+end
+
+# the cases of `jl_object_id`: `objectid` of each type whose values may be objects (the
+# number of cases added)
+function add_objectid_cases!(cgm::CGModule)
+    haskey(cgm.helpers, :objectid_any) || return 0
+    cases = get!(() -> Dict{Int,FuncInfo}(), cgm.helpers, :objectid_cases)
+    ts = cgm.types
+    n = length(cases)
+    for (id, T) in enumerate(copy(ts.typelist))
+        haskey(cases, id) && continue
+        if objectid_case_type(ts, T)
+            cases[id] = runtime_function!(cgm, Runtime.objectid_as, (Any, Type{T}))
+        elseif T === Tuple
+            # (a tuple whose concrete type the module does not have: see `tuple_canon_func!`)
+            cases[id] = runtime_function!(cgm, Runtime.tuple_objectid, (Any, Val{T}))
+        end
+    end
+    return length(cases) - n
 end
 
 function finish_objectid_any!(cgm::CGModule)
@@ -342,8 +366,8 @@ function finish_objectid_any!(cgm::CGModule)
     for (id, T) in enumerate(ts.typelist)
         info = get(cases, id, nothing)
         if info === nothing
-            # objects of the runtime (types, ...) and mutable ones: by identity
-            (T isa DataType && ismutabletype(T)) || continue
+            # mutable objects and type objects: by identity
+            ((T isa DataType && ismutabletype(T)) || is_type_object_type(T)) || continue
         end
         emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
         if!(b)
@@ -356,9 +380,167 @@ function finish_objectid_any!(cgm::CGModule)
     finish!(b)
 end
 
-function emit_fields_egal!(cgm::CGModule, b::Builder, f::Func, st::TypeRef, ca::Int, cb::Int)
+# how `jl_egal` compares each leaf of the immutable type `T` (of its box or its object, after
+# the header): as it is stored (`nothing`); not (`:owner`, of a pointer: a pointer is ===
+# another of the same address); a tuple of unknown length `S`, by its elements (the type id
+# of its array object is not its value's: see `tuple_canon_func!`)
+function egal_leaves(ts::Types, @nospecialize(T))
+    is_ptr_type(T) && return Any[nothing, :owner]
+    l = layout(ts, T)
+    off = l.kind === Boxed ? HEADER_FIELDS : 0
+    n = l.kind === Boxed ? maximum(last, l.fields; init=off) - off : length(l.leaves)
+    how = Any[nothing for _ in 1:n]
+    for (i, r) in enumerate(l.fields)
+        isempty(r) && continue
+        FT = fieldtype(T, i)
+        lf = layout(ts, FT)
+        if lf.kind === Inline
+            how[r .- off] = egal_leaves(ts, FT)
+        elseif is_vararg_tuple(FT) && lf.elements !== nothing
+            how[first(r) - off] = FT
+        end
+    end
+    return how
+end
+
+"""
+`jl_tuple_egal(a::S, b::S) -> i32`: `a === b` of tuples of the type of unknown length `S`, by
+their elements (`jl_egal` the function comparing others).
+"""
+tuple_egal_func!(cgm::CGModule, @nospecialize(S), egal::Func) = get!(cgm.helpers, (:tuple_egal, S)) do
+    l = layout(cgm.types, S)
+    r = RefType(l.wtype, true)
+    h = add_func!(cgm.mod, "jl_tuple_egal_" * typename_str(S), ValType[r, r], ValType[I32])
+    b = Builder(cgm.mod, h)
+    emit!(b, :local_get, 0); emit!(b, :local_get, 1); emit!(b, :ref_eq)
+    if!(b); emit!(b, :i32_const, 1); return!(b); end!(b)
+    emit!(b, :local_get, 0); emit!(b, :ref_is_null); emit!(b, :local_get, 1); emit!(b, :ref_is_null); emit!(b, :i32_or)
+    if!(b); emit!(b, :i32_const, 0); return!(b); end!(b)
+    egal_array_elements!(cgm, b, h, l.wtype, l.elements::MemoryLayout, 0, 1; egal)
+    finish!(b)
+    h
+end
+
+## tuples of unknown length as objects
+
+# A value of a tuple type of unknown length `S` (`Tuple`, `Tuple{Vararg{Int}}`, ...) is an
+# array object (`tuple_array_layout`), while a tuple held as an object (an `Any`) is one of its
+# concrete type, `C`: a box (or its own object). From an `S` to an object, it is of the
+# concrete type its elements make it, where the module has that type (one it tests for,
+# boxes, ...); else, a type no code of the module names, an array object of `Tuple` (of its
+# elements as objects, of `Tuple`'s type id: the one such object of its elements, whatever
+# `S` it came from, compared and hashed by its elements, and tested by them for tuple types).
+# From an object to an `S`, an array object of its elements. By helpers per `S`, generated
+# with the module's types (`finish_tuples!`), of cases per `C` compiled with its code
+# (`Runtime.tuple_as`, `Runtime.tuple_from`, `Runtime.tuple_any`).
+
+"`jl_tuple_canon(x::S) -> \$JlValue`: the tuple `x` of the tuple type of unknown length `S` as an object."
+tuple_canon_func!(cgm::CGModule, @nospecialize(S)) = get!(cgm.helpers, (:tuple_canon, S)) do
+    l = layout(cgm.types, S)
+    add_func!(cgm.mod, "jl_tuple_canon_" * typename_str(S), ValType[l.leaves[1].type],
+              ValType[jlvalue_ref(cgm.types)])
+end
+
+"`jl_tuple_from(x::\$JlValue) -> S`: the tuple object `x` as a value of the tuple type of unknown length `S`."
+tuple_from_func!(cgm::CGModule, @nospecialize(S)) = get!(cgm.helpers, (:tuple_from, S)) do
+    l = layout(cgm.types, S)
+    add_func!(cgm.mod, "jl_tuple_from_" * typename_str(S), ValType[jlvalue_ref(cgm.types)],
+              ValType[l.leaves[1].type])
+end
+
+# the concrete tuple types of the module of the tuple type of unknown length `S`
+function tuple_case_types(ts::Types, @nospecialize(S))
+    return [(id, C) for (id, C) in enumerate(ts.typelist)
+            if C isa DataType && C <: Tuple && isconcretetype(C) && C <: S && C !== S]
+end
+
+# the cases of the tuple helpers (the number added)
+function add_tuple_cases!(cgm::CGModule)
+    ts = cgm.types
+    added = 0
+    for key in collect(keys(cgm.helpers))
+        (key isa Tuple && length(key) == 2 && (key[1] === :tuple_canon || key[1] === :tuple_from)) || continue
+        kind, S = key
+        cases = get!(() -> Dict{Int,FuncInfo}(), cgm.helpers, (:tuple_cases, kind, S))
+        typeid!(ts, Nothing); typeid!(ts, Tuple)
+        # (of a type the module does not have, an object of `Tuple`: from an `S` whose
+        # elements are stored otherwise, as one)
+        other = layout(ts, S).wtype != layout(ts, Tuple).wtype
+        if other && kind === :tuple_canon && !haskey(cgm.helpers, (:tuple_any, S))
+            cgm.helpers[(:tuple_any, S)] = runtime_function!(cgm, Runtime.tuple_any, (S,))
+            added += 1
+        end
+        cs = tuple_case_types(ts, S)
+        other && kind === :tuple_from && push!(cs, (typeid!(ts, Tuple), Tuple))
+        for (id, C) in cs
+            haskey(cases, id) && continue
+            # (from an object: only of types whose values may be objects)
+            kind === :tuple_from && C !== Tuple && !objectid_case_type(ts, C) && continue
+            cases[id] = kind === :tuple_canon ?
+                runtime_function!(cgm, Runtime.tuple_as, (S, Type{C})) :
+                runtime_function!(cgm, Runtime.tuple_from, (Any, Val{C}, Val{S}))
+            added += 1
+        end
+    end
+    return added
+end
+
+function finish_tuples!(cgm::CGModule)
+    ts = cgm.types
+    for (key, f) in collect(cgm.helpers)
+        (key isa Tuple && length(key) == 2 && (key[1] === :tuple_canon || key[1] === :tuple_from)) || continue
+        kind, S = key
+        f = f::Func
+        cases = sort!(collect(get(cgm.helpers, (:tuple_cases, kind, S), Dict{Int,FuncInfo}())); by=first)
+        l = layout(ts, S)
+        ml = l.elements::MemoryLayout
+        b = Builder(cgm.mod, f)
+        if kind === :tuple_canon
+            # of the concrete type of its length whose element types its elements are of
+            n = add_local!(f, I32)
+            r = add_local!(f, jlvalue_ref(ts))
+            emit!(b, :local_get, 0); emit!(b, :struct_get, l.wtype, DATA_FIELD); emit!(b, :array_len)
+            ml.stride != 1 && (emit!(b, :i32_const, ml.stride); emit!(b, :i32_div_u))
+            emit!(b, :local_set, n)
+            for (id, info) in cases
+                emit!(b, :local_get, n); emit!(b, :i32_const, fieldcount(ts.typelist[id])); emit!(b, :i32_eq)
+                if!(b)
+                emit!(b, :local_get, 0); call!(b, info.func); emit!(b, :local_tee, r)
+                emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :i32_const, typeid!(ts, Nothing)); emit!(b, :i32_ne)
+                if!(b); emit!(b, :local_get, r); return!(b); end!(b)
+                end!(b)
+            end
+            # (else an object of `Tuple`, a new one)
+            lT = layout(ts, Tuple)
+            emit!(b, :i32_const, typeid!(ts, Tuple)); emit!(b, :i32_const, 0)
+            emit!(b, :local_get, 0)
+            g = get(cgm.helpers, (:tuple_any, S), nothing)
+            g === nothing || call!(b, (g::FuncInfo).func)
+            emit!(b, :struct_get, g === nothing ? l.wtype : lT.wtype, DATA_FIELD)
+            emit!(b, :struct_new, lT.wtype)
+        else
+            # an array object of the same elements' storage, or by the concrete type it is
+            emit!(b, :local_get, 0); emit!(b, :ref_test, l.wtype)
+            if!(b); emit!(b, :local_get, 0); emit!(b, :ref_cast, l.wtype); return!(b); end!(b)
+            tid = add_local!(f, I32)
+            emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0); emit!(b, :local_set, tid)
+            for (id, info) in cases
+                emit!(b, :local_get, tid); emit!(b, :i32_const, id); emit!(b, :i32_eq)
+                if!(b); emit!(b, :local_get, 0); call!(b, info.func); return!(b); end!(b)
+            end
+            unreachable!(b)
+        end
+        finish!(b)
+    end
+end
+
+function emit_fields_egal!(cgm::CGModule, b::Builder, f::Func, st::TypeRef, ca::Int, cb::Int,
+                           how::Vector{Any})
     fields = (typedef(cgm.mod, st).comp::StructType).fields
     for w in HEADER_FIELDS+1:length(fields)
+        k = w - HEADER_FIELDS
+        h = k <= length(how) ? how[k] : nothing
+        h === :owner && continue
         stg = fields[w].storage
         get = stg isa PackedType ? :struct_get_u : :struct_get
         emit!(b, :local_get, ca); emit!(b, get, st, w - 1)
@@ -374,6 +556,8 @@ function emit_fields_egal!(cgm::CGModule, b::Builder, f::Func, st::TypeRef, ca::
         elseif stg isa RefType && stg.heap isa TypeRef && typedef(cgm.mod, stg.heap).comp isa ArrayType
             # (the array of a memory, in a reference to its element: the same memory)
             emit!(b, :ref_eq); emit!(b, :i32_eqz)
+        elseif stg isa RefType && h !== nothing
+            call!(b, tuple_egal_func!(cgm, h, f)); emit!(b, :i32_eqz)
         elseif stg isa RefType
             # (a reference to some object: compared with jl_egal)
             call!(b, f); emit!(b, :i32_eqz)
@@ -385,9 +569,9 @@ function emit_fields_egal!(cgm::CGModule, b::Builder, f::Func, st::TypeRef, ca::
 end
 
 # the elements of two array objects (tuples, SimpleVectors) of struct type `st`, returning
-# from the function
+# from the function `f` (`egal` the function comparing objects)
 function egal_array_elements!(cgm::CGModule, b::Builder, f::Func, st::TypeRef, ml::MemoryLayout,
-                              ca::Int, cb::Int)
+                              ca::Int, cb::Int; egal::Func=f)
     arr = ml.array
     n, i = add_local!(f, I32), add_local!(f, I32)
     aa, ab = add_local!(f, RefType(arr, true)), add_local!(f, RefType(arr, true))
@@ -411,9 +595,11 @@ function egal_array_elements!(cgm::CGModule, b::Builder, f::Func, st::TypeRef, m
         emit!(b, :i32_reinterpret_f32); emit!(b, :i32_ne)
     elseif stg === I64
         emit!(b, :i64_ne)
+    elseif stg isa RefType && is_vararg_tuple(ml.elem.T) && ml.elem.elements !== nothing
+        call!(b, tuple_egal_func!(cgm, ml.elem.T, egal)); emit!(b, :i32_eqz)
     elseif stg isa RefType
         # (references to objects, or to boxes of the elements: compared with jl_egal)
-        call!(b, f); emit!(b, :i32_eqz)
+        call!(b, egal); emit!(b, :i32_eqz)
     else
         emit!(b, :i32_ne)
     end

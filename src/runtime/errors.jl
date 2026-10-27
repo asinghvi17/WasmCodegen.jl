@@ -12,6 +12,10 @@
 @noinline throw_rethrow_error() = error("rethrow() not allowed outside a catch block")
 @noinline throw_rethrow_other_error() = error("rethrow(exc) not allowed outside a catch block")
 @noinline throw_concurrency_error(msg::String) = throw(ConcurrencyViolationError(msg))
+# a Memory of `n` elements: negative, or larger than a Wasm array
+@noinline throw_memory_size_error(n::Int) = n < 0 ?
+    throw(ArgumentError("invalid GenericMemory size: the number of elements is either negative or too large for system address width")) :
+    throw(OutOfMemoryError())
 
 "The C runtime's `jl_gc_have_pending_finalizers`, as code reads it: none ever are."
 const PENDING_FINALIZERS = Ref{Cint}(0)

@@ -50,6 +50,11 @@ The hash field of the header of the object `x`: of a mutable object, -k for its 
 """
 function header_hash(img::Image, @nospecialize(x))
     ismutable(x) && !(x isa String) || return Inst(:i32_const, 0)
+    return native_id_hash(img, x)
+end
+
+# the header hash referring to the native `objectid` of `x`
+function native_id_hash(img::Image, @nospecialize(x))
     push!(img.native_ids, objectid(x))
     return Inst(:i32_const, -Int32(length(img.native_ids)))
 end
@@ -134,8 +139,10 @@ function const_leaves(img::Image, @nospecialize(x), @nospecialize(FT))
                         Inst(:i32_const, Int32(Base.memoryrefoffset(x) - 1))]
         end
         leaves = Inst[]
+        # (as the declared type stores its fields: a tuple's union elements, boxed)
+        S = isconcretetype(FT) ? T : FT
         for i in 1:fieldcount(T)
-            FTi = fieldtype(T, i)
+            FTi = fieldtype(S, i)
             if isdefined(x, i)
                 append!(leaves, const_leaves(img, getfield(x, i), FTi))
             else
@@ -147,9 +154,10 @@ function const_leaves(img::Image, @nospecialize(x), @nospecialize(FT))
     # a reference
     if lf.wtype == ts.jlvalue
         return Inst[Inst(:global_get, boxed_object_global!(img, x))]
-    elseif lf.elements !== nothing && layout(ts, typeof(x)).elements === nothing
+    elseif lf.elements !== nothing && layout(ts, typeof(x)).wtype != lf.wtype
         # a tuple stored where the declared type is a tuple of unknown length (`VersionNumber`'s
-        # `prerelease`): an array object of the declared element type
+        # `prerelease`) of another storage of its elements: an array object of the declared
+        # element type
         g = get!(() -> tuple_array_global!(img, x, lf; register=false), img.boxes, (x, lf.wtype))
         return Inst[Inst(:global_get, g)]
     end
@@ -168,7 +176,7 @@ function boxed_object_global!(img::Image, @nospecialize(x))
     ts = types(img)
     T = typeof(x)
     l = layout(ts, T)
-    if l.kind === Boxed && is_jlvalue_type(ts, T)
+    if l.kind === Boxed
         return object_global!(img, x)
     elseif l.kind === Ghost
         return singleton_global!(img, T)
@@ -273,11 +281,12 @@ function tuple_array_global!(img::Image, @nospecialize(x), l::Layout; register::
     return g
 end
 
-# a type object: its header and the id of the type it is
+# a type object: its header and the id of the type it is (the module's one object of the
+# type it represents, whose `objectid` is the native one: see `is_type_object_type`)
 function type_object_global!(img::Image, @nospecialize(x::Type))
     ts = types(img)
     st = type_object_type!(ts)
-    init = Inst[Inst(:i32_const, typeid!(ts, typeof(x))), Inst(:i32_const, 0),
+    init = Inst[Inst(:i32_const, typeid!(ts, typeof(x))), native_id_hash(img, x),
                 Inst(:i32_const, typeid!(ts, x)), Inst(:struct_new, st)]
     name = "jl_type_" * replace(string(x), r"[^A-Za-z0-9_]" => "_")
     g = add_global!(img.cgm.mod, name, RefType(st, false), false, init)
@@ -321,8 +330,7 @@ function field_init!(img::Image, @nospecialize(v), @nospecialize(FT), back::Vect
     ts = types(img)
     lf = layout(ts, FT)
     if lf.kind === Boxed
-        target = lf.wtype == ts.jlvalue && !(layout(ts, typeof(v)).kind === Boxed &&
-                                             is_jlvalue_type(ts, typeof(v))) ? nothing : v
+        target = lf.wtype == ts.jlvalue && layout(ts, typeof(v)).kind !== Boxed ? nothing : v
         if target !== nothing && target in img.inprogress
             push!(back, (slot, v, FT))
             return Inst[Inst(:ref_null, lf.leaves[1].type.heap)]
