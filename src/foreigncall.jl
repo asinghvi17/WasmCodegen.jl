@@ -88,7 +88,9 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     elseif name === :jl_symbol_name
         return string_ptr!(fc, args[1]::CGVal, typ, Symbol)
     elseif name === :jl_value_ptr
-        return object_ptr!(fc, args[1]::CGVal, typ)
+        # `pointer_from_objref` (an object to a pointer), or `unsafe_pointer_to_objref`
+        x = args[1]::CGVal
+        return is_ptr_type(x.typ) ? pointer_object!(fc, x) : object_ptr!(fc, x, typ)
     elseif name === :jl_new_structv
         return new_structv!(fc, args[1]::CGVal, args[2]::CGVal)
     elseif name === :jl_new_struct_uninit
