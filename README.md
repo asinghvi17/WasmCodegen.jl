@@ -50,6 +50,7 @@ let out = [];
 const julia = {
   write_byte: (fd, b) => out.push(b),     // Core.stdout / Core.stderr, as bytes
   entropy: () => BigInt.asIntN(64, crypto.getRandomValues(new BigUint64Array(1))[0]),
+  clock_now: () => Date.now() / 1000,  // time(): Unix epoch seconds
   hrtime: () => BigInt(Math.round(performance.now() * 1e6)),  // time_ns()
 };
 const { instance } = await WebAssembly.instantiate(bytes, { julia });

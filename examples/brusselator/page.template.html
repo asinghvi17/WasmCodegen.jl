@@ -519,6 +519,7 @@ v_t = B·u − u²v + α·v_xx              u(x, 0) = A + a·sin 2πx,  v(x, 0) 
   const julia = {
     write_byte: () => {},
     entropy: () => 0n,
+    clock_now: () => Date.now() / 1000,  // time(): Unix epoch seconds
     hrtime: () => BigInt(Math.round(performance.now() * 1e6)),
   };
   WebAssembly.instantiate(bin, { julia }).then(({ instance }) => {

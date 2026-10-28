@@ -15,6 +15,7 @@ function makeImports(mod) {
       crypto.getRandomValues(w);
       return BigInt.asIntN(64, w[0]);
     },
+    clock_now: () => Date.now() / 1000,  // time(): Unix epoch seconds
     hrtime: () => BigInt(Math.round(performance.now() * 1e6)),
   };
   const imports = { julia };

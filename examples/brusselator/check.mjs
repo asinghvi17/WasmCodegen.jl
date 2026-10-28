@@ -5,6 +5,7 @@ const bytes = fs.readFileSync(process.argv[2] ?? new URL('brusselator.wasm', imp
 const julia = {
   write_byte: () => {},
   entropy: () => 0n,
+  clock_now: () => Date.now() / 1000,  // time(): Unix epoch seconds
   hrtime: () => BigInt(Math.round(performance.now() * 1e6)),
 };
 const { instance } = await WebAssembly.instantiate(bytes, { julia });

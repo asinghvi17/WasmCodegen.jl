@@ -38,6 +38,19 @@ divs(a::Int, b::Int) = (div(a, b), rem(a, b))
     @wtest divs(1, 0)
 end
 
+wall_clock() = time()
+
+@testset "wall clock" begin
+    c = wcompile(wall_clock, ())
+    before = time()
+    got = wasm_run(c, "wall_clock"; rettype=Float64)
+    after = time()
+    @test got isa Float64
+    # Host Date.now() has millisecond precision. Allow one second of clock skew;
+    # monotonic time, nanoseconds, and baked build-time timestamps are not this clock.
+    @test before - 1.0 <= got <= after + 1.0
+end
+
 i128ops(a::Int64, b::Int64) = (x = Int128(a) * Int128(b) * 1000; (x + 1, x - 7, x * 3, x ÷ 7, x % 7, x < 0, x >> 70, x << 3, leading_zeros(x), Int64(x >> 64)))
 u128div(a::UInt64, b::UInt64) = (x = UInt128(a) << 64 | b; (x ÷ UInt128(12345), x % UInt128(12345), x * x, count_ones(x)))
 cmp_rational(x::Float64) = x < 1 // 10^5
