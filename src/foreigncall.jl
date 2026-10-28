@@ -103,6 +103,13 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         # (one thread: the first, in the pool of id 0, as natively the main thread is; no
         # finalizers run during code)
         return typ === Nothing ? ghost(Nothing, nothing) : const_value(fc, zero(typ))
+    elseif name === :jl_clock_now
+        # Base.time(): epoch seconds; distinct from the monotonic nanosecond clock.
+        call!(fc.b, host_import!(fc.cgm, "clock_now", ValType[], ValType[F64]))
+        return pop_val!(fc, Float64)
+    elseif name === :jl_gc_enable
+        # Wasm GC is always enabled; return its previous state.
+        return const_value(fc, Int32(1))
     elseif name === :jl_hrtime
         # (`time_ns`) the host's monotonic clock
         call!(fc.b, host_import!(fc.cgm, "hrtime", ValType[], ValType[I64]))
