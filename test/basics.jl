@@ -21,7 +21,10 @@ tup(x::Float64) = (x, 2x, Int(round(x)))
 cmpf(x::Float64, y::Float64) = (x === y, isequal(x, y), x == y)
 divs(a::Int, b::Int) = (div(a, b), rem(a, b))
 
+wall_clock_is_epoch_seconds() = 1e9 < time() < 1e11
+
 @testset "basics" begin
+    @wtest wall_clock_is_epoch_seconds()
     @wtest add1(41)
     @wtest fmuladd(1.5, 2.0, 0.25)
     @wtest loopsum(10)

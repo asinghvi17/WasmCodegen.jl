@@ -107,6 +107,10 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         # (`time_ns`) the host's monotonic clock
         call!(fc.b, host_import!(fc.cgm, "hrtime", ValType[], ValType[I64]))
         return pop_val!(fc, UInt64)
+    elseif name === :jl_clock_now
+        # Base.time(): epoch seconds, supplied by the host (not the monotonic timer).
+        call!(fc.b, host_import!(fc.cgm, "clock_now", ValType[], ValType[F64]))
+        return pop_val!(fc, Float64)
     elseif name === :jl_module_name
         push_val!(fc, convert_repr(fc, args[1]::CGVal, Module))
         emit!(fc.b, :struct_get, layout(fc, Module).wtype, HEADER_FIELDS)

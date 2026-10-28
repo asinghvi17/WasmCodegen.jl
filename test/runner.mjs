@@ -16,6 +16,7 @@ function makeImports(mod) {
       return BigInt.asIntN(64, w[0]);
     },
     hrtime: () => BigInt(Math.round(performance.now() * 1e6)),
+    clock_now: () => Date.now() / 1000,
   };
   const imports = { julia };
   for (const imp of WebAssembly.Module.imports(mod)) {
