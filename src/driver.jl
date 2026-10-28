@@ -48,6 +48,7 @@ function compile(entries::Vector; config::Config=Config(), validate::Bool=true,
 end
 
 function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool, world::UInt)
+    config.host in (:js, :wasi) || throw(ArgumentError("Config: host must be :js or :wasi, got $(repr(config.host))"))
     mis = Core.MethodInstance[entry_instance(e.f, e.argtypes; world) for e in entries]
     w = collect_world(mis; world, verify=config.verify)
     mode = exception_mode(w)
@@ -110,4 +111,5 @@ function finish_module!(cgm::CGModule)
     finish_pointers!(cgm)
     finish_types!(cgm)
     finish_subtype!(cgm)
+    finish_host!(cgm)
 end

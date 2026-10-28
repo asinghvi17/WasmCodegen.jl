@@ -1,31 +1,45 @@
 // Persistent runner: NDJSON requests on stdin, one response per line.
 // {id, wasm (base64) | wasmId, fn, args: [{t, bits}], results: [t...]}
 import { createInterface } from 'node:readline';
+import { WASI } from 'node:wasi';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createHost } from '../js/julia.mjs';
 const modules = new Map();
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 let output = '';
 let bytes = [];
 const decoder = new TextDecoder();
-// the host side of the runtime (import module "julia")
-function makeImports(mod) {
-  const julia = {
-    write_byte: (fd, b) => { bytes.push(b); },
-    entropy: () => {
-      const w = new BigUint64Array(1);
-      crypto.getRandomValues(w);
-      return BigInt.asIntN(64, w[0]);
-    },
-    hrtime: () => BigInt(Math.round(performance.now() * 1e6)),
-  };
-  const imports = { julia };
-  for (const imp of WebAssembly.Module.imports(mod)) {
-    if (imp.module === 'julia' && !(imp.name in julia)) throw new Error('unknown host function ' + imp.name);
+// the output of WASI modules: Node's WASI writes it to a file, read after each call
+const wasiOut = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wasmcodegen-')), 'out');
+const wasiOutFd = fs.openSync(wasiOut, 'a+');
+// a module compiled with `Config(host = :js)` runs with js/julia.mjs; one compiled with
+// `host = :wasi` (it exports its memory) with Node's WASI, as a WASI runtime runs it
+async function instantiate(mod) {
+  const imports = WebAssembly.Module.imports(mod);
+  if (WebAssembly.Module.exports(mod).some((e) => e.name === 'memory')) {
+    for (const imp of imports) {
+      if (imp.module !== 'wasi_snapshot_preview1') throw new Error('not a WASI import: ' + imp.module + '.' + imp.name);
+    }
+    const wasi = new WASI({ version: 'preview1', stdout: wasiOutFd, stderr: wasiOutFd, returnOnExit: true });
+    const inst = await WebAssembly.instantiate(mod, wasi.getImportObject());
+    wasi.initialize(inst);
+    return inst;
   }
-  return imports;
+  const host = createHost({ write: (fd, b) => { for (const x of b) bytes.push(x); } });
+  for (const imp of imports) {
+    if (imp.module !== 'julia' || !(imp.name in host.imports.julia)) throw new Error('unknown host function ' + imp.module + '.' + imp.name);
+  }
+  const inst = await WebAssembly.instantiate(mod, { julia: host.imports.julia });
+  host.attach(inst);
+  return inst;
 }
 function takeOutput() {
   output += decoder.decode(new Uint8Array(bytes));
   bytes = [];
+  const w = fs.readFileSync(wasiOut);
+  if (w.length) { output += decoder.decode(w); fs.ftruncateSync(wasiOutFd, 0); }
   const o = output; output = ''; return o;
 }
 function decode(a) {
@@ -55,7 +69,7 @@ rl.on('line', async (line) => {
     if (!inst) {
       const bytes = Buffer.from(req.wasm, 'base64');
       const mod = await WebAssembly.compile(bytes, { builtins: ['js-string'] });
-      inst = await WebAssembly.instantiate(mod, makeImports(mod));
+      inst = await instantiate(mod);
       modules.set(req.wasmId, inst);
     }
     takeOutput();

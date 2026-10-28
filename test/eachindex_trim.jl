@@ -10,7 +10,7 @@
             e
         end)
         @test msg == "DimensionMismatch: all inputs to eachindex must have the same indices"
-        c = WasmCodegen.compile(PrecompiledPrograms.sum4, (Int,); world = w, config = WasmCodegen.Config(verify = :error))
+        c = WasmCodegen.compile(PrecompiledPrograms.sum4, (Int,); world = w, config = test_config(verify = :error))
         @test wasm_run(c, "sum4", 10; rettype = Float64) === PrecompiledPrograms.sum4(10)
     end
 end

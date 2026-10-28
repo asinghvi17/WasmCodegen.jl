@@ -13,7 +13,9 @@ end
 
 stats = Dict(split(l, "=") |> p -> p[1] => p[2] for l in readlines(joinpath(dir, "stats.txt")))
 html = read(joinpath(dir, "page.template.html"), String)
+host = read(normpath(joinpath(dir, "..", "..", "js", "julia.mjs")))
 html = replace(html, "__WASM_BASE64__" => base64encode(bytes),
+               "__JULIA_HOST__" => "data:text/javascript;base64," * base64encode(host),
                "__SIZE__" => string(round(Int, length(bytes) / 1024)),
                "__FUNCS__" => stats["functions"], "__OBJECTS__" => stats["objects"],
                "__NATIVE__" => join(native, ","), "__N__" => string(N))

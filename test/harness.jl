@@ -14,7 +14,8 @@ const REQ_ID = Ref(0)
 function runner()
     r = RUNNER[]
     if r === nothing || !process_running(r)
-        r = open(`$(node_cmd()) $(joinpath(@__DIR__, "runner.mjs"))`, "r+")
+        # (node:wasi, for modules compiled for WASI, warns that it is experimental)
+        r = open(`$(node_cmd()) --disable-warning=ExperimentalWarning $(joinpath(@__DIR__, "runner.mjs"))`, "r+")
         readline(r)  # ready
         RUNNER[] = r
     end
@@ -94,13 +95,19 @@ const LAST_OUTPUT = Ref("")
 
 const COMPILED = IdDict{Any,Any}()
 
+"The host interface the tests compile for (`Config(host = ...)`): `WASMCODEGEN_TEST_HOST`, js by default."
+const TEST_HOST = Symbol(get(ENV, "WASMCODEGEN_TEST_HOST", "js"))
+
+"The configuration of the tests' compilations: `Config(; kw...)` for the tests' host."
+test_config(; kw...) = WasmCodegen.Config(; host=TEST_HOST, kw...)
+
 """
     wcompile(f, argtypes) -> Compilation (cached)
 """
-function wcompile(f, argtypes::Tuple; kw...)
+function wcompile(f, argtypes::Tuple; config=test_config(), kw...)
     key = (f, argtypes)
     get!(COMPILED, key) do
-        WasmCodegen.compile(f, argtypes; kw...)
+        WasmCodegen.compile(f, argtypes; config, kw...)
     end
 end
 

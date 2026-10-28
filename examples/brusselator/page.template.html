@@ -516,12 +516,8 @@ v_t = B·u − u²v + α·v_xx              u(x, 0) = A + a·sin 2πx,  v(x, 0) 
   new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 
   const bin = Uint8Array.from(atob(WASM_BASE64), (c) => c.charCodeAt(0));
-  const julia = {
-    write_byte: () => {},
-    entropy: () => 0n,
-    hrtime: () => BigInt(Math.round(performance.now() * 1e6)),
-  };
-  WebAssembly.instantiate(bin, { julia }).then(({ instance }) => {
+  // js/julia.mjs, the module's host, inlined by page.jl
+  import("__JULIA_HOST__").then(({ instantiate }) => instantiate(bin)).then(({ instance }) => {
     ex = instance.exports;
     N = ex.bz_n();
     schedule();

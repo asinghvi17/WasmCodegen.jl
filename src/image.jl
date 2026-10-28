@@ -606,7 +606,7 @@ end
     finish_image!(cgm)
 
 Add the start function, which completes the objects of the image (references in cycles,
-large arrays).
+large arrays): for WASI, the exported `_initialize` instead (`host.jl`).
 """
 function finish_image!(cgm::CGModule)
     img = cgm.image
@@ -629,5 +629,9 @@ function finish_image!(cgm::CGModule)
         emit!(b, inst.op, inst.imm...)
     end
     finish!(b)
-    cgm.mod.start = f
+    if cgm.config.host === :wasi
+        add_export!(cgm.mod, "_initialize", f)
+    else
+        cgm.mod.start = f
+    end
 end

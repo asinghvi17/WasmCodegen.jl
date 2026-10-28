@@ -33,7 +33,7 @@ emit: walk the structured IR → WasmBuilder (validating builder)
   │  simple code: a local per value; per-type helpers for memory access and boxing
   │  runtime functions (Julia) and host imports added on demand
   ▼
-image: serialize the referenced objects; start function completes them
+image: serialize the referenced objects; start function completes them (WASI: _initialize)
   ▼
 raw module (WasmBuilder's validation, and wasm-tools' when installed)
   ▼
@@ -417,22 +417,38 @@ shared (10% smaller modules for the parser).
   which reflects on it) is a foldable function returning its name as a Symbol, so that
   inference computes it for a type known at compile time (a `Union` or `UnionAll` is not
   a constant for inference: printing one at run time needs reflection, not supported).
-- **Primitives**: runtime functions whose calls the code generator compiles to host
-  imports (module `julia`): `write_byte(fd, byte)`, `entropy()` (the seed of the task's
-  random number generator), `hrtime()` (`time_ns()`: a monotonic clock in nanoseconds).
+- **Primitives**: runtime functions whose calls the code generator compiles to the host's
+  (`host.jl`): `write_byte(fd, byte)` and `flush_output(fd)` (the end of a write),
+  `entropy()` (the seed of the task's random number generator), `hrtime()` (`time_ns()`: a
+  monotonic clock in nanoseconds).
   The C runtime's globals code reads through `cglobal`: none so far but
   `jl_gc_have_pending_finalizers` (an image object holding 0). The thread counts behind
   `Threads.nthreads()` (`jl_n_threads_per_pool`, a pointer to an array) are not yet
   supported.
 - **The pseudo-runtime's patches** (section 1): Base/Core methods over the primitives
   (IO for `Core.stdout`/`Core.stderr`).
-- **The host**: a loader instantiating the module with the `julia` imports (the test
-  runner's is in `test/runner.mjs`): it buffers bytes per descriptor and decodes them as
-  UTF-8.
+- **The host** (`Config(host = ...)`), as other languages compiling to Wasm have both a
+  JavaScript and a WASI target (Go's `js` and `wasip1`, Kotlin's `wasmJs` and `wasmWasi`):
+  - `:js`: imports of the module `julia` (`write_byte`, `entropy`, `hrtime`), which
+    `js/julia.mjs` provides (`WasmCodegen.JS_HOST`): it buffers output bytes per
+    descriptor and decodes them as UTF-8. `flush_output` compiles to nothing.
+  - `:wasi`: WASI preview 1 (`fd_write`, `random_get`, `clock_time_get` of the monotonic
+    clock). WASI passes data through linear memory, which a WasmGC module otherwise has no
+    use for: as Kotlin's WASI target does, the module has a page of it for these calls
+    only, exported as `memory` (as WASI requires): the 8 bytes of a call's result, an
+    iovec, and an output buffer that `write_byte` appends to and `fd_write` writes out at
+    `flush_output`, when full, or for another descriptor. A failed `random_get` or
+    `clock_time_get` traps. Initialization (the image's, which seeds the RNG through the
+    host) runs from the exported `_initialize`, as a WASI reactor's, instead of a start
+    function: a WASI host can serve calls only once the instance (its memory) exists.
+    `js/julia.mjs` implements these three functions too, for JavaScript without WASI.
+
+  The test runner (`test/runner.mjs`) runs `:js` modules with `js/julia.mjs` and `:wasi`
+  ones with Node's `node:wasi`; `WASMCODEGEN_TEST_HOST=wasi` runs the suite for WASI.
 
 Next: `IdSet` (`smallintset.c`); `deepcopy` of mutable structs (`jl_set_nth_field` of an
 object whose type is known only at run time); pointers stored in memory (the C runtime's
-thread counts); a WASI-style host interface.
+thread counts).
 
 ## 9. Output, performance
 
