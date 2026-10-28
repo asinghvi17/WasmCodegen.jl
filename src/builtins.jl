@@ -142,8 +142,28 @@ function get_field(fc::FnCtx, x::CGVal, i::Int)
     T = x.typ
     l = layout(fc, T)
     if isconstant(x) && (!ismutable(constant_value(x)) || constant_value(x) isa Type)
-        # (a type's fields are fixed once it is made)
-        return const_value(fc, getfield(constant_value(x), i))
+        return const_value(fc,getfield(constant_value(x),i))
+    end
+    if T isa Union
+        variants=Base.uniontypes(T)
+        valid=[U for U in variants if 1 <= i <= fieldcount(U)]
+        isempty(valid) && return throw_error!(fc,Runtime.throw_bounds_error,()->convert_repr(fc,x,Any),const_value(fc,i))
+        FT=Union{(fieldtype(U,i) for U in valid)...}
+        result=new_val!(fc,FT)
+        for U in valid
+            test=emit_isa!(fc,x,U)
+            push_val!(fc,test);if!(fc.b)
+            value=get_field(fc,convert_repr(fc,x,U),i)
+            assign!(fc,result,value)
+            else!(fc.b)
+        end
+        throw_error!(fc,Runtime.throw_bounds_error,()->convert_repr(fc,x,Any),const_value(fc,i))
+        for _ in valid;end!(fc.b);end
+        return result
+    end
+    nfields = try fieldcount(T) catch; nothing end
+    if nfields !== nothing && !(1 <= i <= nfields)
+        return throw_error!(fc,Runtime.throw_bounds_error,()->convert_repr(fc,x,Any),const_value(fc,i))
     end
     FT = fieldtype(T, i)
     if l.kind === Inline
