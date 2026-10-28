@@ -421,7 +421,8 @@ shared (10% smaller modules for the parser).
   imports (module `julia`): `write_byte(fd, byte)`, `entropy()` (the seed of the task's
   random number generator), `hrtime()` (`time_ns()`: a monotonic clock in nanoseconds),
   and `clock_now()` (`time()`: Float64 seconds since the Unix epoch; in JavaScript,
-  `Date.now() / 1000`).
+  `Date.now() / 1000`). `GC.enable` cannot disable the host's WasmGC collector:
+  `jl_gc_enable` ignores its argument and returns the previously enabled state, 1.
   The C runtime's globals code reads through `cglobal`: none so far but
   `jl_gc_have_pending_finalizers` (an image object holding 0). The thread counts behind
   `Threads.nthreads()` (`jl_n_threads_per_pool`, a pointer to an array) are not yet

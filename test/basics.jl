@@ -51,6 +51,20 @@ wall_clock() = time()
     @test before - 1.0 <= got <= after + 1.0
 end
 
+# This policy intentionally differs from native Julia: disabling GC is a no-op,
+# and every call reports that GC was previously enabled. Do not disable host GC.
+gc_enable_previous(on::Int32) = ccall(:jl_gc_enable, Int32, (Int32,), on)
+gc_enable_previous(on::Bool) = GC.enable(on)
+
+@testset "GC stays enabled" begin
+    raw = wcompile(gc_enable_previous, (Int32,))
+    public = wcompile(gc_enable_previous, (Bool,))
+    for on in (false, false, true, false, true)
+        @test wasm_run(raw, "gc_enable_previous", Int32(on); rettype=Int32) === Int32(1)
+        @test wasm_run(public, "gc_enable_previous", on; rettype=Bool) === true
+    end
+end
+
 i128ops(a::Int64, b::Int64) = (x = Int128(a) * Int128(b) * 1000; (x + 1, x - 7, x * 3, x ÷ 7, x % 7, x < 0, x >> 70, x << 3, leading_zeros(x), Int64(x >> 64)))
 u128div(a::UInt64, b::UInt64) = (x = UInt128(a) << 64 | b; (x ÷ UInt128(12345), x % UInt128(12345), x * x, count_ones(x)))
 cmp_rational(x::Float64) = x < 1 // 10^5

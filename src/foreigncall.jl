@@ -109,6 +109,9 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         # Base.time(): seconds since the Unix epoch, distinct from monotonic time_ns().
         call!(fc.b, host_import!(fc.cgm, "clock_now", ValType[], ValType[F64]))
         return pop_val!(fc, Float64)
+    elseif name === :jl_gc_enable
+        # WasmGC stays enabled, regardless of the requested state; it was enabled before.
+        return const_value(fc, Int32(1))
     elseif name === :jl_hrtime
         # (`time_ns`) the host's monotonic clock
         call!(fc.b, host_import!(fc.cgm, "hrtime", ValType[], ValType[I64]))
