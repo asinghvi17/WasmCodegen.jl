@@ -13,24 +13,23 @@
 
 const WASI_EBADF = 8, WASI_EINVAL = 28;
 
-// writes to the console, a line at a time (`flush()` writes an unfinished line)
+// writes to the console, a line at a time, in the order written: an unfinished line is
+// written when the other stream is written to, and by `flush()`
 function consoleWriter() {
   const decoder = new TextDecoder();
-  const pending = { 1: [], 2: [] };
-  const emit = (fd, line) => (fd === 2 ? console.error : console.log)(line);
-  const write = (fd, bytes) => {
-    const buf = pending[fd] ?? (pending[fd] = []);
+  let fd = 1, buf = [];
+  const emit = () => {
+    (fd === 2 ? console.error : console.log)(decoder.decode(new Uint8Array(buf)));
+    buf = [];
+  };
+  const write = (to, bytes) => {
+    if (to !== fd) { if (buf.length) emit(); fd = to; }
     for (const b of bytes) {
-      if (b === 10) { emit(fd, decoder.decode(new Uint8Array(buf))); buf.length = 0; }
+      if (b === 10) emit();
       else buf.push(b);
     }
   };
-  write.flush = () => {
-    for (const fd in pending) {
-      if (pending[fd].length) emit(+fd, decoder.decode(new Uint8Array(pending[fd])));
-      pending[fd] = [];
-    }
-  };
+  write.flush = () => { if (buf.length) emit(); };
   return write;
 }
 
@@ -45,8 +44,9 @@ function fillRandom(bytes) {
 
 /**
  * The imports of a module (both interfaces), to instantiate it with:
- * `{ imports, attach(instance), flush() }`. `attach` gives the WASI functions the
- * instance's memory and runs its initialization (`_initialize`), as WASI hosts do.
+ * `{ imports, attach(instance), flush() }`. For a WASI module (one exporting its memory),
+ * `attach` gives the WASI functions the instance's memory and runs its initialization
+ * (`_initialize`), as WASI hosts do; a JavaScript module initializes as it is instantiated.
  */
 export function createHost({ write } = {}) {
   const out = write ?? consoleWriter();
@@ -88,7 +88,8 @@ export function createHost({ write } = {}) {
   return {
     imports: { julia, wasi_snapshot_preview1: wasi },
     attach(instance) {
-      memory = instance.exports.memory ?? null;
+      if (!(instance.exports.memory instanceof WebAssembly.Memory)) return;
+      memory = instance.exports.memory;
       instance.exports._initialize?.();
     },
     flush() { out.flush?.(); },

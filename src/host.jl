@@ -58,6 +58,9 @@ end
 
 const WASI = "wasi_snapshot_preview1"
 
+# the exports of a WASI module that are not entry points
+const WASI_EXPORTS = ("memory", "_initialize")
+
 # the layout of the linear memory: the 8 bytes of a call's result, an iovec (the address
 # and length of bytes for `fd_write`), the count of bytes `fd_write` wrote, and the output
 # buffer (the rest of the page)

@@ -18,7 +18,7 @@ const wasiOutFd = fs.openSync(wasiOut, 'a+');
 // `host = :wasi` (it exports its memory) with Node's WASI, as a WASI runtime runs it
 async function instantiate(mod) {
   const imports = WebAssembly.Module.imports(mod);
-  if (WebAssembly.Module.exports(mod).some((e) => e.name === 'memory')) {
+  if (WebAssembly.Module.exports(mod).some((e) => e.name === 'memory' && e.kind === 'memory')) {
     for (const imp of imports) {
       if (imp.module !== 'wasi_snapshot_preview1') throw new Error('not a WASI import: ' + imp.module + '.' + imp.name);
     }
