@@ -254,6 +254,7 @@ end
 
 ## Libc.rand / Libc.srand: src/sys.c (`cong` on a global seed)
 
+# (seeded from the host's entropy when the module starts, `seed_from_host!`)
 const RAND_SEED = Ref{UInt64}(0)
 
 "`jl_srand(seed)`."
@@ -282,6 +283,7 @@ is_gc_logging_enabled() = GC_LOGGING[]
 ## the scheduler's per-thread random state (`Base.Partr.get_ptls_rng`/`set_ptls_rng`): the one
 ## thread's (src/threading.c)
 
+# (seeded from the host's entropy when the module starts, `seed_from_host!`)
 const PTLS_RNG = Ref{UInt64}(0)
 get_ptls_rng() = PTLS_RNG[]
 set_ptls_rng(seed::UInt64) = (PTLS_RNG[] = seed; nothing)

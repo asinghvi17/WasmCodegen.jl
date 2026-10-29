@@ -115,6 +115,10 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         # a constant here (`runtime_ccalls.jl`)
         v = CONST_FOREIGNCALLS[name]
         return v === nothing || typ === Nothing ? ghost(Nothing, nothing) : const_value(fc, convert(typ, v))
+    elseif name === :jl_rand || name === :jl_get_ptls_rng
+        # (the generator's state, seeded from the host's entropy when the module starts)
+        seed_from_host!(fc.cgm, name === :jl_rand ? Runtime.RAND_SEED : Runtime.PTLS_RNG)
+        return emit_runtime_ccall!(fc, runtime_ccall(name), args, typ)
     elseif (r = runtime_ccall(name)) !== nothing
         return emit_runtime_ccall!(fc, r, args, typ)
     elseif name === :jl_get_world_counter || name === :jl_get_tls_world_age

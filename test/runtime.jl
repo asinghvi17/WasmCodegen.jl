@@ -85,6 +85,10 @@ end
 # Libc.rand (`jl_rand`, `jl_srand`): the C runtime's generator, the same stream as natively
 rt_libc_rand(seed::UInt64) = (Libc.srand(seed); (Libc.rand(), Libc.rand(), Libc.rand(Float64), Libc.rand(UInt32)))
 
+# unseeded, both generators start from the host's entropy, as natively from the system's:
+# not the streams of seed 0 (whose first `Libc.rand()` is 362437)
+rt_rand_seeded(x::Int) = (Libc.rand() != UInt32(362437), Base.Partr.get_ptls_rng() != 0, x)
+
 # the GC: collection and finalizers are no-ops, weak references hold
 mutable struct RTBox; x::Int; end
 function rt_gc(x::Int)
@@ -175,6 +179,7 @@ rt_typeintersect(x::Int) = (typeintersect(x > 0 ? Vector{Int} : Vector, Abstract
     @testset "rt_gensym" begin @wtest rt_gensym(20) end
     @testset "rt_libc_rand" begin @wtest rt_libc_rand(0x000000000000002a) end
     @testset "rt_libc_rand" begin @wtest rt_libc_rand(0xffffffffffffffff) end
+    @testset "rt_rand_seeded" begin @wtest rt_rand_seeded(1) end
     @testset "rt_gc" begin @wtest rt_gc(7) end
     @testset "rt_sys" begin @wtest rt_sys(1) end
     @testset "rt_lock" begin @wtest rt_lock(3) end
