@@ -27,5 +27,6 @@ WasmCodegen.with_trim_patches() do _, _
     include("invoke_cycle.jl")
     include("idset.jl")
     include("unset.jl")
+    include("image_pointers.jl")
     include("juliac/runtests.jl")
 end
