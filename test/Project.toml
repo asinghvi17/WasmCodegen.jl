@@ -7,6 +7,7 @@ NodeJS_24_jll = "30a2228f-09fe-513d-9563-0d10bd40449a"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 WasmBuilder = "c3e9a8f2-6b1d-4f7a-8e25-1a9d3b7c4e60"
 WasmCodegen = "5b0f1d7e-3c2a-4e8b-9a61-7d2f4c8e1a93"
 

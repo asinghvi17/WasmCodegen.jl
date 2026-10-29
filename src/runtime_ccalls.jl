@@ -17,6 +17,13 @@ for (name, f, kinds) in (
         (:jl_idset_pop, Runtime.IdSets.pop, [:val, :val, :val]),
         (:jl_idset_put_key, Runtime.IdSets.put_key, [:val, :val, :val]),
         (:jl_idset_put_idx, Runtime.IdSets.put_idx, [:val, :val, :val]),
+        # the parser's operators (show of Symbol, Module and Expr, Meta.isoperator)
+        (:jl_is_operator, Runtime.Operators.is_operator, [:val]),
+        (:jl_is_unary_operator, Runtime.Operators.is_unary_operator, [:val]),
+        (:jl_is_unary_and_binary_operator, Runtime.Operators.is_unary_and_binary_operator, [:val]),
+        (:jl_is_syntactic_operator, Runtime.Operators.is_syntactic_operator, [:val]),
+        (:jl_operator_precedence, Runtime.Operators.operator_precedence, [:val]),
+        (:jl_op_suffix_char, Runtime.Operators.op_suffix_char, [:val]),
         # symbols, Libc.rand
         (:jl_gensym, Runtime.gensym, Symbol[]),
         (:jl_tagged_gensym, Runtime.tagged_gensym, [:val, :val]),
@@ -206,4 +213,88 @@ function finish_gensym_counter!(cgm::CGModule)
     l = layout(img.cgm.types, typeof(Runtime.GENSYM_COUNTER))
     push!(img.patches, (g, :struct, l.wtype, first(l.fields[1]) - 1, Runtime.native_gensym_counter(), UInt32))
     return
+end
+
+## modules (`parentmodule`, `PkgId(::Module)`, `moduleloc`)
+
+"""
+`jl_module_parent(m)`, `jl_module_uuid(m)` and `jl_module_getloc(m, line)`: modules exist in
+the module only as objects of its image, so each is a helper function (`jl_module_<what>`) over
+the image's modules, by identity, made when the module is finished (`finish_modules!`): their
+parents (added to the image until every module's is in it), UUIDs and definition sites, as
+natively.
+"""
+const MODULE_QUERIES = (:jl_module_parent, :jl_module_uuid, :jl_module_getloc)
+
+function module_query_func!(cgm::CGModule, what::Symbol)
+    get!(cgm.helpers, (:module_query, what)) do
+        jl = jlvalue_ref(cgm.types)
+        results = what === :uuid ? ValType[I64, I64] : what === :line ? ValType[I32] : ValType[jl]
+        add_func!(cgm.mod, string("jl_module_", what), ValType[jl], results)
+    end
+end
+
+function emit_module_query!(fc::FnCtx, name::Symbol, args::Vector{Any}, @nospecialize(typ))
+    m = convert_repr(fc, args[1]::CGVal, Module)
+    query(what) = (push_val!(fc, convert_repr(fc, m, Any)); call!(fc.b, module_query_func!(fc.cgm, what)))
+    if name === :jl_module_parent
+        query(:parent)
+        return convert_repr(fc, pop_val!(fc, Any), Module)
+    elseif name === :jl_module_uuid
+        query(:uuid)
+        return pop_val!(fc, NTuple{2,UInt64})
+    else
+        # the line, through the pointer if it is not null (as natively); the file, a Symbol
+        p = args[2]::CGVal
+        if !(isconstant(p) && constant_value(p) == C_NULL)
+            if !isconstant(p)
+                push_val!(fc, ptr_address(p)); emit!(fc.b, :i64_eqz); emit!(fc.b, :i32_eqz)
+                if!(fc.b)
+            end
+            query(:line)
+            ptr_store!(fc, p, pop_val!(fc, Int32), const_value(fc, 1))
+            isconstant(p) || end!(fc.b)
+        end
+        query(:file)
+        return convert_repr(fc, pop_val!(fc, Any), Symbol)
+    end
+end
+
+function finish_modules!(cgm::CGModule)
+    queries = [(k[2], f) for (k, f) in cgm.helpers if k isa Tuple && k[1] === :module_query]
+    isempty(queries) && return
+    img = cgm.image
+    modules() = Module[x for x in keys(img.globals) if x isa Module]
+    # every module's parent, and the files of their definitions, in the image
+    while true
+        ms = modules()
+        foreach(m -> object_global!(img, parentmodule(m)), ms)
+        any(q -> q[1] === :file, queries) && foreach(m -> object_global!(img, Base.moduleloc(m).file::Symbol), ms)
+        length(modules()) == length(ms) && break
+    end
+    ms = modules()
+    for (what, f) in queries
+        b = Builder(cgm.mod, f)
+        for m in ms
+            emit!(b, :local_get, 0)
+            emit!(b, :global_get, object_global!(img, m))
+            emit!(b, :ref_eq)
+            if!(b)
+            if what === :parent
+                emit!(b, :global_get, object_global!(img, parentmodule(m)))
+            elseif what === :uuid
+                lo, hi = ccall(:jl_module_uuid, NTuple{2,UInt64}, (Any,), m)
+                emit!(b, :i64_const, reinterpret(Int64, lo)); emit!(b, :i64_const, reinterpret(Int64, hi))
+            elseif what === :line
+                emit!(b, :i32_const, Int32(Base.moduleloc(m).line))
+            else
+                emit!(b, :global_get, object_global!(img, Base.moduleloc(m).file::Symbol))
+            end
+            return!(b)
+            end!(b)
+        end
+        # (a module not in the image: none exists at run time)
+        unreachable!(b)
+        finish!(b)
+    end
 end
