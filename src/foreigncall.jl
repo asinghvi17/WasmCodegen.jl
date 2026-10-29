@@ -484,6 +484,8 @@ const RUNTIME_CCALLS = Dict{Symbol,RuntimeCcall}(
     # C strings: the bytes before a NUL (a string's or symbol's end)
     :strlen => RuntimeCcall(Runtime.ptr_strlen, [:val]),
     :jl_cstr_to_string => RuntimeCcall(Runtime.cstr_to_string, [:val]),
+    # type equality (`==` of types)
+    :jl_types_equal => RuntimeCcall(Runtime.types_equal, [:val, :val]),
     # identity hash tables (`IdDict`)
     :jl_eqtable_put => RuntimeCcall(Runtime.EqTables.put, [:val, :val, :val, :val]),
     :jl_eqtable_get => RuntimeCcall(Runtime.EqTables.get, [:val, :val, :val]),

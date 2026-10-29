@@ -100,6 +100,59 @@ function finish_subtype!(cgm::CGModule)
 end
 
 """
+    typeof_any!(fc, x, typ) -> CGVal
+
+`typeof(x)` of a value of an abstract type: the type object of its type id, from a table of
+the type objects of the module's concrete types (`finish_typeof!`), which a helper looks up.
+"""
+function typeof_any!(fc::FnCtx, x::CGVal, @nospecialize(typ))
+    h = get!(fc.cgm.helpers, :typeof) do
+        jl = jlvalue_ref(fc.cgm.types)
+        add_func!(fc.cgm.mod, "jl_typeof", ValType[jl], ValType[jl])
+    end
+    # (the error of a value whose type is not one of the module's: see finish_typeof!)
+    get!(() -> runtime_function!(fc.cgm, Runtime.throw_typeof_unknown, ()), fc.cgm.helpers, :typeof_unknown)
+    push_val!(fc, convert_repr(fc, x, Any))
+    call!(fc.b, h)
+    return convert_repr(fc, pop_val!(fc, Any), typ)
+end
+
+# the table of `typeof`: by type id, the type object of each concrete type of the module (the
+# type objects themselves added by `add_reflection_types!`, before any table over types). A
+# value's type id is one of them, but for a tuple of a concrete type the module does not have
+# (an object of `Tuple`, see `tuple_canon_func!`): its `typeof` is an error.
+function finish_typeof!(cgm::CGModule)
+    h = get(cgm.helpers, :typeof, nothing)
+    h === nothing && return
+    ts, img = cgm.types, cgm.image
+    concrete(T) = T isa DataType && isconcretetype(T)
+    add_reflection_types!(cgm) == 0 || error("WasmCodegen: typeof's type objects added after the tables over types")
+    jl = jlvalue_ref(ts)
+    refs = array_type!(ts, jl)
+    n = length(ts.typelist)
+    n <= 10_000 || unsupported("typeof of a value of abstract type in a module of more than 10000 types")
+    elems = Inst[concrete(T) ? Inst(:global_get, object_global!(img, T)) : Inst(:ref_null, ts.jlvalue)
+                 for T in ts.typelist]
+    table = add_global!(cgm.mod, "jl_typeof_table", RefType(refs, false), false,
+                        Inst[elems..., Inst(:array_new_fixed, refs, n)])
+    b = Builder(cgm.mod, h)
+    r = add_local!(h, jl)
+    # (type ids are from 1; not of a concrete type: the error; a type id the table does not
+    # have cannot be a value's, as all the module's types are made before)
+    emit!(b, :global_get, table)
+    emit!(b, :local_get, 0); emit!(b, :struct_get, ts.jlvalue, 0)
+    emit!(b, :i32_const, 1); emit!(b, :i32_sub)
+    emit!(b, :array_get, refs)
+    emit!(b, :local_tee, r); emit!(b, :ref_is_null)
+    if!(b)
+    call!(b, (cgm.helpers[:typeof_unknown]::FuncInfo).func)
+    unreachable!(b)
+    end!(b)
+    emit!(b, :local_get, r)
+    finish!(b)
+end
+
+"""
     emit_map_type!(fc, f, T) -> CGVal
 
 `Runtime.map_type(f, T)`: the type `f(T)`, from a table of `f` over the module's types.
@@ -125,7 +178,7 @@ function finish_type_maps!(cgm::CGModule)
     maps = [(k[2], f) for (k, f) in cgm.helpers if k isa Tuple && k[1] === :map_type]
     isempty(maps) && return
     img = cgm.image
-    add_type_map_types!(cgm)
+    add_reflection_types!(cgm)
     types = type_objects(cgm)
     ts = cgm.types
     jl = jlvalue_ref(ts)
@@ -142,6 +195,27 @@ function finish_type_maps!(cgm::CGModule)
         emit!(b, :local_get, k)
         emit!(b, :array_get, refs)
         finish!(b)
+    end
+end
+
+# the type objects reflection on types at run time needs, before any table over types is made:
+# of the values of the module's functions of types (`add_type_map_types!`), and with `typeof`,
+# of every concrete type of the module (a value's type); each can add types for the other,
+# until neither adds any (the number of types added)
+function add_reflection_types!(cgm::CGModule)
+    ts, img = cgm.types, cgm.image
+    added = 0
+    while true
+        n0, m0 = length(ts.typelist), length(img.globals)
+        if haskey(cgm.helpers, :typeof)
+            for T in copy(ts.typelist)
+                T isa DataType && isconcretetype(T) && object_global!(img, T)
+            end
+        end
+        add_type_map_types!(cgm)
+        n1, m1 = length(ts.typelist), length(img.globals)
+        (n1 == n0 && m1 == m0) && return added
+        added += (n1 - n0) + (m1 - m0)
     end
 end
 
@@ -326,7 +400,7 @@ function compile_runtime_cases!(cgm::CGModule)
                         trim_patches=config.trim_patches, optimize=config.optimize)
     try
         while true
-            n = add_type_map_types!(cgm) + add_objectid_cases!(cgm) + add_tuple_cases!(cgm)
+            n = add_reflection_types!(cgm) + add_objectid_cases!(cgm) + add_tuple_cases!(cgm)
             n == 0 && break
             process_worklist!(cgm)
         end
