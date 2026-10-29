@@ -69,6 +69,11 @@ using ..GAliasSource: counter as renamed
 read_alias() = renamed
 end
 read_alias() = GAliasDest.read_alias()
+# a write through the original, read through the renamed import
+function write_read_alias(n::Int)
+    GAliasSource.counter = n
+    return GAliasDest.read_alias()
+end
 # a long chain of imports: one variable
 module GAliasChain
 module Hop0
@@ -97,6 +102,8 @@ end
 
 @testset "imported globals" begin
     @wtest read_alias()
+    # (compiled while GAliasSource.counter is 7)
+    @test wasm_run(WasmCodegen.compile(write_read_alias, (Int,)), "write_read_alias", 23; rettype=Int) == 23
     # (compiled while Hop0.counter is 7: the write is seen through the chain, natively 17)
     @test wasm_run(WasmCodegen.compile(read_chain, ()), "read_chain"; rettype=Int) == 17
     @test read_chain() == 17
