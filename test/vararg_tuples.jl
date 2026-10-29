@@ -37,6 +37,12 @@ kind(::Tuple{}) = 0
 kind(t::Tuple) = length(t)
 own_limit(v::VersionNumber) = kind(v.prerelease)
 end
+# a module's limit above the default still applies: four candidate methods, one call
+module MaxMethods4
+Base.Experimental.@max_methods 4
+k(::Any) = 0; k(::Int) = 1; k(::Float64) = 2; k(::Bool) = 3
+k_any(n::Int) = k(Base.inferencebarrier(isodd(n) ? n : n / 2))
+end
 function vn_maxmethods1(i::Int)
     v = VS[i]
     p = MaxMethods1.firstpre(v)
@@ -51,6 +57,8 @@ end
             end
         end
     end
+    @wtest MaxMethods4.k_any(3)
+    @wtest MaxMethods4.k_any(4)
     # (natively the call is dynamic too, but works)
     @test MaxMethods1.own_limit(VS[3]) == 2
     @test_throws WasmCodegen.UnsupportedConstructs wcompile(MaxMethods1.own_limit, (VersionNumber,))
