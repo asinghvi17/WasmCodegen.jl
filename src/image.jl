@@ -558,9 +558,12 @@ declared type), initialized with its value at compile time.
 function nonconst_global(fc::FnCtx, ref::GlobalRef)
     T, gs, def = global_var!(fc.cgm.image, ref)
     if def !== nothing
-        # not assigned yet: an UndefVarError
+        # not assigned yet (or never declared): an UndefVarError of the name in the module it
+        # is read from (an import's, not the original's), as natively
         emit!(fc.b, :global_get, def); emit!(fc.b, :i32_eqz)
-        if!(fc.b); throw_error!(fc, Runtime.throw_undefvar_error, () -> const_value(fc, ref.name)); end!(fc.b)
+        if!(fc.b)
+        throw_error!(fc, Runtime.throw_undefvar_error, () -> const_value(fc, ref.name), () -> const_value(fc, ref.mod))
+        end!(fc.b)
     end
     l = layout(fc, T)
     l.kind === Ghost && return ghost(T, something(ghost_value(T)))
@@ -570,7 +573,30 @@ function nonconst_global(fc::FnCtx, ref::GlobalRef)
     return pop_val!(fc, T)
 end
 
+"""
+    canonical_ref(world, ref) -> GlobalRef
+
+The binding `ref` is in `world`: the original of an imported one (`using M: x as y`, or an
+implicit `using`), through every import, else itself. (Only a partition of a kind importing
+a binding links to one: a constant's restriction is its value, which may be a binding.)
+"""
+function canonical_ref(world::UInt, ref::GlobalRef)
+    b = convert(Core.Binding, ref)
+    seen = IdSet{Core.Binding}()
+    while true
+        b in seen && error("WasmCodegen: a cycle of imports at ", b.globalref)
+        push!(seen, b)
+        p = Base.invoke_in_world(world, Base.lookup_binding_partition, world, b)
+        # (as the compiler's `walk_binding_partition`)
+        Base.is_some_binding_imported(Base.binding_kind(p)) || break
+        b = Base.partition_restriction(p)::Core.Binding
+    end
+    return b.globalref
+end
+
 function global_var!(img::Image, ref::GlobalRef)
+    # (a binding imported into a module, maybe renamed, is the original's: one variable)
+    ref = canonical_ref(img.cgm.world.world, ref)
     key = (ref.mod, ref.name)
     haskey(img.vars, key) && return img.vars[key]
     T = Base.invoke_in_world(img.cgm.world.world, Core.get_binding_type, ref.mod, ref.name)
