@@ -24,5 +24,6 @@ WasmCodegen.with_trim_patches() do _, _
     include("hosts.jl")
     include("ptrbytes.jl")
     include("typeof_any.jl")
+    include("invoke_cycle.jl")
     include("juliac/runtests.jl")
 end
