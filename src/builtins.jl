@@ -380,6 +380,10 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
         return outlined_memorynew!(fc, constant_value(args[1]), args[2])
     elseif f === Core._apply_iterate
         return emit_apply_iterate!(fc, args, typ)
+    elseif f === Core.fieldtype && length(args) == 2 && args[1] isa CGVal && isconstant(args[1]) &&
+           constant_value(args[1]) isa DataType && isconcretetype(constant_value(args[1])) &&
+           args[2] isa CGVal && (args[2].typ === Symbol || args[2].typ <: Integer)
+        return fieldtype_dynamic!(fc, constant_value(args[1]), args[2], typ)
     elseif f === Core.apply_type
         all(a -> a isa CGVal && isconstant(a), args) &&
             return const_value(fc, Core.apply_type(map(constant_value, args)...))
@@ -994,4 +998,36 @@ function emit_apply_iterate!(fc::FnCtx, args::Vector{Any}, @nospecialize(typ))
     emit!(fc.b, :local_get, arr)
     emit!(fc.b, :struct_new, l.wtype)
     return pop_val!(fc, typ)
+end
+
+"""
+`fieldtype(T, f)` of a concrete type `T` known at compile time and a field name (or index) `f`
+known at run time (`setproperty!` converts to it): the type of the field it names, by a chain
+of tests; a name that is not a field's is a FieldError, an index out of range a BoundsError,
+as natively.
+"""
+function fieldtype_dynamic!(fc::FnCtx, @nospecialize(T), f::CGVal, @nospecialize(typ))
+    n = fieldcount(T)
+    if f.typ === Symbol
+        idx = field_index_of!(fc, T, f)
+        push_val!(fc, idx); emit!(fc.b, :i64_eqz)
+        if!(fc.b); throw_error!(fc, Runtime.throw_field_error, () -> convert_repr(fc, const_value(fc, T), Any), f); end!(fc.b)
+    else
+        idx = convert_repr(fc, f, Int)
+        push_val!(fc, idx); emit!(fc.b, :i64_const, 1); emit!(fc.b, :i64_sub)
+        emit!(fc.b, :i64_const, n); emit!(fc.b, :i64_ge_u)
+        if!(fc.b); throw_error!(fc, Runtime.throw_bounds_error, () -> convert_repr(fc, const_value(fc, T), Any), idx); end!(fc.b)
+    end
+    # (one type for every field: that one)
+    fts = Any[fieldtype(T, k) for k in 1:n]
+    allequal(fts) && !isempty(fts) && return convert_repr(fc, const_value(fc, fts[1]), typ)
+    r = new_local!(fc, jlvalue_ref(fc.cgm.types))
+    for k in 1:n
+        push_val!(fc, idx); emit!(fc.b, :i64_const, k); emit!(fc.b, :i64_eq)
+        if!(fc.b)
+        push_val!(fc, convert_repr(fc, const_value(fc, fts[k]), Any)); emit!(fc.b, :local_set, r)
+        end!(fc.b)
+    end
+    emit!(fc.b, :local_get, r)
+    return convert_repr(fc, pop_val!(fc, Any), typ)
 end

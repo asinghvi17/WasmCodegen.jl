@@ -91,6 +91,8 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return object_ptr!(fc, args[1]::CGVal, typ)
     elseif name === :jl_new_structv
         return new_structv!(fc, args[1]::CGVal, args[2]::CGVal)
+    elseif name in MODULE_QUERIES
+        return emit_module_query!(fc, name, args, typ)
     elseif name === :jl_set_nth_field
         return set_nth_field!(fc, ex, args)
     elseif name === :jl_new_struct_uninit
