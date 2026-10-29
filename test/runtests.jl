@@ -29,5 +29,6 @@ WasmCodegen.with_trim_patches() do _, _
     include("unset.jl")
     include("image_pointers.jl")
     include("vararg_tuples.jl")
+    include("versions.jl")
     include("juliac/runtests.jl")
 end
