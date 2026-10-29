@@ -107,6 +107,7 @@ end
 function finish_module!(cgm::CGModule)
     finish_image!(cgm)
     finish_type_maps!(cgm)
+    finish_typeof!(cgm)
     finish_type_isa!(cgm)
     finish_egal!(cgm)
     finish_objectid_any!(cgm)

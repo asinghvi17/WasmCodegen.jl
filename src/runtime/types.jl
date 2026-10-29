@@ -51,3 +51,40 @@ that type's hash.
     end
     return h
 end
+
+"""
+    types_equal(a, b)
+
+`jl_types_equal(a, b)`: whether the types `a` and `b` are equal, as subtypes of each other
+(`<:` of the module's types is a table, see `reflection.jl`). `Vararg`s, which are not types,
+are equal as the C runtime compares them: of the same length (or both of no length) and of
+the same element type (`===`; a bare `Vararg`'s is `Any`). A `Vararg` and a type are not.
+(The C runtime also finds `Vararg`s equal whose element types differ only in the names of
+type variables, `Vararg{Tuple{T,T} where T}` and `Vararg{Tuple{S,S} where S}`: here they are
+not, as the fields of type objects are not read at run time.)
+"""
+function types_equal(@nospecialize(a), @nospecialize(b))
+    a === b && return Int32(1)
+    if a isa Core.TypeofVararg || b isa Core.TypeofVararg
+        a isa Core.TypeofVararg || return Int32(0)
+        b isa Core.TypeofVararg || return Int32(0)
+        va, vb = a::Core.TypeofVararg, b::Core.TypeofVararg
+        isdefined(va, :N) == isdefined(vb, :N) || return Int32(0)
+        isdefined(va, :N) && !(getfield(va, :N) === getfield(vb, :N)) && return Int32(0)
+        Ta = isdefined(va, :T) ? getfield(va, :T) : Any
+        Tb = isdefined(vb, :T) ? getfield(vb, :T) : Any
+        return Int32(Ta === Tb)
+    end
+    return Int32(((a <: b)::Bool && (b <: a)::Bool)::Bool)
+end
+
+"""
+The error of `typeof` of a tuple whose concrete type is not one of the module's (see
+`reflection.jl`). (Julia's `typeof` does not throw, so inference may have removed the
+handlers around it: the message is also written to `Core.stderr` before the error.)
+"""
+@noinline function throw_typeof_unknown()
+    msg = "WasmCodegen: typeof of a tuple whose concrete type the module does not have (no types are made at run time)"
+    Core.println(Core.stderr, msg)
+    error(msg)
+end

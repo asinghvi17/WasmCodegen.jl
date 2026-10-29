@@ -297,7 +297,8 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
     elseif f === Core.typeof
         x = args[1]::CGVal
         isconcretetype(x.typ) && return const_value(fc, x.typ)
-        return typeof_union!(fc, x, typ)
+        x.typ isa Union && all(isconcretetype, Base.uniontypes(x.typ)) && return typeof_union!(fc, x, typ)
+        return typeof_any!(fc, x, typ)
     elseif f === Core.tuple
         return make_tuple(fc, typ, CGVal[a for a in args])
     elseif f === Core.ifelse
