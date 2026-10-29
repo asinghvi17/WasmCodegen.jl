@@ -70,6 +70,22 @@ function bigwide_store(o::Int)
     GC.@preserve m poke(Ptr{UInt8}(pointer_from_objref(m)), o, 0x5a)
     return Int(m.x) + Int(m.y)
 end
+# a field of a union of isbits types is stored inline, not as isbits leaves: its bytes (the
+# value's and the selector's) are not addressable, a pointer access traps
+mutable struct BigUnion
+    buf::NTuple{65,UInt8}
+    u::Union{UInt8,UInt16}
+    x::Int
+end
+function bigunion_load(o::Int)
+    m = BigUnion(ntuple(i -> UInt8(i), Val(65)), UInt16(0x1234), 7)
+    GC.@preserve m unsafe_load(Ptr{UInt8}(pointer_from_objref(m)) + o)
+end
+function bigunion_store(o::Int)
+    m = BigUnion(ntuple(i -> UInt8(i), Val(65)), UInt16(0x1234), 7)
+    GC.@preserve m unsafe_store!(Ptr{UInt8}(pointer_from_objref(m)) + o, 0x5a)
+    return Int(m.u) + m.x
+end
 # SHA hashes (a smoke test of code reading bytes through pointers)
 import SHA
 sha_hashes(k::Int) = (s = repeat("abc", k); (hash(SHA.sha512(s)), hash(SHA.sha256(s)), hash(SHA.sha1(s))))
@@ -90,4 +106,14 @@ sha_hashes(k::Int) = (s = repeat("abc", k); (hash(SHA.sha512(s)), hash(SHA.sha25
     c = wcompile(bigbuf_store, (Int,))
     r = wasm_run(c, "bigbuf_store", 0; rettype=Int)
     @test r isa Tuple && r[1] === :trap
+    U, X = Int(fieldoffset(BigUnion, 2)), Int(fieldoffset(BigUnion, 3))
+    @wtest bigunion_load(3)
+    @wtest bigunion_load(X)
+    @wtest bigunion_store(X)
+    for o in U:X-1
+        r = wasm_run(wcompile(bigunion_load, (Int,)), "bigunion_load", o; rettype=UInt8)
+        @test r isa Tuple && r[1] === :trap
+        r = wasm_run(wcompile(bigunion_store, (Int,)), "bigunion_store", o; rettype=Int)
+        @test r isa Tuple && r[1] === :trap
+    end
 end

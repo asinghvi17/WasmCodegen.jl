@@ -663,8 +663,15 @@ function object_owners(cgm::CGModule)
         leaves = ObjectLeaf[]
         for i in 1:fieldcount(T)
             FT = fieldtype(T, i)
-            isbitstype(FT) && sizeof(FT) > 0 || continue
-            object_leaves!(leaves, ts, FT, Int(fieldoffset(T, i)), l.wtype, l.fields[i], Tuple{TypeRef,Int}[])
+            off = Int(fieldoffset(T, i))
+            if isbitstype(FT) && sizeof(FT) > 0
+                object_leaves!(leaves, ts, FT, off, l.wtype, l.fields[i], Tuple{TypeRef,Int}[])
+            elseif Base.allocatedinline(FT)
+                # stored inline but not as isbits leaves (a union of isbits types and its
+                # selector byte, a struct holding references): its bytes are not addressable
+                n = (i < fieldcount(T) ? Int(fieldoffset(T, i + 1)) : sizeof(T)) - off
+                n > 0 && push!(leaves, ObjectLeaf(nothing, I8, off, n, nothing))
+            end
         end
         isempty(leaves) || push!(owners, (Int32(id), l.wtype, leaves))
     end
