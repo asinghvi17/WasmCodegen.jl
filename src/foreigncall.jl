@@ -105,7 +105,7 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return typ === Nothing ? ghost(Nothing, nothing) : const_value(fc, zero(typ))
     elseif name === :jl_hrtime
         # (`time_ns`) the host's monotonic clock
-        call!(fc.b, host_import!(fc.cgm, "hrtime", ValType[], ValType[I64]))
+        call!(fc.b, host_func!(fc.cgm, :hrtime))
         return pop_val!(fc, UInt64)
     elseif name === :jl_module_name
         push_val!(fc, convert_repr(fc, args[1]::CGVal, Module))

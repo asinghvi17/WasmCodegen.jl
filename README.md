@@ -13,7 +13,7 @@ No Julia runtime is linked. WasmGC provides allocation and garbage collection, a
 generated code handles object layout and type tags. What libjulia's C code does
 otherwise (IO, 128-bit arithmetic, `memmove`, Unicode tables, `strtod`, hashes, random
 seeds, BLAS and LAPACK) is a small runtime written in Julia and compiled into the module on
-demand, over a few host imports.
+demand, over a few host imports (from JavaScript, or WASI).
 
 **Status: experimental.** The supported subset is what `juliac --trim=safe` accepts: no
 dynamic dispatch. Julia 1.13 is the main target, and 1.12 also works. Programs that run
@@ -43,18 +43,32 @@ write("f.wasm", c.bytes)
 ```
 
 ```js
-// node --experimental-wasm-exnref run.mjs
+// node --experimental-wasm-exnref run.mjs, with js/julia.mjs copied next to it
 import fs from 'node:fs';
-const bytes = fs.readFileSync('f.wasm');
-let out = [];
-const julia = {
-  write_byte: (fd, b) => out.push(b),     // Core.stdout / Core.stderr, as bytes
-  entropy: () => BigInt.asIntN(64, crypto.getRandomValues(new BigUint64Array(1))[0]),
-  hrtime: () => BigInt(Math.round(performance.now() * 1e6)),  // time_ns()
-};
-const { instance } = await WebAssembly.instantiate(bytes, { julia });
+import { instantiate } from './julia.mjs';
+const { instance } = await instantiate(fs.readFileSync('f.wasm'));   // output to the console
 console.log(instance.exports.f(100n));      // Int is an i64: a BigInt
-process.stdout.write(new TextDecoder().decode(new Uint8Array(out)));
+```
+
+The module imports what it needs of the host (output, a random seed, a clock), in one of
+two interfaces, `Config(host = ...)`:
+
+- `:js` (the default): a few functions of the import module `julia`, which
+  [`js/julia.mjs`](js/julia.mjs) provides (its `instantiate`, or `createHost` for the
+  imports alone). `WasmCodegen.JS_HOST` is its path, to copy next to a module.
+- `:wasi`: [WASI preview 1](https://github.com/WebAssembly/WASI/blob/main/legacy/preview1/docs.md)
+  (`fd_write`, `random_get`, `clock_time_get`), for WASI runtimes, as other languages
+  compiling to Wasm do (Go's `wasip1`, Kotlin's `wasmWasi`). The module exports its
+  `memory` (a page, for the data of WASI calls) and runs its initialization from
+  `_initialize`, as a WASI reactor; `js/julia.mjs` runs these too, where JavaScript has
+  no WASI (browsers). In Node, with `node:wasi`:
+
+```js
+import { WASI } from 'node:wasi';
+const wasi = new WASI({ version: 'preview1' });
+const { instance } = await WebAssembly.instantiate(await WebAssembly.compile(bytes), wasi.getImportObject());
+wasi.initialize(instance);
+instance.exports.f(100n);
 ```
 
 `compile` throws `UnsupportedConstructs` with the statements it cannot compile and the

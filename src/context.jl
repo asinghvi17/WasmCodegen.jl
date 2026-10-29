@@ -14,13 +14,18 @@ The configuration of the code generator:
   (`patches.jl`);
 - `trim`: as juliac's `--trim`: `:safe`, a statement the code generator cannot compile
   (dynamic dispatch, ...) is an error; `:unsafe`, it compiles to a trap where it is (an
-  error if it runs), recorded in the diagnostics.
+  error if it runs), recorded in the diagnostics;
+- `host`: the interface to the host the module imports (`host.jl`): `:js`, the functions
+  of the import module `julia`, which `js/julia.mjs` provides; `:wasi`, WASI preview 1
+  (`wasi_snapshot_preview1`), for WASI runtimes (wasmtime, Node's `node:wasi`) and for
+  JavaScript through `js/julia.mjs`.
 """
 Base.@kwdef struct Config
     on_unsupported::Symbol = :error
     verify::Symbol = :warn
     trim_patches::Bool = true
     trim::Symbol = :safe
+    host::Symbol = :js
     "Binaryen's `wasm-opt` options the module is optimized with (`nothing`: not optimized).
     The code generator emits simple code (a local per value) and leaves allocating locals,
     putting values on the operand stack and the rest to it."

@@ -10,15 +10,21 @@ concurrency:
   cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
 jobs:
   test:
-    name: Julia ${{ matrix.version }}
+    name: Julia ${{ matrix.version }}${{ matrix.host == 'wasi' && ' (WASI)' || '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         version: ['1.12', '1.13']
+        host: ['js']
+        include:
+          # the suite compiled for WASI (`Config(host = :wasi)`), run by Node's node:wasi
+          - version: '1.13'
+            host: 'wasi'
     env:
       WASM_TOOLS_VERSION: '1.262.0'
+      WASMCODEGEN_TEST_HOST: ${{ matrix.host }}
     steps:
       - uses: actions/checkout@v4
       - name: Install wasm-tools (independent validation)

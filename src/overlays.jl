@@ -39,8 +39,10 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
         fd, b = CGVal[operand(fc, a) for a in ex.args[3:end]]
         push_val!(fc, convert_repr(fc, fd, Int32))
         push_val!(fc, convert_repr(fc, b, UInt8))
-        call!(fc.b, host_import!(fc.cgm, "write_byte", ValType[I32, I32], ValType[]))
+        call!(fc.b, host_func!(fc.cgm, :write_byte))
         return ghost(Nothing, nothing)
+    elseif m.module === Runtime.IO && m.name === :flush_output
+        return emit_flush_output!(fc)
     elseif m.module === Runtime && m.name === :map_type
         f = mi.specTypes.parameters[2]
         return emit_map_type!(fc, f.instance, operand(fc, ex.args[4]))
@@ -66,12 +68,3 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
     end
     return nothing
 end
-
-"""
-    host_import!(cgm, name, params, results) -> Func
-
-The function `name` the host provides (import module `julia`), the runtime's interface to
-the world outside: see the loader for what each one does.
-"""
-host_import!(cgm::CGModule, name::AbstractString, params::Vector{ValType}, results::Vector{ValType}) =
-    add_import!(cgm.mod, "julia", name, params, results)

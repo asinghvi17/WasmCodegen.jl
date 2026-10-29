@@ -1,13 +1,9 @@
 // node check.mjs [brusselator.wasm]: solve with each linear solver, print the counts, the
 // time and a checksum of the solution (native.jl prints the same for native Julia)
 import fs from 'node:fs';
+import { instantiate } from '../../js/julia.mjs';
 const bytes = fs.readFileSync(process.argv[2] ?? new URL('brusselator.wasm', import.meta.url));
-const julia = {
-  write_byte: () => {},
-  entropy: () => 0n,
-  hrtime: () => BigInt(Math.round(performance.now() * 1e6)),
-};
-const { instance } = await WebAssembly.instantiate(bytes, { julia });
+const { instance } = await instantiate(bytes);
 const e = instance.exports;
 const names = ['GenericLUFactorization', 'PureKLUFactorization', 'KrylovJL_GMRES'];
 const N = e.bz_n();

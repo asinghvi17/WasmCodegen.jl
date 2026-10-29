@@ -122,7 +122,7 @@ end
 
 The task the module's code runs in (`current_task()`): a `Task` object, its fields zero
 or empty but for its random number generator's state (`rngState0` ... `rngState4`), seeded
-at start from the host (`julia.entropy`), as Julia seeds the root task from the system's
+at start from the host (its `entropy`, `host.jl`), as Julia seeds the root task from the system's
 entropy.
 """
 function current_task_global!(cgm::CGModule)
@@ -146,7 +146,7 @@ function current_task_global!(cgm::CGModule)
         w = first(l.fields[Base.fieldindex(Task, name)]) - 1
         push!(cgm.image.init, Inst(:global_get, g), Inst(:global_get, nothing_g), Inst(:struct_set, l.wtype, w))
     end
-    entropy = host_import!(cgm, "entropy", ValType[], ValType[I64])
+    entropy = host_func!(cgm, :entropy)
     for i in 0:4
         w = first(l.fields[Base.fieldindex(Task, Symbol("rngState", i))]) - 1
         push!(cgm.image.init, Inst(:global_get, g), Inst(:call, entropy), Inst(:struct_set, l.wtype, w))

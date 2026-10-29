@@ -4,7 +4,7 @@ cache_prog(x::Float64) = sum(sin(x + i) * cos(i * x) for i in 1:5) + (x > 1 ? x^
 
 @testset "structured-IR cache" begin
     WasmCodegen.empty_ir_cache!()
-    cfg(c) = WasmCodegen.Config(optimize = nothing, ir_cache = c)
+    cfg(c) = test_config(optimize = nothing, ir_cache = c)
     plain = WasmCodegen.compile(cache_prog, (Float64,); config = cfg(false))
     @test WasmCodegen.ir_cache_stats().entries == 0          # off: nothing kept
     filled = WasmCodegen.compile(cache_prog, (Float64,); config = cfg(true))
