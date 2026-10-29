@@ -19,6 +19,9 @@ The configuration of the code generator:
   of the import module `julia`, which `js/julia.mjs` provides; `:wasi`, WASI preview 1
   (`wasi_snapshot_preview1`), for WASI runtimes (wasmtime, Node's `node:wasi`) and for
   JavaScript through `js/julia.mjs`.
+- `image_pointer_fields`: the `(type, field name)`s whose pointers of the build process
+  (addresses without an owner) the image may hold as they are; any other non-null one is an
+  unsupported construct.
 """
 Base.@kwdef struct Config
     on_unsupported::Symbol = :error
@@ -36,6 +39,7 @@ Base.@kwdef struct Config
     behind a model-independent interface. Emission only reads the structured IR, so it is reused
     as it is. See `ir_cache_stats`, `empty_ir_cache!`."
     ir_cache::Bool = false
+    image_pointer_fields::Vector{Tuple{Any,Symbol}} = Tuple{Any,Symbol}[]
 end
 
 """

@@ -122,15 +122,16 @@ end
 The leaves of the value `x` stored where the declared type is `FT` (a field, an
 element): constant instructions, `global.get`s of objects.
 """
-function const_leaves(img::Image, @nospecialize(x), @nospecialize(FT))
+function const_leaves(img::Image, @nospecialize(x), @nospecialize(FT); raw_pointer::Bool=false)
     ts = types(img)
     lf = layout(ts, FT)
     lf.kind === Ghost && return Inst[]
     if lf.kind === Inline
         T = typeof(x)
-        # a pointer from the build process: an address without owner
-        is_ptr_type(T) && return Inst[Inst(:i64_const, reinterpret(Int64, UInt64(UInt(x)))),
-                                      Inst(:ref_null, ts.jlvalue)]
+        if is_ptr_type(T)
+            check_build_pointer(x, raw_pointer)
+            return Inst[Inst(:i64_const, reinterpret(Int64, reinterpret(UInt64, x))), Inst(:ref_null, ts.jlvalue)]
+        end
         isprimitivetype(T) && return primitive_const(x, lf.leaves)
         if is_memoryref_type(T)
             mem = x.mem
@@ -144,7 +145,8 @@ function const_leaves(img::Image, @nospecialize(x), @nospecialize(FT))
         for i in 1:fieldcount(T)
             FTi = fieldtype(S, i)
             if isdefined(x, i)
-                append!(leaves, const_leaves(img, getfield(x, i), FTi))
+                raw = (T, fieldname(T, i)) in img.cgm.config.image_pointer_fields
+                append!(leaves, const_leaves(img, getfield(x, i), FTi; raw_pointer=raw))
             else
                 append!(leaves, Inst[default_inst(l.type) for l in field_leaves(ts, FTi)])
             end
@@ -153,7 +155,7 @@ function const_leaves(img::Image, @nospecialize(x), @nospecialize(FT))
     end
     # a reference
     if lf.wtype == ts.jlvalue
-        return Inst[Inst(:global_get, boxed_object_global!(img, x))]
+        return Inst[Inst(:global_get, boxed_object_global!(img, x; raw_pointer))]
     elseif lf.elements !== nothing && layout(ts, typeof(x)).wtype != lf.wtype
         # a tuple stored where the declared type is a tuple of unknown length (`VersionNumber`'s
         # `prerelease`) of another storage of its elements: an array object of the declared
@@ -164,6 +166,18 @@ function const_leaves(img::Image, @nospecialize(x), @nospecialize(FT))
     return Inst[Inst(:global_get, object_global!(img, x))]
 end
 
+# A pointer from the build process: an address without owner, which means nothing in Wasm.
+# Only a null pointer, or one in a field allowlisted by `Config(image_pointer_fields)`, is
+# serialized (as its address).
+function check_build_pointer(@nospecialize(x), raw_pointer::Bool)
+    addr = reinterpret(UInt64, x)
+    addr == 0 || raw_pointer ||
+        unsupported("a pointer of the build process in the image (a ", typeof(x), " of address 0x",
+                    string(addr, base=16), "): serialize it as C_NULL (sanitize the global ",
+                    "before compiling) or allowlist its field with Config(image_pointer_fields)")
+    return nothing
+end
+
 ## objects
 
 """
@@ -172,7 +186,7 @@ end
 A global holding `x` as a `\$JlValue`: its object if it is one, else a box (for inline
 values, ghosts, `Memory` and `String`).
 """
-function boxed_object_global!(img::Image, @nospecialize(x))
+function boxed_object_global!(img::Image, @nospecialize(x); raw_pointer::Bool=false)
     ts = types(img)
     T = typeof(x)
     l = layout(ts, T)
@@ -181,11 +195,13 @@ function boxed_object_global!(img::Image, @nospecialize(x))
     elseif l.kind === Ghost
         return singleton_global!(img, T)
     end
+    # (a pointer, where it is boxed: checked at each use, as equal pointers share a box)
+    is_ptr_type(T) && check_build_pointer(x, raw_pointer)
     # isbits values are boxed once per value; others (Memory, String) per object
     get!(img.boxes, x) do
         box = box_type!(ts, T)
         init = Inst[Inst(:i32_const, typeid!(ts, T)), Inst(:i32_const, 0)]
-        append!(init, const_leaves(img, x, T))
+        append!(init, const_leaves(img, x, T; raw_pointer))
         push!(init, Inst(:struct_new, box))
         add_global!(img.cgm.mod, global_name(img, x), RefType(box, false), false, init)
     end
@@ -326,7 +342,8 @@ end
 
 # the leaves of the field value `v` (declared type FT) of an object being serialized, with
 # null for references to objects being serialized (cycles), recorded in `back`
-function field_init!(img::Image, @nospecialize(v), @nospecialize(FT), back::Vector{Any}, slot)
+function field_init!(img::Image, @nospecialize(v), @nospecialize(FT), back::Vector{Any}, slot;
+                     raw_pointer::Bool=false)
     ts = types(img)
     lf = layout(ts, FT)
     if lf.kind === Boxed
@@ -336,7 +353,7 @@ function field_init!(img::Image, @nospecialize(v), @nospecialize(FT), back::Vect
             return Inst[Inst(:ref_null, lf.leaves[1].type.heap)]
         end
     end
-    return const_leaves(img, v, FT)
+    return const_leaves(img, v, FT; raw_pointer)
 end
 
 function struct_global!(img::Image, @nospecialize(x), l::Layout)
@@ -349,7 +366,8 @@ function struct_global!(img::Image, @nospecialize(x), l::Layout)
         for i in 1:fieldcount(T)
             FT = fieldtype(T, i)
             if isdefined(x, i)
-                append!(init, field_init!(img, getfield(x, i), FT, back, first(l.fields[i]) - 1))
+                raw = (T, fieldname(T, i)) in img.cgm.config.image_pointer_fields
+                append!(init, field_init!(img, getfield(x, i), FT, back, first(l.fields[i]) - 1; raw_pointer=raw))
             else
                 append!(init, Inst[default_inst(leaf.type) for leaf in field_leaves(ts, FT)])
             end
