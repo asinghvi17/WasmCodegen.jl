@@ -584,26 +584,87 @@ function byte_owners(cgm::CGModule)
     return owners
 end
 
+"""
+    ObjectLeaf
+
+A leaf of the isbits fields of a mutable object, `n` bytes at byte offset `off` of the
+object: its value is reached from the object by `steps`, (struct type, 0-based field)
+pairs, each but the first applied to the reference the previous one read (cast to its
+struct type), and has storage `storage`. A field of more than `MAX_INLINE_LEAVES` leaves is
+one reference: to a boxed immutable value (more steps) or to a large tuple's array
+(`elem` = (array type, element size): the byte's element is found at run time). With
+`steps === nothing` its bytes are not addressable (a pointer access traps).
+"""
+struct ObjectLeaf
+    steps::Union{Nothing,Vector{Tuple{TypeRef,Int}}}
+    storage::StorageType
+    off::Int
+    n::Int
+    elem::Union{Nothing,Tuple{TypeRef,Int}}
+end
+
+# the leaves of a value of the isbits type `FT` at byte offset `off`, stored in the Wasm
+# fields `ws` (1-based) of the struct type `st` reached by `steps`
+function object_leaves!(out::Vector{ObjectLeaf}, ts::Types, @nospecialize(FT), off::Int,
+                        st::TypeRef, ws, steps::Vector{Tuple{TypeRef,Int}})
+    fields = (typedef(ts.mod, st).comp::StructType).fields
+    l = layout(ts, FT)
+    if l.kind === Ghost || l.kind === Bottom
+        return out
+    elseif l.kind === Inline && (isprimitivetype(FT) || is_ptr_type(FT))
+        bl = bit_leaves(FT, off)
+        length(bl) == length(ws) || return push!(out, ObjectLeaf(nothing, I8, off, sizeof(FT), nothing))
+        for ((P, poff), w) in zip(bl, ws)
+            P === :owner && continue
+            push!(out, ObjectLeaf([steps; (st, w - 1)], fields[w].storage, poff, nbytes(P), nothing))
+        end
+    elseif l.kind === Inline
+        for j in 1:fieldcount(FT)
+            FTj = fieldtype(FT, j)
+            sizeof(FTj) == 0 && continue
+            object_leaves!(out, ts, FTj, off + Int(fieldoffset(FT, j)), st, ws[l.fields[j]], steps)
+        end
+    elseif l.kind === Boxed && length(ws) == 1
+        # a large immutable value: a reference to its box, or to its tuple's array
+        inner = [steps; (st, only(ws) - 1)]
+        if l.elements !== nothing
+            ml = l.elements
+            E = fieldtype(FT, 1)
+            if isprimitivetype(E) && !ml.boxed && ml.storage isa Union{NumType,PackedType} &&
+               storage_bytes(ml.storage) >= sizeof(E) && !(E <: Ptr)
+                push!(out, ObjectLeaf([inner; (l.wtype, HEADER_FIELDS)], ml.storage, off,
+                                      sizeof(FT), (ml.array, sizeof(E))))
+            else
+                push!(out, ObjectLeaf(nothing, I8, off, sizeof(FT), nothing))
+            end
+        else
+            for j in 1:fieldcount(FT)
+                FTj = fieldtype(FT, j)
+                sizeof(FTj) == 0 && continue
+                object_leaves!(out, ts, FTj, off + Int(fieldoffset(FT, j)), l.wtype, l.fields[j], inner)
+            end
+        end
+    else
+        push!(out, ObjectLeaf(nothing, I8, off, sizeof(FT), nothing))
+    end
+    return out
+end
+
 # the mutable objects whose bytes are addressable (a `Ref` a pointer was taken to), by
-# type id: their Wasm struct type and the leaves of their isbits fields, as (Wasm field
-# index, storage, byte offset, byte size)
+# type id: their Wasm struct type and the leaves of their isbits fields
 function object_owners(cgm::CGModule)
     ts = cgm.types
-    owners = Tuple{Int32,TypeRef,Vector{Tuple{Int,StorageType,Int,Int}}}[]
+    owners = Tuple{Int32,TypeRef,Vector{ObjectLeaf}}[]
     for (id, T) in enumerate(copy(ts.typelist))
         (T isa DataType && isconcretetype(T) && ismutabletype(T) && !is_memory_type(T) &&
          !(T <: Task) && !any(R -> T === R, RUNTIME_TYPES)) || continue
         l = layout(ts, T)
         l.kind === Boxed || continue
-        fields = (typedef(cgm.mod, l.wtype).comp::StructType).fields
-        leaves = Tuple{Int,StorageType,Int,Int}[]
+        leaves = ObjectLeaf[]
         for i in 1:fieldcount(T)
             FT = fieldtype(T, i)
             isbitstype(FT) && sizeof(FT) > 0 || continue
-            for ((P, off), w) in zip(bit_leaves(FT, Int(fieldoffset(T, i))), l.fields[i])
-                P === :owner && continue
-                push!(leaves, (w - 1, fields[w].storage, off, nbytes(P)))
-            end
+            object_leaves!(leaves, ts, FT, Int(fieldoffset(T, i)), l.wtype, l.fields[i], Tuple{TypeRef,Int}[])
         end
         isempty(leaves) || push!(owners, (Int32(id), l.wtype, leaves))
     end
@@ -659,35 +720,61 @@ function replace_byte!(b::Builder, boff::Int)
     emit!(b, :i64_or)
 end
 
+# push the value a leaf's steps reach from the object in the local `obj` (the last read
+# as storage `stg` when it is the leaf's value)
+function push_leaf_steps!(b::Builder, obj::Int, steps, stg::Union{Nothing,StorageType})
+    emit!(b, :local_get, obj)
+    for (k, (sst, w)) in enumerate(steps)
+        k > 1 && emit!(b, :ref_cast, sst)
+        emit!(b, k == length(steps) && stg isa PackedType ? :struct_get_u : :struct_get, sst, w)
+    end
+end
+
 # the byte at offset `off` of a mutable object of struct type `st` (local 1), among its
-# isbits leaves; a padding byte reads as zero
+# isbits leaves; a padding byte reads as zero. A byte of a large immutable field (in a box
+# or a tuple's array, which other values may share) is read there; storing into it, or
+# accessing a byte whose field isn't addressable, traps
 function object_byte_access!(b::Builder, f::Func, kind::Symbol, off::Int, boff::Int,
-                             st::TypeRef, leaves, objs::Dict{TypeRef,Int})
+                             st::TypeRef, leaves::Vector{ObjectLeaf}, objs::Dict{TypeRef,Int})
     obj = get!(() -> add_local!(f, RefType(st, true)), objs, st)
     emit!(b, :local_get, 1); emit!(b, :ref_cast, st); emit!(b, :local_set, obj)
-    for (w, stg, loff, n) in leaves
+    for lf in leaves
+        stg = lf.storage
         # the byte offset into the leaf, if within it
-        emit!(b, :local_get, off); emit!(b, :i64_const, loff); emit!(b, :i64_sub)
+        emit!(b, :local_get, off); emit!(b, :i64_const, lf.off); emit!(b, :i64_sub)
         emit!(b, :local_set, boff)
-        emit!(b, :local_get, boff); emit!(b, :i64_const, n); emit!(b, :i64_lt_u)
+        emit!(b, :local_get, boff); emit!(b, :i64_const, lf.n); emit!(b, :i64_lt_u)
         if!(b)
-        if kind === :load
-            emit!(b, :local_get, obj)
-            emit!(b, stg isa PackedType ? :struct_get_u : :struct_get, st, w)
+        if lf.steps === nothing || (kind === :store && (length(lf.steps) > 1 || lf.elem !== nothing))
+            unreachable!(b)
+        elseif kind === :load && lf.elem !== nothing
+            at, s = lf.elem
+            push_leaf_steps!(b, obj, lf.steps, nothing)
+            emit!(b, :ref_cast, at)
+            emit!(b, :local_get, boff)
+            s != 1 && (emit!(b, :i64_const, s); emit!(b, :i64_div_u))
+            emit!(b, :i32_wrap_i64)
+            get_elem_bits!(b, at, stg)
+            push_byte_shift!(b, boff, s)
+            emit!(b, :i64_shr_u)
+            emit!(b, :i32_wrap_i64); emit!(b, :i32_const, 0xff); emit!(b, :i32_and)
+        elseif kind === :load
+            push_leaf_steps!(b, obj, lf.steps, stg)
             storage_to_bits!(b, stg)
             emit!(b, :local_get, boff); emit!(b, :i64_const, 8); emit!(b, :i64_mul)
             emit!(b, :i64_shr_u)
             emit!(b, :i32_wrap_i64); emit!(b, :i32_const, 0xff); emit!(b, :i32_and)
         else
+            sst, w = only(lf.steps)
             emit!(b, :local_get, obj)
             emit!(b, :local_get, obj)
-            emit!(b, stg isa PackedType ? :struct_get_u : :struct_get, st, w)
+            emit!(b, stg isa PackedType ? :struct_get_u : :struct_get, sst, w)
             storage_to_bits!(b, stg)
             replace_byte!(b, boff)
             bits_to_storage!(b, stg)
-            emit!(b, :struct_set, st, w)
+            emit!(b, :struct_set, sst, w)
         end
-        return!(b)
+        lf.steps === nothing || (kind === :store && (length(lf.steps) > 1 || lf.elem !== nothing)) || return!(b)
         end!(b)
     end
     kind === :load && emit!(b, :i32_const, 0)
