@@ -630,6 +630,15 @@ function emit_egal!(fc::FnCtx, a::CGVal, b::CGVal)
         # a singleton against a boxed value: its object
         g, o = la.kind === Ghost ? (a, b) : (b, a)
         lo = layout(fc, o.typ)
+        if is_vararg_tuple(o.typ) && lo.kind === Boxed && lo.elements !== nothing && g.typ === Tuple{}
+            # a tuple of unknown length (an array object) is `()` iff it is empty (other
+            # singleton tuples, `(nothing,)`, are not compared: unsupported below)
+            push_val!(fc, o)
+            emit!(fc.b, :struct_get, lo.wtype, DATA_FIELD)
+            emit_memory_length!(fc, lo.elements)
+            emit!(fc.b, :i32_eqz)
+            return pop_val!(fc, Bool)
+        end
         lo.kind === Boxed && lo.wtype == fc.cgm.types.jlvalue ||
             unsupported("=== of ", Ta, " and ", Tb)
         push_val!(fc, o)
