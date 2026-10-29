@@ -53,6 +53,8 @@ function compile_in_world(entries::Vector{Entry}, config::Config, validate::Bool
         config.host === :wasi && e.name in WASI_EXPORTS &&
             throw(ArgumentError("the entry point $(e.f) is exported as \"$(e.name)\", a name WASI reserves: give it another (`Entry(f, argtypes; name)`)"))
     end
+    # (the module's gensyms continue the build process's: none repeats one the image holds)
+    Runtime.sync_gensym_counter!()
     mis = Core.MethodInstance[entry_instance(e.f, e.argtypes; world) for e in entries]
     w = collect_world(mis; world, verify=config.verify)
     mode = exception_mode(w)
@@ -105,6 +107,7 @@ end
 
 # (the image first, then the type maps, which add types: the tables over types after them)
 function finish_module!(cgm::CGModule)
+    finish_gensym_counter!(cgm)
     finish_image!(cgm)
     finish_type_maps!(cgm)
     finish_typeof!(cgm)
