@@ -66,3 +66,22 @@ ptr_strlen(p::Cstring) = ptr_strlen(convert(Ptr{UInt8}, p))
 "`jl_cstr_to_string(p)`: a String of the bytes at `p` before a NUL."
 cstr_to_string(p::Ptr{UInt8}) = unsafe_string(p, ptr_strlen(p))
 cstr_to_string(p::Cstring) = cstr_to_string(convert(Ptr{UInt8}, p))
+
+"""
+    unset_element!(r::MemoryRef)
+
+Makes the element `r` refers to undefined, as Base's `_unsetindex!` does to an element
+stored inline that holds references (by storing null pointers over it). A primitive of the
+code generator: the element's box, or each of its reference leaves, becomes null (Wasm has
+no pointers into it); natively, Base's stores. Only for such elements (`trim/wasm-memory.jl`).
+"""
+@noinline function unset_element!(r::MemoryRef{T}) where {T}
+    mem = r.mem
+    t = Base.@_gc_preserve_begin mem
+    p = Ptr{Ptr{Cvoid}}(pointer(r))
+    for j = 1:Core.sizeof(Ptr{Cvoid}):Base.datatype_layoutsize(typeof(mem))
+        Core.Intrinsics.atomic_pointerset(p + j - 1, C_NULL, :monotonic)
+    end
+    Base.@_gc_preserve_end t
+    return nothing
+end
