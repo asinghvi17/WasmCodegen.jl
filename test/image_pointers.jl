@@ -89,3 +89,13 @@ end
     @test wasm_run(c, "read_csh"; rettype=Tuple{UInt,UInt}) == (UInt(0x5000), UInt(0)) == P.read_csh()
 end
 
+# the runtime's Unicode tables have no unused capacity (the image serializes all of a Memory)
+@testset "image: Unicode tables" begin
+    U = WasmCodegen.Runtime.UnicodeData
+    for name in (:CATEGORY, :ID_CHAR, :ID_START_CHAR, :BOUNDCLASS, :INDIC_CONJUNCT, :IS_UPPER,
+                 :CHARWIDTH, :IS_LOWER, :TO_UPPER, :TO_LOWER, :TO_TITLE)
+        for v in getfield(U, name)
+            @test length(v.ref.mem) == length(v)
+        end
+    end
+end

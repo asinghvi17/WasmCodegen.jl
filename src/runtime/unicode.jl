@@ -19,7 +19,9 @@ function runs(f, ::Type{T}=Int8) where {T}
             prev = v
         end
     end
-    return (starts, values)
+    # (copies without the capacity `push!` left: the image holds every element of the memory,
+    # and those past the end are whatever the build process's heap held there)
+    return (copy(starts), copy(values))
 end
 
 # the value of the run holding `c`, or `invalid` past the last code point
