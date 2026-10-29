@@ -100,6 +100,29 @@ function object_ptr!(fc::FnCtx, x::CGVal, @nospecialize(T))
     return new_ptr!(fc, T, owner, PtrOrigin(owner, nothing, nothing, x.typ))
 end
 
+"""
+The object the pointer `p` points to (`unsafe_pointer_to_objref`): its owner. Traps when `p`
+has no owner (it was made from an integer, or lost its owner) or is not at the owner's base
+address. As the owner follows the pointer, not its address, a pointer moved by arithmetic from
+one object to another (`p + (q - p)` keeps `p`'s owner) traps, where natively it gives the
+object at that address. The pointers to the data of a String, a Symbol's name or a Memory have
+that base too, so they give the String, Symbol or Memory (natively they do not point to an
+object, and the result is undefined).
+"""
+function pointer_object!(fc::FnCtx, p::CGVal)
+    o = new_local!(fc, jlvalue_ref(fc.cgm.types))
+    push_leaf!(fc, ptr_owner(p))
+    emit!(fc.b, :local_tee, o)
+    emit!(fc.b, :ref_is_null)
+    if!(fc.b); unreachable!(fc.b); end!(fc.b)
+    x = CGVal(Any, Boxed, LeafVal[o])
+    push_leaf!(fc, p.leaves[1])
+    push_memory_base!(fc, x)
+    emit!(fc.b, :i64_ne)
+    if!(fc.b); unreachable!(fc.b); end!(fc.b)
+    return x
+end
+
 "`p + off` (or `p - off`): the same owner, the address moved."
 function ptr_offset!(fc::FnCtx, p::CGVal, off::CGVal, add::Bool)
     push_leaf!(fc, p.leaves[1])
