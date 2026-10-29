@@ -61,6 +61,20 @@ function emit_intrinsic_call!(fc::FnCtx, mi::Core.MethodInstance, ex::Expr, @nos
         push_default!(fc, ml.storage)
         emit!(fc.b, :array_set, ml.array)
         return ghost(Nothing, nothing)
+    elseif m.module === Runtime && m.name === :unset_element!
+        # the element's box (an element per array element) or each of its reference leaves,
+        # null: undefined (`emit_memoryref_isassigned!`)
+        r = operand(fc, ex.args[3])
+        E = ref_eltype(r.typ)
+        ml = memory_layout(fc.cgm.types, E)
+        ml.storage isa RefType && (ml.boxed || all(l -> l.type isa RefType, ml.elem.leaves)) ||
+            unsupported("unsetting an element of ", E)
+        for k in 0:(ml.boxed ? 0 : ml.stride - 1)
+            push_element_address!(fc, r, ml, k)
+            emit!(fc.b, :ref_null, (ml.storage::RefType).heap)
+            emit!(fc.b, :array_set, ml.array)
+        end
+        return ghost(Nothing, nothing)
     elseif m.module === Runtime && m.name === :reinterpret_bits
         Out = mi.specTypes.parameters[2].parameters[1]
         In = mi.specTypes.parameters[3]
