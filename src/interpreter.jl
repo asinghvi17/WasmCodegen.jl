@@ -83,6 +83,16 @@ function fold_target_intrinsic(@nospecialize(f), argtypes::Vector{Any})
     return CC.CallMeta(CC.Const(false), Union{}, CC.EFFECTS_TOTAL, CC.NoCallInfo())
 end
 
+# A module's `Base.Experimental.@max_methods` (Pkg sets 1 for its modules) limits the
+# methods inference considers at a call to save latency in a session that may define more:
+# with more candidates the call stays dynamic. A closed world has no later methods and no
+# dynamic dispatch to fall back on, so it infers with at least the default limit (a module's
+# higher one still applies, and a function's own `@max_methods`): `isempty(v.prerelease)` (a
+# `Tuple{Vararg{...}}`, two candidate methods) is then the union-split call it is outside
+# such modules (the module's limit; `get_max_methods(interp, f, sv)` asks the function's own first)
+CC.get_max_methods(interp::WasmInterpreter, sv::CC.AbsIntState) =
+    max(something(CC.get_max_methods_for_module(sv), 0), CC.get_max_methods(interp))
+
 function CC.abstract_call_known(interp::WasmInterpreter, @nospecialize(f),
                                 arginfo::CC.ArgInfo, si::CC.StmtInfo, sv::CC.InferenceState,
                                 max_methods::Int=CC.get_max_methods(interp, f, sv))
