@@ -48,6 +48,14 @@ function vn_print_ctx(i::Int)
     return (sizeof(s), hash(s), hash(sprint(print, VS[i])), hash(sprint(show, VS[i])))
 end
 
+# the text Base prints, as literals (`@wtest`'s native references run the patched methods)
+const VS_TEXT = ["1.2.3", "1.2.3-alpha", "1.2.3-alpha.1", "1.2.3+build.7", "1.2.3-rc.2+b5",
+                 "0.0.0", "1.13.2", "1.13.2-DEV.1+abc.2", "2.0.0-0.3.7", "1.0.0-x.7.z.92"]
+const SPECIAL = (v"0-", v"1+", VMAX)
+const SPECIAL_TEXT = ("0.0.0-", "1.0.0+", "∞")
+vn_text(i::Int) = string(VS[i]) == VS_TEXT[i] && repr(VS[i]) == string("v\"", VS_TEXT[i], "\"")
+vn_special_text(k::Int) = string(SPECIAL[k]) == SPECIAL_TEXT[k]
+
 # as in Pkg's modules: one method per call
 module MaxMethods1
 Base.Experimental.@max_methods 1
@@ -69,6 +77,16 @@ end
         end
     end
     @testset "Dict" begin @wtest vn_dict(3) end
+    @testset "text" begin
+        for i in 1:N
+            @test vn_text(i)
+            @wtest vn_text(i)
+        end
+        for k in 1:length(SPECIAL)
+            @test vn_special_text(k)
+            @wtest vn_special_text(k)
+        end
+    end
     @testset "hash against Base's recursive definition" begin
         c = wcompile(vn_parts_hash, (Int,))
         for i in 1:N
