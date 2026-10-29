@@ -60,6 +60,11 @@ export function createHost({ write } = {}) {
       return BigInt.asIntN(64, w[0]);
     },
     hrtime: monotonicNs,
+    // seconds since the Unix epoch, to the microsecond (as gettimeofday's)
+    clock_now: () => {
+      const t = realtimeNs();
+      return Number(t / 1000000000n) + Number((t % 1000000000n) / 1000n) * 1e-6;
+    },
   };
   const wasi = {
     fd_write(fd, iovs, iovsLen, nwrittenPtr) {

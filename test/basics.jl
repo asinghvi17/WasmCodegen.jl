@@ -180,6 +180,20 @@ end
 # the module does not have (not `unsafe_pointer_to_objref` of the pointer)
 objref_boxed_ptr(n::Int) = ccall(:jl_value_ptr, Ptr{Cvoid}, (Any,), Ptr{Cvoid}(n)) != C_NULL
 
+# a constant field index out of a type's fields: a BoundsError at run time, as natively
+function field_oob(x::Float64)
+    nt = (a=x, b=2x)
+    try
+        getfield(nt, 3)
+    catch e
+        e isa BoundsError ? -1.0 : -2.0
+    end
+end
+
+@testset "fields" begin
+    @wtest field_oob(1.5)
+end
+
 @testset "pointers" begin
     @wtest objref_roundtrip(3)
     @wtest objref_roundtrip(4)

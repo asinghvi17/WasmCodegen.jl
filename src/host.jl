@@ -1,12 +1,12 @@
 # The host interface: what the module needs of the world outside it. The runtime's host
 # primitives are writing bytes to stdout or stderr (`write_byte`, then `flush_output` when
-# a write completes), entropy for the seed of the random number generator (`entropy`) and
-# a monotonic clock in nanoseconds (`hrtime`). `Config(host = ...)` chooses how the module
-# imports them:
+# a write completes), entropy for the seed of the random number generator (`entropy`), a
+# monotonic clock in nanoseconds (`hrtime`) and the time of day in seconds since the Unix
+# epoch (`clock_now`). `Config(host = ...)` chooses how the module imports them:
 #
 # - `:js`: functions of the import module `julia`: `write_byte(fd: i32, byte: i32)`,
-#   `entropy() -> i64` and `hrtime() -> i64`, which `js/julia.mjs` provides (flushing is
-#   the host's: nothing is buffered in the module).
+#   `entropy() -> i64`, `hrtime() -> i64` and `clock_now() -> f64`, which `js/julia.mjs`
+#   provides (flushing is the host's: nothing is buffered in the module).
 # - `:wasi`: WASI preview 1 (`wasi_snapshot_preview1`): `fd_write`, `random_get` and
 #   `clock_time_get`, as other languages compiling to WASI do. WASI passes data through
 #   linear memory: the module has one page of it, exported as `memory` (as WASI requires),
@@ -20,13 +20,14 @@ const JS_HOST = normpath(joinpath(@__DIR__, "..", "js", "julia.mjs"))
 
 const HOST_PRIMITIVES = Dict(:write_byte => (ValType[I32, I32], ValType[]),
                              :entropy => (ValType[], ValType[I64]),
-                             :hrtime => (ValType[], ValType[I64]))
+                             :hrtime => (ValType[], ValType[I64]),
+                             :clock_now => (ValType[], ValType[F64]))
 
 """
     host_func!(cgm, name) -> Func
 
-The function of the host primitive `name` (`:write_byte`, `:entropy`, `:hrtime`): the
-import `julia.name`, or for WASI a function of the module over WASI's.
+The function of the host primitive `name` (`:write_byte`, `:entropy`, `:hrtime`,
+`:clock_now`): the import `julia.name`, or for WASI a function of the module over WASI's.
 """
 function host_func!(cgm::CGModule, name::Symbol)
     cgm.config.host === :wasi && return wasi_func!(cgm, name)
@@ -71,6 +72,7 @@ const WASI_OUT = 64
 const WASI_OUT_SIZE = 65536 - WASI_OUT
 
 # WASI's clocks (`clockid`)
+const WASI_CLOCK_REALTIME = 0
 const WASI_CLOCK_MONOTONIC = 1
 
 "The function `name` of WASI preview 1 (each returns an errno, 0 on success)."
@@ -111,6 +113,21 @@ function wasi_func!(cgm::CGModule, name::Symbol)
             # clock_time_get(id, precision, time)
             emit!(b, :i32_const, WASI_CLOCK_MONOTONIC); emit!(b, :i64_const, 1); emit!(b, :i32_const, WASI_RESULT)
             call!(b, wasi_import!(cgm, "clock_time_get", ValType[I32, I64, I32]))
+        elseif name === :clock_now
+            # the real-time clock to the microsecond, as seconds and microseconds, as natively
+            # (`jl_clock_now`: gettimeofday's `tv_sec + tv_usec * 1e-6`)
+            emit!(b, :i32_const, WASI_CLOCK_REALTIME); emit!(b, :i64_const, 1000); emit!(b, :i32_const, WASI_RESULT)
+            call!(b, wasi_import!(cgm, "clock_time_get", ValType[I32, I64, I32]))
+            wasi_check!(b)
+            ns = add_local!(f, I64)
+            emit!(b, :i32_const, WASI_RESULT); emit!(b, :i64_load, 3, 0); emit!(b, :local_set, ns)
+            emit!(b, :local_get, ns); emit!(b, :i64_const, 1_000_000_000); emit!(b, :i64_div_u)
+            emit!(b, :f64_convert_i64_u)
+            emit!(b, :local_get, ns); emit!(b, :i64_const, 1_000_000_000); emit!(b, :i64_rem_u)
+            emit!(b, :i64_const, 1000); emit!(b, :i64_div_u); emit!(b, :f64_convert_i64_u)
+            emit!(b, :f64_const, 1.0e-6); emit!(b, :f64_mul); emit!(b, :f64_add)
+            finish!(b)
+            return f
         else
             error("no host primitive $name")
         end

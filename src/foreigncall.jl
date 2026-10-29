@@ -110,6 +110,10 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
                     :jl_gc_run_pending_finalizers, :jl_threadid, :jl_get_task_tid)
         # (one thread: the first; no finalizers run during code)
         return typ === Nothing ? ghost(Nothing, nothing) : const_value(fc, zero(typ))
+    elseif name === :jl_clock_now
+        # (`time()`) the host's time of day, seconds since the Unix epoch
+        call!(fc.b, host_func!(fc.cgm, :clock_now))
+        return pop_val!(fc, Float64)
     elseif name === :jl_hrtime
         # (`time_ns`) the host's monotonic clock
         call!(fc.b, host_func!(fc.cgm, :hrtime))

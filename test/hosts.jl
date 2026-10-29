@@ -9,12 +9,14 @@ host_entropy_time() = (t0 = time_ns(); x = rand(); t1 = time_ns(); (0.0 <= x < 1
 host_print_fail(n::Int) = (println(Core.stdout, "before ", n); n > 0 && error("boom"); n)
 host_order() = (print(Core.stderr, "first"); println(Core.stdout, "second"); print(Core.stdout, "third"); 0)
 host_inc(x::Int) = x + 1
+host_clock() = time()
 # an image object completed by initialization (a cycle), which calls no host function
 mutable struct HostNode; next::Any; v::Int; end
 const HOST_CYCLE = (n = HostNode(nothing, 7); n.next = n; n)
 host_cycle() = (HOST_CYCLE.next::HostNode).v
 
 imported_modules(c) = unique(f.imported[1] for f in c.cgm.mod.funcs if f.imported !== nothing)
+imported_names(c) = [f.imported[2] for f in c.cgm.mod.funcs if f.imported !== nothing]
 exported_names(c) = [name for (name, _) in c.cgm.mod.exports]
 
 # run `fn(args...)` of the module with js/julia.mjs's `instantiate`: (result as a string, output)
@@ -100,6 +102,13 @@ end
         @test wasm_run(big, "host_big_print", 50_000; rettype=Int) == 50_000
         @test LAST_OUTPUT[] == repeat("ab", 50_000)
         @test wasm_run(entropy, "host_entropy_time"; rettype=Tuple{Bool,Bool}) == (true, true)
+        # the time of day (`time()`): the host's, seconds since the epoch
+        clock = WasmCodegen.compile(host_clock, (); config=cfg)
+        @test imported_names(clock) == (host === :js ? ["clock_now"] : ["clock_time_get"])
+        t0 = time(); t = wasm_run(clock, "host_clock"; rettype=Float64); t1 = time()
+        @test t0 - 1 <= t <= t1 + 1
+        r, _ = run_julia_mjs(clock, "host_clock")
+        @test t0 - 1 <= parse(Float64, r) <= time() + 1
         # output written before a trap is not lost
         failing = WasmCodegen.compile(host_print_fail, (Int,); config=cfg)
         @test wasm_run(failing, "host_print_fail", 1; rettype=Int)[1] === :trap

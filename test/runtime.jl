@@ -82,6 +82,14 @@ function rt_gc_logging(x::Int)
     return (a, b, c, x)
 end
 
+# GC.enable: the requested state, kept as natively (WasmGC collects regardless)
+function rt_gc_enable(x::Int)
+    a = GC.enable(false); b = GC.enable(false); c = GC.enable(true); d = GC.enable(true)
+    e = ccall(:jl_gc_enable, Int32, (Int32,), Int32(0)); f = ccall(:jl_gc_enable, Int32, (Int32,), Int32(-3))
+    g = ccall(:jl_gc_enable, Int32, (Int32,), Int32(1))
+    return (a, b, c, d, e, f, g, x)
+end
+
 # Libc.rand (`jl_rand`, `jl_srand`): the C runtime's generator, the same stream as natively
 rt_libc_rand(seed::UInt64) = (Libc.srand(seed); (Libc.rand(), Libc.rand(), Libc.rand(Float64), Libc.rand(UInt32)))
 
@@ -164,6 +172,7 @@ rt_typeintersect(x::Int) = (typeintersect(x > 0 ? Vector{Int} : Vector, Abstract
     end
     @testset "rt_ptls_rng" begin @wtest rt_ptls_rng(UInt64(42)) end
     @testset "rt_gc_logging" begin @wtest rt_gc_logging(1) end
+    @testset "rt_gc_enable" begin @wtest rt_gc_enable(1) end
     @testset "rt_deepcopy" begin @wtest rt_deepcopy(3) end
     @testset "rt_deepcopy" begin @wtest rt_deepcopy(0) end
     @testset "rt_crc_string" begin @wtest rt_crc_string(1) end

@@ -428,7 +428,8 @@ shared (10% smaller modules for the parser).
 - **Primitives**: runtime functions whose calls the code generator compiles to the host's
   (`host.jl`): `write_byte(fd, byte)` and `flush_output(fd)` (the end of a write),
   `entropy()` (the seed of the task's random number generator), `hrtime()` (`time_ns()`: a
-  monotonic clock in nanoseconds).
+  monotonic clock in nanoseconds), `clock_now()` (`time()`: seconds since the Unix epoch, to
+  the microsecond as natively).
   The C runtime's globals code reads through `cglobal`: none so far but
   `jl_gc_have_pending_finalizers` (an image object holding 0). The thread counts behind
   `Threads.nthreads()` (`jl_n_threads_per_pool`, a pointer to an array) are not yet
@@ -437,11 +438,11 @@ shared (10% smaller modules for the parser).
   (IO for `Core.stdout`/`Core.stderr`).
 - **The host** (`Config(host = ...)`), as other languages compiling to Wasm have both a
   JavaScript and a WASI target (Go's `js` and `wasip1`, Kotlin's `wasmJs` and `wasmWasi`):
-  - `:js`: imports of the module `julia` (`write_byte`, `entropy`, `hrtime`), which
+  - `:js`: imports of the module `julia` (`write_byte`, `entropy`, `hrtime`, `clock_now`), which
     `js/julia.mjs` provides (`WasmCodegen.JS_HOST`): it buffers output bytes per
     descriptor and decodes them as UTF-8. `flush_output` compiles to nothing.
   - `:wasi`: WASI preview 1 (`fd_write`, `random_get`, `clock_time_get` of the monotonic
-    clock). WASI passes data through linear memory, which a WasmGC module otherwise has no
+    and real-time clocks). WASI passes data through linear memory, which a WasmGC module otherwise has no
     use for: as Kotlin's WASI target does, the module has a page of it for these calls
     only, exported as `memory` (as WASI requires): the 8 bytes of a call's result, an
     iovec, and an output buffer that `write_byte` appends to and `fd_write` writes out at

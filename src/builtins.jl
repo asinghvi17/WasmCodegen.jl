@@ -145,6 +145,16 @@ function get_field(fc::FnCtx, x::CGVal, i::Int)
         # (a type's fields are fixed once it is made)
         return const_value(fc, getfield(constant_value(x), i))
     end
+    # an index out of a type's fields (known at compile time): a BoundsError, as natively
+    nfields = try
+        fieldcount(T)
+    catch
+        nothing
+    end
+    if nfields !== nothing && !(1 <= i <= nfields)
+        return throw_error!(fc, Runtime.throw_bounds_error, () -> convert_repr(fc, x, Any),
+                            const_value(fc, i))
+    end
     FT = fieldtype(T, i)
     if l.kind === Inline
         if is_memoryref_type(T)

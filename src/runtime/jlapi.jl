@@ -280,6 +280,11 @@ const GC_LOGGING = Ref{Cint}(0)
 enable_gc_logging(on::Cint) = (GC_LOGGING[] = on != 0 ? Cint(1) : Cint(0); nothing)
 is_gc_logging_enabled() = GC_LOGGING[]
 
+"The GC's requested state (`jl_gc_enable`), kept as natively: WasmGC collects regardless."
+const GC_ENABLED = Ref{Int32}(1)
+"`jl_gc_enable(on)`: enabled if `on` is not 0; the previous state (1 enabled, 0 not)."
+gc_enable(on::Int32) = (prev = GC_ENABLED[]; GC_ENABLED[] = on != 0 ? Int32(1) : Int32(0); prev)
+
 ## the scheduler's per-thread random state (`Base.Partr.get_ptls_rng`/`set_ptls_rng`): the one
 ## thread's (src/threading.c)
 

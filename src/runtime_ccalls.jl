@@ -32,6 +32,7 @@ for (name, f, kinds) in (
         # the GC
         (:jl_enable_gc_logging, Runtime.enable_gc_logging, [:val]),
         (:jl_is_gc_logging_enabled, Runtime.is_gc_logging_enabled, Symbol[]),
+        (:jl_gc_enable, Runtime.gc_enable, [:val]),
         # the scheduler's random state (`Base.Partr`): one thread's
         (:jl_get_ptls_rng, Runtime.get_ptls_rng, Symbol[]),
         (:jl_set_ptls_rng, Runtime.set_ptls_rng, [:val]),
