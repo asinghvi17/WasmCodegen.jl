@@ -88,9 +88,12 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     elseif name === :jl_symbol_name
         return string_ptr!(fc, args[1]::CGVal, typ, Symbol)
     elseif name === :jl_value_ptr
-        # `pointer_from_objref` (an object to a pointer), or `unsafe_pointer_to_objref`
-        x = args[1]::CGVal
-        return is_ptr_type(x.typ) ? pointer_object!(fc, x) : object_ptr!(fc, x, typ)
+        # by the declared signature, as natively: `(Any,) -> Ptr` is `pointer_from_objref` (an
+        # object to a pointer), `(Ptr,) -> Any` is `unsafe_pointer_to_objref`
+        RT, AT = ex.args[2], ex.args[3]::Core.SimpleVector
+        length(AT) == 1 && AT[1] === Any && is_ptr_type(RT) && return object_ptr!(fc, args[1]::CGVal, typ)
+        length(AT) == 1 && is_ptr_type(AT[1]) && RT === Any && return pointer_object!(fc, args[1]::CGVal)
+        unsupported("jl_value_ptr declared as ", AT, " -> ", RT)
     elseif name === :jl_new_structv
         return new_structv!(fc, args[1]::CGVal, args[2]::CGVal)
     elseif name in MODULE_QUERIES

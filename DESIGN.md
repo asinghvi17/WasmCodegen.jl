@@ -258,6 +258,12 @@ Pointer arithmetic moves the address and keeps the owner, and both cross calls w
 pointer, as any value's leaves do. Memory is addressed by bytes as Julia lays it out, so a
 pointer may reinterpret it.
 
+`unsafe_pointer_to_objref(p)` is `p`'s owner when `p` is at the owner's base address, and
+traps otherwise. Since the owner follows the pointer and not its address, a pointer without
+owner (made from an integer, or through an integer round trip) and one moved by arithmetic from
+one object to another (`p + (q - p)` keeps `p`'s owner) trap where natively they give the
+object at that address.
+
 Within a function, a pointer also carries its **origin** when it is known statically: the
 array of its owner, the byte offset into it, and the type of its elements. A load, store,
 `memmove` or `memset` through pointers with origins compiles to array accesses
@@ -297,7 +303,9 @@ built it.
   built at compile time find them.
 - Global variables are mutable globals (one per leaf of the declared type), initialized
   with their value at compile time.
-- A `Ptr` constant is its address without owner (an address of the build process).
+- A `Ptr` constant must be null (`C_NULL`): a non-null one is an address of the build process,
+  which means nothing in the module, and is rejected unless its field is allowlisted by
+  `Config(image_pointer_fields)` (then it is kept as an address without owner).
 - A symbol carries its hash, as Julia's runtime computed it, so that dictionaries with
   symbol keys built at compile time are found at run time.
 - Not serializable (an error naming the object): tasks, modules, methods.

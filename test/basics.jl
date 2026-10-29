@@ -158,6 +158,27 @@ function objref_inside(n::Int)
     GC.@preserve b (unsafe_pointer_to_objref(pointer_from_objref(b) + 8)::ObjBox).x
 end
 objref_int(n::Int) = (unsafe_pointer_to_objref(Ptr{Cvoid}(n))::ObjBox).x
+# moved away and back: the same owner, at its base
+function objref_offset(n::Int)
+    b = ObjBox(n, "a")
+    GC.@preserve b (unsafe_pointer_to_objref((pointer_from_objref(b) + 8n) - 8n)::ObjBox).x
+end
+# a pointer replaced in a loop: each iteration's object
+function objref_loop(n::Int)
+    bs = [ObjBox(i, "b") for i in 1:n]
+    GC.@preserve bs begin
+        s = 0
+        p = pointer_from_objref(bs[1])
+        for i in 1:n
+            s += 10s + (unsafe_pointer_to_objref(p)::ObjBox).x
+            p = pointer_from_objref(bs[i])
+        end
+        s
+    end
+end
+# `jl_value_ptr` declared `(Any,)` of a pointer value: the address of its box natively, which
+# the module does not have (not `unsafe_pointer_to_objref` of the pointer)
+objref_boxed_ptr(n::Int) = ccall(:jl_value_ptr, Ptr{Cvoid}, (Any,), Ptr{Cvoid}(n)) != C_NULL
 
 @testset "pointers" begin
     @wtest objref_roundtrip(3)
@@ -166,6 +187,10 @@ objref_int(n::Int) = (unsafe_pointer_to_objref(Ptr{Cvoid}(n))::ObjBox).x
         got = wasm_run(wcompile(f, (Int,)), string(nameof(f)), 8; rettype=Int)
         @test got isa Tuple && got[1] === :trap
     end
+    @wtest objref_offset(3)
+    @wtest objref_loop(5)
+    @test objref_boxed_ptr(8)
+    @test_throws WasmCodegen.UnsupportedConstructs wcompile(objref_boxed_ptr, (Int,))
     @wtest union_copy(1)
     @wtest misaligned(0x12345678)
     @wtest widened_ptr(0x12345678)

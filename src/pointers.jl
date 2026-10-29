@@ -103,8 +103,11 @@ end
 """
 The object the pointer `p` points to (`unsafe_pointer_to_objref`): its owner. Traps when `p`
 has no owner (it was made from an integer, or lost its owner) or is not at the owner's base
-address. The pointers to the data of a String or a Memory have that base too, so they give the
-String or the Memory (natively they do not point to an object, and the result is undefined).
+address. As the owner follows the pointer, not its address, a pointer moved by arithmetic from
+one object to another (`p + (q - p)` keeps `p`'s owner) traps, where natively it gives the
+object at that address. The pointers to the data of a String, a Symbol's name or a Memory have
+that base too, so they give the String, Symbol or Memory (natively they do not point to an
+object, and the result is undefined).
 """
 function pointer_object!(fc::FnCtx, p::CGVal)
     o = new_local!(fc, jlvalue_ref(fc.cgm.types))
