@@ -878,6 +878,10 @@ function emit_call!(fc::FnCtx, ex::Expr, @nospecialize(typ))
     (f isa CGVal && isconstant(f)) ||
         unsupported("a call of a function value of type ", f isa CGVal ? f.typ : f)
     fv = constant_value(f)
+    # finalizers never run (WasmGC has no way to run code when an object dies): nothing is
+    # registered, and the arguments, among them the optimizer's code instance of the
+    # finalizer (`Core.finalizer(f, o, inline, ci)`), are not values of the module
+    fv === Core.finalizer && return ghost(Nothing, nothing)
     args = Any[any(g -> fv === g, GLOBAL_BUILTINS) ? builtin_operand(fc, a) : operand(fc, a) for a in ex.args[2:end]]
     if fv isa Core.IntrinsicFunction
         return emit_intrinsic!(fc, fv, args, typ)
