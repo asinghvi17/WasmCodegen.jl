@@ -87,15 +87,10 @@ typeof_any_map(n::Int) = (T = typeof(typeof_any_id(Any[TypeofAnyMapOnly(n)])[1])
 const TYPEOF_ANY_VARARGS = Any[Vararg{Int}, Vararg{Int}, Vararg{Real}, Vararg{Int, 2}, Vararg{Int, 3}, Int, Tuple{Vararg{Int}},
                                Vararg, Vararg{Any}, Vararg{Any, 2}, Vararg{Tuple{Union{Int,Nothing}}},
                                Vararg{Union{Tuple{Int},Tuple{Nothing}}}, Tuple{Union{Int,Nothing}},
-                               Union{Tuple{Int},Tuple{Nothing}}]
-function typeof_any_vararg_eq(n::Int)
-    h = 0
-    for i in 1:length(TYPEOF_ANY_VARARGS), j in 1:length(TYPEOF_ANY_VARARGS)
-        a, b = TYPEOF_ANY_VARARGS[i], TYPEOF_ANY_VARARGS[j]
-        h = h * 2 + ccall(:jl_types_equal, Cint, (Any, Any), a, b)
-    end
-    return h + n
-end
+                               Union{Tuple{Int},Tuple{Nothing}}, Vararg{Tuple{T,T} where T},
+                               Vararg{Tuple{T,T} where T<:Integer}, Vararg{Tuple{S,T} where {S,T}}]
+typeof_any_vararg_eq(i::Int, j::Int) =
+    ccall(:jl_types_equal, Cint, (Any, Any), TYPEOF_ANY_VARARGS[i], TYPEOF_ANY_VARARGS[j])
 
 @testset "typeof and jl_types_equal: Varargs and tuples" begin
     @test typeof_unknown_tuple(7)
@@ -104,9 +99,13 @@ end
         @test occursin("typeof of a tuple whose concrete type the module does not have", LAST_OUTPUT[])
     end
     @wtest typeof_any_map(1)
-    @wtest typeof_any_vararg_eq(0)
+    for i in 1:length(TYPEOF_ANY_VARARGS), j in 1:length(TYPEOF_ANY_VARARGS)
+        @wtest typeof_any_vararg_eq(i, j)
+    end
     # (the runtime's jl_types_equal against the C runtime's, natively)
     for a in TYPEOF_ANY_VARARGS, b in TYPEOF_ANY_VARARGS
         @test WasmCodegen.Runtime.types_equal(a, b) == ccall(:jl_types_equal, Cint, (Any, Any), a, b)
     end
+    # (element types that differ only in the names of type variables: see `types_equal`)
+    @test_broken WasmCodegen.Runtime.types_equal(Vararg{Tuple{T,T} where T}, Vararg{Tuple{S,S} where S}) == 1
 end

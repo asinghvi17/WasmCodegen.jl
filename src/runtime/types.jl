@@ -59,6 +59,9 @@ end
 (`<:` of the module's types is a table, see `reflection.jl`). `Vararg`s, which are not types,
 are equal as the C runtime compares them: of the same length (or both of no length) and of
 the same element type (`===`; a bare `Vararg`'s is `Any`). A `Vararg` and a type are not.
+(The C runtime also finds `Vararg`s equal whose element types differ only in the names of
+type variables, `Vararg{Tuple{T,T} where T}` and `Vararg{Tuple{S,S} where S}`: here they are
+not, as the fields of type objects are not read at run time.)
 """
 function types_equal(@nospecialize(a), @nospecialize(b))
     a === b && return Int32(1)
