@@ -67,6 +67,9 @@ end
 Base.showerror(io::IO, e::TrimFailure) =
     print(io, "the code of the entry points is not trim-safe (as juliac --trim=safe checks):\n", e.report)
 
+# the rounds of inferring invoke targets as entries in `trim_check`
+const MAX_INVOKE_ROUNDS = 8
+
 """
     trim_check(entries; world, onlywarn=false) -> String
 
@@ -74,11 +77,27 @@ Check the entry points as `juliac --trim=safe` does: native inference collects t
 they run (`Compiler.typeinf_ext_toplevel`), and juliac's verifier checks it. Returns the
 verifier's report, and throws a [`TrimFailure`](@ref) if it found errors (unless
 `onlywarn`). This is the subset of Julia the code generator targets.
+
+An `:invoke` of a method instance without a code instance (one inferred only as part of a
+recursion cycle, or whose cached code the patches invalidated) is a static call, which the
+code generator compiles, but the verifier rejects it as unresolved: native inference does
+not compile its target. Each such target is inferred as an entry of its own, and the invoke
+made of its code instance; the verifier checks that code as any other. (For a few rounds: the
+targets of a program whose specializations do not end, as recursive invokes of ever deeper
+types, stay unresolved invokes.)
 """
 function trim_check(entries::Vector{Core.MethodInstance}; world::UInt=Base.get_world_counter(),
                     onlywarn::Bool=false)
     args = VERSION >= v"1.13-" ? (CC.TRIM_UNSAFE, false) : (CC.TRIM_UNSAFE,)
-    codeinfos = CC.typeinf_ext_toplevel(Any[entries...], UInt[world], args...)
+    roots = Any[entries...]
+    codeinfos = CC.typeinf_ext_toplevel(copy(roots), UInt[world], args...)
+    for _ in 1:MAX_INVOKE_ROUNDS
+        targets = filter(mi -> !(mi in roots), uncompiled_invoke_targets(codeinfos))
+        isempty(targets) && break
+        append!(roots, targets)
+        codeinfos = CC.typeinf_ext_toplevel(copy(roots), UInt[world], args...)
+    end
+    link_invoke_targets!(codeinfos)
     io = IOBuffer()
     try
         redirect_stdout(devnull) do
@@ -89,6 +108,62 @@ function trim_check(entries::Vector{Core.MethodInstance}; world::UInt=Base.get_w
         throw(TrimFailure(String(take!(io))))
     end
     return String(take!(io))
+end
+
+# the code instances of `codeinfos` the verifier links invokes to, by method instance: native
+# ones valid in the current world, of the instance itself (`get_verify_typeinf_trim`'s)
+function linkable_code(codeinfos::Vector{Any})
+    now = Base.get_world_counter()
+    code = IdDict{Core.MethodInstance,Core.CodeInstance}()
+    for item in codeinfos
+        item isa Core.CodeInstance && item.owner === nothing && item.min_world <= now <= item.max_world &&
+            CC.get_ci_mi(item) === item.def && (code[item.def] = item)
+    end
+    return code
+end
+
+# the statement's invoke target when it is a bare method instance (else nothing)
+function invoked_instance(@nospecialize(st))
+    ex = Meta.isexpr(st, :(=)) ? st.args[2] : st
+    Meta.isexpr(ex, :invoke) && ex.args[1] isa Core.MethodInstance || return nothing
+    return ex.args[1]::Core.MethodInstance
+end
+
+# the method instances `codeinfos` invoke without a code instance of them in `codeinfos`
+function uncompiled_invoke_targets(codeinfos::Vector{Any})
+    code = linkable_code(codeinfos)
+    targets = Core.MethodInstance[]
+    for i in 1:length(codeinfos)
+        codeinfos[i] isa Core.CodeInstance || continue
+        for st in (codeinfos[i + 1]::Core.CodeInfo).code
+            mi = invoked_instance(st)
+            mi === nothing || haskey(code, mi) || mi in targets || push!(targets, mi)
+        end
+    end
+    return targets
+end
+
+# the invokes of a bare method instance with a code instance in `codeinfos`, of that code
+# instance (in copies of the sources: they are inference's)
+function link_invoke_targets!(codeinfos::Vector{Any})
+    code = linkable_code(codeinfos)
+    for i in 1:length(codeinfos)
+        codeinfos[i] isa Core.CodeInstance || continue
+        src = codeinfos[i + 1]::Core.CodeInfo
+        any(st -> (mi = invoked_instance(st); mi !== nothing && haskey(code, mi)), src.code) || continue
+        src = copy(src)
+        src.code = copy(src.code)
+        for j in eachindex(src.code)
+            st = src.code[j]
+            mi = invoked_instance(st)
+            (mi !== nothing && haskey(code, mi)) || continue
+            ex = Meta.isexpr(st, :(=)) ? st.args[2] : st
+            linked = Expr(:invoke, code[mi], ex.args[2:end]...)
+            src.code[j] = Meta.isexpr(st, :(=)) ? Expr(:(=), st.args[1], linked) : linked
+        end
+        codeinfos[i + 1] = src
+    end
+    return codeinfos
 end
 
 """
