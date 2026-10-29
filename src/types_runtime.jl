@@ -155,6 +155,25 @@ function current_task_global!(cgm::CGModule)
 end
 
 """
+    seed_from_host!(cgm, ref)
+
+Seed the runtime's generator state `ref` (a `Ref{UInt64}` of the image) from the host's
+entropy when the module starts, as Julia seeds its C runtime's generators from the system's
+(`jl_init_rand`, and each thread's state from it).
+"""
+function seed_from_host!(cgm::CGModule, ref::Base.RefValue{UInt64})
+    get!(cgm.helpers, (:seed_from_host, objectid(ref))) do
+        g = object_global!(cgm.image, ref)
+        l = layout(cgm.types, typeof(ref))
+        w = first(l.fields[1]) - 1
+        push!(cgm.image.init, Inst(:global_get, g), Inst(:call, host_func!(cgm, :entropy)),
+              Inst(:struct_set, l.wtype, w))
+        nothing
+    end
+    return nothing
+end
+
+"""
     objectid_mutable_func!(cgm) -> Func
 
 `(x::\$JlValue) -> i64`: the `objectid` of the mutable object `x`. An object of the image has

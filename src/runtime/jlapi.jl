@@ -1,5 +1,31 @@
-# Functions of Julia's C runtime (libjulia) that Base calls and that are computations, done
-# here as natively (see `runtime_ccalls.jl`).
+# Functions of Julia's C runtime (libjulia) that Base calls and that are computations, or
+# constants of a program of one thread and one task, done here as natively (see
+# `foreigncall.jl`'s `RUNTIME_CCALLS`).
+
+## CRC-32C (`Base._crc32c`, `CRC32c.crc32c`; Pkg's package slugs): src/crc32c.c
+
+const CRC32C_TABLE = let t = Vector{UInt32}(undef, 256)
+    for i in 0:255
+        c = UInt32(i)
+        for _ in 1:8
+            c = c & 1 != 0 ? (c >> 1) ⊻ 0x82f63b78 : c >> 1
+        end
+        t[i+1] = c
+    end
+    t
+end
+
+"`jl_crc32c(crc, p, n)`: the CRC-32C (Castagnoli) of the `n` bytes at `p`, continuing `crc`."
+function crc32c(crc::UInt32, p::Ptr{UInt8}, n::UInt)
+    c = ~crc
+    i = UInt(1)
+    while i <= n
+        c = CRC32C_TABLE[((c ⊻ unsafe_load(p, i)) & 0xff) + 1] ⊻ (c >> 8)
+        i += 1
+    end
+    return ~c
+end
+crc32c(crc::UInt32, p::Ptr, n::UInt) = crc32c(crc, convert(Ptr{UInt8}, p), n)
 
 ## IdSet (`Base.IdSet`): src/idset.c over src/smallintset.c
 
@@ -195,3 +221,101 @@ function put_idx(keys, idxs, idx::Int)
 end
 
 end
+
+## gensym (`gensym()`, `gensym(tag)`): src/ast.c (`##` and a counter, `##tag#` and it)
+
+"""
+The counter of gensyms (`gs_ctr` in src/symbol.c): the module's starts at the build process's
+next value as of the end of the compilation (`finish_gensym_counter!` sets it in the image after
+everything the compilation generated, inference included), so the module's gensyms continue
+the sequence and never repeat a generated symbol the image holds.
+"""
+const GENSYM_COUNTER = Ref{UInt32}(0)
+
+"The build process's next gensym number (natively; it takes one)."
+native_gensym_counter() = parse(UInt32, String(Base.gensym())[3:end]) + 0x1
+"Set `GENSYM_COUNTER` (natively) to the build process's next gensym number."
+sync_gensym_counter!() = (GENSYM_COUNTER[] = native_gensym_counter(); nothing)
+
+next_gensym() = (c = GENSYM_COUNTER[]; GENSYM_COUNTER[] = c + 0x1; c)
+
+"`jl_gensym()`: the symbol `##n`, `n` the counter's value (then incremented)."
+gensym() = Symbol("##", next_gensym())
+
+"""
+`jl_tagged_gensym(p, n)`: the symbol `##tag#n` of the tag of the `n` bytes at `p` (`n` all
+ones: of the bytes before a NUL).
+"""
+function tagged_gensym(p::Ptr{UInt8}, n::UInt)
+    tag = n == typemax(UInt) ? unsafe_string(p, ptr_strlen(p)) : unsafe_string(p, n)
+    occursin('\0', tag) && throw(ArgumentError("Symbol name may not contain \\0"))
+    return Symbol("##", tag, "#", next_gensym())
+end
+
+## Libc.rand / Libc.srand: src/sys.c (`cong` on a global seed)
+
+# (seeded from the host's entropy when the module starts, `seed_from_host!`)
+const RAND_SEED = Ref{UInt64}(0)
+
+"`jl_srand(seed)`."
+srand(seed::UInt64) = (RAND_SEED[] = seed; nothing)
+
+"""
+`jl_rand()`: the C runtime's `cong(UINT64_MAX, &seed)` (src/julia_internal.h): steps of a
+linear congruential generator until one is below the bound.
+"""
+function rand()
+    while true
+        seed = RAND_SEED[] * 69069 + 362437
+        RAND_SEED[] = seed
+        seed < typemax(UInt64) && return seed
+    end
+end
+
+## the GC (WasmGC's: it collects on its own, and finalizers never run)
+
+const GC_LOGGING = Ref{Cint}(0)
+
+"`jl_enable_gc_logging(on)`: kept as a flag (nothing is logged: WasmGC reports no collections)."
+enable_gc_logging(on::Cint) = (GC_LOGGING[] = on != 0 ? Cint(1) : Cint(0); nothing)
+is_gc_logging_enabled() = GC_LOGGING[]
+
+## the scheduler's per-thread random state (`Base.Partr.get_ptls_rng`/`set_ptls_rng`): the one
+## thread's (src/threading.c)
+
+# (seeded from the host's entropy when the module starts, `seed_from_host!`)
+const PTLS_RNG = Ref{UInt64}(0)
+get_ptls_rng() = PTLS_RNG[]
+set_ptls_rng(seed::UInt64) = (PTLS_RNG[] = seed; nothing)
+
+"`jl_set_nth_field(x, i, v)` with `i` out of range: a BoundsError of `i + 1`, as natively."
+@noinline throw_nth_field_bounds(@nospecialize(x), i::UInt) = throw(BoundsError(x, (i % Int) + 1))
+
+# `jl_gc_new_weakref_th(ptls, x)`: a WeakRef holding `x` (strongly: a GC never has to run)
+@eval new_weakref(::Ptr{Cvoid}, @nospecialize(x)) = $(Expr(:new, WeakRef, :x))
+
+"`jl_gc_get_total_bytes(p)`: no statistics of the heap (WasmGC has none): 0."
+gc_get_total_bytes(p::Ptr{Int64}) = (unsafe_store!(p, Int64(0)); nothing)
+
+"`jl_gc_num()`: `Base.GC_Num` of zeros (`@time` and `@timed` report no allocations)."
+const GC_NUM_ZERO = Base.GC_Num((zero(fieldtype(Base.GC_Num, i)) for i in 1:fieldcount(Base.GC_Num))...)
+gc_num() = GC_NUM_ZERO
+
+"`jl_set_fenv_rounding(i)`: to nearest (0, success); another mode throws."
+function set_fenv_rounding(i::Int32)
+    i == Base.Rounding.JL_FE_TONEAREST && return Int32(0)
+    throw(ArgumentError("setrounding of Float32/Float64 to a mode other than RoundNearest: " *
+                        "Wasm's floating-point operations only round to nearest (WasmCodegen)"))
+end
+
+"`jl_set_zero_subnormals(yes)`: keeping subnormals succeeds (0); flushing them is unsupported."
+set_zero_subnormals(yes::Int8) = yes == 0 ? Int32(0) : Int32(1)
+
+## the C runtime's global variables code reads (`cglobal`), as the module has them
+
+"`jl_n_threads`: one thread (`Threads.maxthreadid`)."
+const N_THREADS = Ref{Cint}(1)
+"`jl_n_threadpools`: the interactive pool (empty) and the default one, as natively with `-t 1`."
+const N_THREADPOOLS = Ref{Cint}(2)
+"`jl_n_gcthreads`: no GC threads besides the one thread (`Threads.ngcthreads() == 1`)."
+const N_GCTHREADS = Ref{Cint}(0)

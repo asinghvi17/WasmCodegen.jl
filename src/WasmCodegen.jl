@@ -25,6 +25,7 @@ module Runtime
 include("runtime/int128.jl")
 include("runtime/io.jl")
 include("runtime/pointers.jl")
+include("runtime/libc.jl")
 include("runtime/reinterpret.jl")
 include("runtime/hash.jl")
 include("runtime/unicode.jl")

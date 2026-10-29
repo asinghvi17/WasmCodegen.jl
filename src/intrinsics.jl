@@ -575,14 +575,14 @@ end
     emit_cglobal!(fc, name, P) -> CGVal
 
 `cglobal(name, T)`: a pointer to a global variable of the C runtime. Of those code reads,
-its value as the module has it (in an object of the image): no finalizers are pending
-(`jl_gc_have_pending_finalizers`).
+its value as the module has it (in an object of the image, `C_GLOBALS`): no finalizers are
+pending (`jl_gc_have_pending_finalizers`), one thread (`jl_n_threads`, ...).
 """
 function emit_cglobal!(fc::FnCtx, name::CGVal, @nospecialize(P))
     s = isconstant(name) ? foreigncall_name(constant_value(name)) : nothing
-    s === :jl_gc_have_pending_finalizers ||
-        unsupported("the global variable ", something(s, name.typ), " of the C runtime")
-    return object_ptr!(fc, const_value(fc, Runtime.PENDING_FINALIZERS), P)
+    s isa Symbol && haskey(C_GLOBALS, s) ||
+        unsupported("the global variable ", something(s, name.typ), " of the C runtime", foreigncall_hint(s))
+    return object_ptr!(fc, const_value(fc, C_GLOBALS[s]), P)
 end
 
 # the operations of `atomicrmw` on the old value and the operand

@@ -91,6 +91,8 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return object_ptr!(fc, args[1]::CGVal, typ)
     elseif name === :jl_new_structv
         return new_structv!(fc, args[1]::CGVal, args[2]::CGVal)
+    elseif name === :jl_set_nth_field
+        return set_nth_field!(fc, ex, args)
     elseif name === :jl_new_struct_uninit
         T = args[1]::CGVal
         (isconstant(T) && constant_value(T) isa DataType) ||
@@ -98,10 +100,8 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         return convert_repr(fc, emit_new!(fc, constant_value(T), CGVal[]), Any)
     elseif name in (:jl_gc_disable_finalizers_internal, :jl_gc_enable_finalizers_internal,
                     :jl_cpu_suspend, :jl_cpu_pause, :jl_cpu_wake, :jl_gc_safepoint,
-                    :jl_gc_run_pending_finalizers, :jl_threadid, :jl_get_task_tid,
-                    :jl_get_task_threadpoolid, :jl_threadpoolid)
-        # (one thread: the first, in the pool of id 0, as natively the main thread is; no
-        # finalizers run during code)
+                    :jl_gc_run_pending_finalizers, :jl_threadid, :jl_get_task_tid)
+        # (one thread: the first; no finalizers run during code)
         return typ === Nothing ? ghost(Nothing, nothing) : const_value(fc, zero(typ))
     elseif name === :jl_hrtime
         # (`time_ns`) the host's monotonic clock
@@ -111,6 +111,14 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         push_val!(fc, convert_repr(fc, args[1]::CGVal, Module))
         emit!(fc.b, :struct_get, layout(fc, Module).wtype, HEADER_FIELDS)
         return pop_val!(fc, Symbol)
+    elseif name isa Symbol && haskey(CONST_FOREIGNCALLS, name)
+        # a constant here (`runtime_ccalls.jl`)
+        v = CONST_FOREIGNCALLS[name]
+        return v === nothing || typ === Nothing ? ghost(Nothing, nothing) : const_value(fc, convert(typ, v))
+    elseif name === :jl_rand || name === :jl_get_ptls_rng
+        # (the generator's state, seeded from the host's entropy when the module starts)
+        seed_from_host!(fc.cgm, name === :jl_rand ? Runtime.RAND_SEED : Runtime.PTLS_RNG)
+        return emit_runtime_ccall!(fc, runtime_ccall(name), args, typ)
     elseif (r = runtime_ccall(name)) !== nothing
         return emit_runtime_ccall!(fc, r, args, typ)
     elseif name === :jl_get_world_counter || name === :jl_get_tls_world_age
@@ -126,7 +134,7 @@ function emit_foreigncall!(fc::FnCtx, ex::Expr, @nospecialize(typ))
         unreachable!(fc.b)
         return bottom()
     end
-    unsupported("the foreign call ", something(name, ex.args[1]))
+    unsupported("the foreign call ", something(name, ex.args[1]), foreigncall_hint(name))
 end
 
 """

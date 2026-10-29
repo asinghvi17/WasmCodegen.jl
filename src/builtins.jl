@@ -347,7 +347,7 @@ function emit_builtin!(fc::FnCtx, f::Core.Builtin, args::Vector{Any}, @nospecial
         unsupported("sizeof of a value of type ", x.typ)
     elseif f === Core.compilerbarrier
         return args[2]
-    elseif f === Core.donotdelete || f === Core.finalizer
+    elseif f === Core.donotdelete
         return ghost(Nothing, nothing)
     elseif f === Core.getglobal
         m, s = args[1], args[2]
